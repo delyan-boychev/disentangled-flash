@@ -202,7 +202,7 @@ Strict FP32 also benefits significantly:
 
 Geometric-mean speedup across all tested batch sizes:
 
-| Sequence length | FP16 vs. HF | FP16 vs. PyTorch | FP32 vs. HF | FP32 vs. PyTorch |
+| Sequence length | FP16 vs. HF | FP16 vs. PyTorch impl. | FP32 vs. HF | FP32 vs. PyTorch impl. |
 |---:|---:|---:|---:|---:|
 | 16 | **1.96×** | **1.17×** | **2.10×** | **1.18×** |
 | 32 | **1.89×** | **1.18×** | **1.75×** | **1.17×** |
