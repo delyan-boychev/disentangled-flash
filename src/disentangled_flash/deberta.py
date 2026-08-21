@@ -11,21 +11,21 @@ from __future__ import annotations
 
 import inspect
 import types
-from collections.abc import Iterable
-from typing import Any, Callable, Mapping, Union
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
-from ._prepared import InferenceDisentangledSelfAttention, PreparedPositionPlan
 from ._reference import BaseModelOutput
-from .position import SharedPositionPlanCache
+from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
 from .kernel import (
     TritonInferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
 )
+from .position import SharedPositionPlanCache
 
-PositionPlan = Union[PreparedPositionPlan, TritonPreparedPositionPlan]
+PositionPlan = TorchPositionPlan | TritonPreparedPositionPlan
 
 
 def _invalidate_encoder_cache_after_load(
@@ -37,6 +37,10 @@ def _invalidate_encoder_cache_after_load(
 
 class DebertaV2InferenceEncoder(nn.Module):
     """Inference-only replacement for a Hugging Face ``DebertaV2Encoder``.
+
+    This module is a drop-in replacement for the Hugging Face encoder in DeBERTa-v2
+    and DeBERTa-v3 models. It uses the fast, exact, Triton-fused or PyTorch-optimized
+    disentangled self-attention mechanisms under the hood.
 
     Call :meth:`prepare_for_inference` for all production bucket lengths, then
     :meth:`activate_shape` before executing or compiling a bucket.  The hot
@@ -53,8 +57,8 @@ class DebertaV2InferenceEncoder(nn.Module):
         fp32_precision: str = "strict",
     ) -> None:
         super().__init__()
-        if backend not in {"optimized", "triton"}:
-            raise ValueError("backend must be 'optimized' or 'triton'")
+        if backend not in {"torch", "triton"}:
+            raise ValueError("backend must be 'torch' or 'triton'")
         if not hasattr(source_encoder, "layer"):
             raise TypeError("source_encoder does not look like a DebertaV2Encoder")
 
@@ -94,11 +98,11 @@ class DebertaV2InferenceEncoder(nn.Module):
             uses_position_bias=uses_position_bias,
         )
 
-        attention_class: type[InferenceDisentangledSelfAttention]
+        attention_class: type[TorchInferenceDisentangledSelfAttention]
         if backend == "triton":
             attention_class = TritonInferenceDisentangledSelfAttention
         else:
-            attention_class = InferenceDisentangledSelfAttention
+            attention_class = TorchInferenceDisentangledSelfAttention
 
         for layer in self.layer:
             original_attention = layer.attention.self
@@ -137,9 +141,9 @@ class DebertaV2InferenceEncoder(nn.Module):
     def get_rel_pos(self, *args: Any, **kwargs: Any) -> None:
         """The compact delta plan replaces Hugging Face's dense relative_pos."""
 
-        return None
+        return
 
-    def _attention_modules(self) -> tuple[InferenceDisentangledSelfAttention, ...]:
+    def _attention_modules(self) -> tuple[TorchInferenceDisentangledSelfAttention, ...]:
         return tuple(layer.attention.self for layer in self.layer)
 
     def clear_inference_cache(self) -> None:
@@ -150,12 +154,12 @@ class DebertaV2InferenceEncoder(nn.Module):
         for attention in self._attention_modules():
             attention.clear_inference_cache()
 
-    def train(self, mode: bool = True) -> "DebertaV2InferenceEncoder":
+    def train(self, mode: bool = True) -> DebertaV2InferenceEncoder:
         if mode and hasattr(self, "_prepared_plans"):
             self.clear_inference_cache()
         return super().train(mode)
 
-    def _apply(self, fn: Any, recurse: bool = True) -> "DebertaV2InferenceEncoder":
+    def _apply(self, fn: Any, recurse: bool = True) -> DebertaV2InferenceEncoder:
         result = super()._apply(fn, recurse=recurse)
         if hasattr(self, "_prepared_plans"):
             self.clear_inference_cache()
@@ -165,7 +169,7 @@ class DebertaV2InferenceEncoder(nn.Module):
     def prepare_for_inference(
         self,
         sequence_lengths: int | Iterable[int],
-    ) -> "DebertaV2InferenceEncoder":
+    ) -> DebertaV2InferenceEncoder:
         """Prepare every layer and every selected production bucket."""
 
         if self.training:
@@ -193,7 +197,7 @@ class DebertaV2InferenceEncoder(nn.Module):
         self.activate_shape(lengths[0])
         return self
 
-    def activate_shape(self, sequence_length: int) -> "DebertaV2InferenceEncoder":
+    def activate_shape(self, sequence_length: int) -> DebertaV2InferenceEncoder:
         """Select a prebuilt bucket outside the compiled hot graph."""
 
         try:
@@ -325,7 +329,7 @@ def enable_deberta_inference(
     if getattr(model, "z_steps", 0) > 1:
         raise ValueError("DeBERTa z_steps > 1 is not supported by the inference path")
     if isinstance(model.encoder, DebertaV2InferenceEncoder):
-        raise ValueError("the model already uses DebertaV2InferenceEncoder")
+        raise TypeError("the model already uses DebertaV2InferenceEncoder")
 
     was_training = model.training
     if sequence_lengths is not None and was_training:
@@ -368,9 +372,7 @@ def compile_deberta_buckets(
     if missing:
         raise ValueError(f"unprepared bucket lengths: {missing}")
 
-    supports_isolation = "isolate_recompiles" in inspect.signature(
-        torch.compile
-    ).parameters
+    supports_isolation = "isolate_recompiles" in inspect.signature(torch.compile).parameters
     compiled: dict[int, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = {}
 
     def make_forward(
@@ -423,8 +425,6 @@ def compile_deberta_buckets(
                     )
                 function(hidden_states, attention_mask)
     return compiled
-
-
 
 
 def optimize_deberta(

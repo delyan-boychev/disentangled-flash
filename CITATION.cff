@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: "Boychev"
+    given-names: "Delyan"
+    email: "delyan.boychev05@gmail.com"
+title: "DisentangledFlash: Fast exact DeBERTa-style disentangled attention in Triton"
+version: 0.1.0
+date-released: 2026-08-21
+url: "https://github.com/delyan-boychev/disentangled-flash"

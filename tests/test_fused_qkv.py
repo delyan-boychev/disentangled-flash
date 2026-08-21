@@ -1,7 +1,7 @@
 import torch
 
-from disentangled_flash._prepared import InferenceDisentangledSelfAttention
 from disentangled_flash._reference import DebertaAttentionConfig
+from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 
 
 def test_qkv_is_always_fused_after_prepare():
@@ -17,7 +17,7 @@ def test_qkv_is_always_fused_after_prepare():
         pos_att_type=("c2p", "p2c"),
         norm_rel_ebd="none",
     )
-    module = InferenceDisentangledSelfAttention(config).eval()
+    module = TorchInferenceDisentangledSelfAttention(config).eval()
     relative = torch.randn(config.position_buckets * 2, config.hidden_size)
     module.prepare_for_inference(relative)
 

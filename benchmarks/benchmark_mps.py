@@ -9,12 +9,12 @@ import time
 
 import torch
 
-from disentangled_flash._prepared import InferenceDisentangledSelfAttention
 from disentangled_flash._reference import (
     DebertaAttentionConfig,
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
+from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 
 
 def synchronize() -> None:
@@ -90,7 +90,9 @@ def main() -> None:
     )
 
     reference = OriginalDisentangledSelfAttention(config).to(device=device, dtype=dtype).eval()
-    optimized = InferenceDisentangledSelfAttention(config).to(device=device, dtype=dtype).eval()
+    optimized = (
+        TorchInferenceDisentangledSelfAttention(config).to(device=device, dtype=dtype).eval()
+    )
     optimized.load_state_dict(reference.state_dict(), strict=True)
     rel_embeddings = torch.randn(
         config.position_buckets * 2,
@@ -151,16 +153,29 @@ def main() -> None:
                 max_error = difference.max().item()
                 mean_error = difference.mean().item()
 
-                reference_call = lambda: reference(
-                    hidden_states,
-                    _prepare_attention_mask(attention_mask, length, length),
+                def reference_call(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    length=length,
                     rel_embeddings=rel_embeddings,
-                )
-                optimized_call = lambda: optimized.forward_prepared(
-                    hidden_states,
-                    attention_mask,
-                    prepared_plan,
-                )
+                ):
+                    return reference(
+                        hidden_states,
+                        _prepare_attention_mask(attention_mask, length, length),
+                        rel_embeddings=rel_embeddings,
+                    )
+
+                def optimized_call(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    prepared_plan=prepared_plan,
+                ):
+                    return optimized.forward_prepared(
+                        hidden_states,
+                        attention_mask,
+                        prepared_plan,
+                    )
+
                 reference_p50, reference_p90 = measure(
                     reference_call,
                     args.warmup,

@@ -9,8 +9,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -21,14 +21,13 @@ from benchmarks.benchmark_cuda import (
     parse_csv,
     parse_csv_ints,
 )
-from disentangled_flash._prepared import InferenceDisentangledSelfAttention
 from disentangled_flash._reference import (
     DebertaAttentionConfig,
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
+from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
-
 
 DTYPES = {
     "fp16": torch.float16,
@@ -118,18 +117,22 @@ def build_pair(
             fp32_precision=fp32_precision,
         )
     else:
-        target = InferenceDisentangledSelfAttention(config)
+        target = TorchInferenceDisentangledSelfAttention(config)
     target.load_state_dict(reference.state_dict(), strict=True)
 
     device = torch.device("cuda")
     reference = reference.to(device=device, dtype=dtype).eval()
     target = target.to(device=device, dtype=dtype).eval()
     generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-    relative = torch.empty(512, hidden_size).normal_(
-        mean=0.0,
-        std=0.02,
-        generator=generator,
-    ).to(device=device, dtype=dtype)
+    relative = (
+        torch.empty(512, hidden_size)
+        .normal_(
+            mean=0.0,
+            std=0.02,
+            generator=generator,
+        )
+        .to(device=device, dtype=dtype)
+    )
     embedding = torch.empty(8192, hidden_size).normal_(
         mean=0.0,
         std=0.02,
@@ -143,7 +146,7 @@ def build_pair(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backends", type=parse_csv, default=["optimized", "triton"])
+    parser.add_argument("--backends", type=parse_csv, default=["torch", "triton"])
     parser.add_argument("--dtypes", type=parse_csv, default=["fp16", "bf16", "fp32"])
     parser.add_argument("--executions", type=parse_csv, default=["eager"])
     parser.add_argument("--head-dims", type=parse_csv_ints, default=[64])
@@ -152,8 +155,25 @@ def main() -> None:
         "--lengths",
         type=parse_csv_ints,
         default=[
-            1, 2, 31, 32, 33, 63, 64, 65, 127, 128, 129,
-            255, 256, 257, 511, 512, 513, 1024, 2048,
+            1,
+            2,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            511,
+            512,
+            513,
+            1024,
+            2048,
         ],
     )
     parser.add_argument("--position-modes", type=parse_csv, default=["both"])
@@ -166,8 +186,8 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is not available")
-    if set(args.backends) - {"optimized", "triton"}:
-        raise ValueError("backends must contain only optimized and/or triton")
+    if set(args.backends) - {"torch", "triton"}:
+        raise ValueError("backends must contain only torch and/or triton")
     if set(args.dtypes) - set(DTYPES):
         raise ValueError(f"dtypes must be selected from {sorted(DTYPES)}")
     if set(args.executions) - {"eager", "compile"}:
@@ -202,6 +222,8 @@ def main() -> None:
                             def eager_call(
                                 hidden_states: torch.Tensor,
                                 attention_mask: torch.Tensor,
+                                target=target,
+                                plan=plan,
                             ) -> torch.Tensor:
                                 return target.forward_prepared(
                                     hidden_states,
@@ -271,10 +293,7 @@ def main() -> None:
 
     summary = []
     groups = sorted(
-        {
-            (row["backend"], row["dtype"], row["execution"], row["head_dim"])
-            for row in rows
-        }
+        {(row["backend"], row["dtype"], row["execution"], row["head_dim"]) for row in rows}
     )
     print("\nMaximum observed errors")
     print(f"{'backend':>9} {'dtype':>5} {'execution':>9} {'D':>4} {'max abs':>14} {'mean abs':>14}")

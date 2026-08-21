@@ -1,4 +1,4 @@
-"""Prepared inference-only DeBERTa-v2/v3 disentangled attention.
+"""Pytorch inference-only DeBERTa-v2/v3 disentangled attention.
 
 The hot path keeps the exact eager attention equation, while moving relative
 projection and position-index work into explicit preparation.  Position-index
@@ -26,7 +26,7 @@ from .position import (
 )
 
 
-class PreparedPositionPlan(NamedTuple):
+class TorchPositionPlan(NamedTuple):
     """Layer projections plus shared gather indices for one sequence length."""
 
     sequence_length: int
@@ -44,7 +44,7 @@ def _invalidate_attention_cache_after_load(
     module.clear_inference_cache()
 
 
-class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
+class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
     """Cached, active-slot-pruned DeBERTa attention for inference only.
 
     ``forward_prepared`` performs no cache lookup or mutation and is the entry
@@ -62,9 +62,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         super().__init__(config)
         if isinstance(self.pos_att_type, str):
             self.pos_att_type = tuple(
-                part.strip().lower()
-                for part in self.pos_att_type.split("|")
-                if part.strip()
+                part.strip().lower() for part in self.pos_att_type.split("|") if part.strip()
             )
         uses_position_bias = self.relative_attention and bool(
             {"c2p", "p2c"}.intersection(self.pos_att_type)
@@ -79,15 +77,13 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         self.register_buffer("_cached_pos_query", None, persistent=False)
         self.register_buffer("_cached_qkv_weight", None, persistent=False)
         self.register_buffer("_cached_qkv_bias", None, persistent=False)
-        self._position_projection_cache: dict[
-            tuple[int, str], PreparedPositionPlan
-        ] = {}
+        self._position_projection_cache: dict[tuple[int, str], TorchPositionPlan] = {}
         self.register_load_state_dict_post_hook(_invalidate_attention_cache_after_load)
 
     def set_position_plan_cache(
         self,
         cache: SharedPositionPlanCache,
-    ) -> "InferenceDisentangledSelfAttention":
+    ) -> TorchInferenceDisentangledSelfAttention:
         """Attach a model-wide index cache and discard layer-derived plans."""
 
         self.position_plan_cache = cache
@@ -103,12 +99,12 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         self._cached_qkv_bias = None
         self._position_projection_cache.clear()
 
-    def train(self, mode: bool = True) -> "InferenceDisentangledSelfAttention":
+    def train(self, mode: bool = True) -> TorchInferenceDisentangledSelfAttention:
         if mode:
             self.clear_inference_cache()
         return super().train(mode)
 
-    def _apply(self, fn: Any, recurse: bool = True) -> "InferenceDisentangledSelfAttention":
+    def _apply(self, fn: Any, recurse: bool = True) -> TorchInferenceDisentangledSelfAttention:
         result = super()._apply(fn, recurse=recurse)
         self.clear_inference_cache()
         return result
@@ -130,7 +126,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
     def prepare_for_inference(
         self,
         rel_embeddings: torch.Tensor | None,
-    ) -> "InferenceDisentangledSelfAttention":
+    ) -> TorchInferenceDisentangledSelfAttention:
         """Cache layer-dependent relative projections and the fused QKV projection."""
 
         if self.training:
@@ -194,7 +190,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         self,
         sequence_length: int,
         device: torch.device | str | None = None,
-    ) -> PreparedPositionPlan:
+    ) -> TorchPositionPlan:
         """Prepare layer projections using a model-wide shared index plan."""
 
         if self.training:
@@ -208,7 +204,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
 
         indices = self.position_plan_cache.dense(sequence_length, resolved_device)
         pos_key, pos_query = self._project_active_positions(indices.active_slots)
-        plan = PreparedPositionPlan(
+        plan = TorchPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
             # For square self-attention DeBERTa's post-transpose p2c lookup is
@@ -227,7 +223,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         query_layer: torch.Tensor,
         key_layer: torch.Tensor,
         relative_pos: torch.Tensor,
-    ) -> PreparedPositionPlan:
+    ) -> TorchPositionPlan:
         """Compatibility path for caller-provided relative-position tensors."""
 
         if relative_pos.dim() == 2:
@@ -267,7 +263,7 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
             c2p_local = c2p_slots
             p2c_local = p2c_slots
         pos_key, pos_query = self._project_active_positions(active_slots)
-        return PreparedPositionPlan(
+        return TorchPositionPlan(
             sequence_length=query_layer.size(-2),
             active_slots=active_slots,
             c2p_local=c2p_local,
@@ -278,10 +274,10 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
 
     def _validate_inference_call(self) -> None:
         if self.training:
-            raise RuntimeError("InferenceDisentangledSelfAttention requires module.eval()")
+            raise RuntimeError("TorchInferenceDisentangledSelfAttention requires module.eval()")
         if torch.is_grad_enabled():
             raise RuntimeError(
-                "InferenceDisentangledSelfAttention requires torch.no_grad() or "
+                "TorchInferenceDisentangledSelfAttention requires torch.no_grad() or "
                 "torch.inference_mode()"
             )
 
@@ -306,18 +302,22 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         batch_size: int,
         sequence_length: int,
     ) -> torch.Tensor:
-        return tensor.view(
-            batch_size,
-            sequence_length,
-            self.num_attention_heads,
-            self.attention_head_size,
-        ).permute(0, 2, 1, 3).contiguous()
+        return (
+            tensor.view(
+                batch_size,
+                sequence_length,
+                self.num_attention_heads,
+                self.attention_head_size,
+            )
+            .permute(0, 2, 1, 3)
+            .contiguous()
+        )
 
     def forward_prepared(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        plan: PreparedPositionPlan,
+        plan: TorchPositionPlan,
     ) -> tuple[torch.Tensor, None]:
         """Pure tensor forward for a plan created outside the compiled graph."""
 
@@ -401,10 +401,16 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         if output_attentions:
             raise ValueError("output_attentions=True is not supported by the inference path")
         if query_states is not None:
-            raise ValueError("the optimized inference path supports self-attention only")
+            raise ValueError("the torch inference path supports self-attention only")
 
-        needs_key = self.relative_attention and "c2p" in self.pos_att_type and self._cached_pos_key is None
-        needs_query = self.relative_attention and "p2c" in self.pos_att_type and self._cached_pos_query is None
+        needs_key = (
+            self.relative_attention and "c2p" in self.pos_att_type and self._cached_pos_key is None
+        )
+        needs_query = (
+            self.relative_attention
+            and "p2c" in self.pos_att_type
+            and self._cached_pos_query is None
+        )
         needs_qkv = self._cached_qkv_weight is None
         if needs_key or needs_query or needs_qkv:
             self.prepare_for_inference(rel_embeddings)
@@ -423,4 +429,4 @@ class InferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         return self.forward_prepared(hidden_states, attention_mask, plan)
 
 
-__all__ = ["InferenceDisentangledSelfAttention", "PreparedPositionPlan"]
+__all__ = ["TorchInferenceDisentangledSelfAttention", "TorchPositionPlan"]

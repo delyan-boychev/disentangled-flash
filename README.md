@@ -1,14 +1,17 @@
 # DisentangledFlash
 
-**Fast exact DeBERTa-style disentangled attention in Triton.**
+[![CI](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml/badge.svg)](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
+***Fast exact DeBERTa-style disentangled attention in Triton.***
 
 DisentangledFlash is an inference-oriented implementation of bidirectional
-DeBERTa-v2/v3 disentangled self-attention. The Triton kernel fuses QK,
-relative-score lookup, factorized padding-mask application, online softmax,
-and PV without materializing a `[B, H, L, L]` attention tensor. C2P/P2C
-projection score GEMMs remain regular PyTorch GEMMs over the pruned active
-relative-position slots.
-f
+DeBERTa-v2/v3 disentangled self-attention. 
+
+The Triton kernel is inspired by [FlashAttention](https://github.com/Dao-AILab/flash-attention)'s tiling, IO-aware computations, and online softmax without memory materialization, while its relative position encoding implementation is inspired by [FlexAttention](https://pytorch.org/blog/flexattention/). It fuses QK, relative-score lookup, factorized padding-mask application, online softmax, and PV without materializing a `[B, H, L, L]` attention tensor. C2P/P2C projection score GEMMs remain regular PyTorch GEMMs over the pruned active relative-position slots.
+
+The PyTorch-optimized (`torch`) backend is constructed by optimizing operations, employing smart caching techniques, and leveraging fused QKV projection.
+
 
 ## Status
 
@@ -19,10 +22,15 @@ f
 - head dimensions 32, 64, and 128
 - factorized 2-D padding masks
 - prepared fixed-length buckets with dynamic batch size
-- **fused QKV projection is always enabled** for the Pytorch/Triton backends
+- **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
 Training/backward is not implemented. CPU/MPS use the PyTorch backend
 for development/benchmarking, not the Triton kernel.
+
+While currently tailored to DeBERTa-v2/v3, the kernel and caching abstractions are designed to be extensible to other architectures requiring factorized relative-position or disentangled attention schemes in the future.
+
+> [!IMPORTANT]
+> **GPU Compatibility**: The Triton kernel has been validated and benchmarked primarily on the **NVIDIA RTX 6000 Ada** (Compute Capability 8.9). Further testing, benchmarking, and autotuning calibration are required to ensure optimal performance on other GPU models and hardware architectures. **Pull requests, benchmark results, and configurations for other GPUs are highly welcome!**
 
 ## Install
 
@@ -48,9 +56,11 @@ DeBERTa-v2 tokenizer uses a SentencePiece `spm.model`.
 from transformers import AutoModelForSequenceClassification
 from disentangled_flash import optimize_deberta
 
-model = AutoModelForSequenceClassification.from_pretrained(
-    "microsoft/deberta-v2-xlarge-mnli"
-).cuda().eval()
+model = (
+    AutoModelForSequenceClassification.from_pretrained("microsoft/deberta-v2-xlarge-mnli")
+    .cuda()
+    .eval()
+)
 
 optimize_deberta(
     model.deberta,
@@ -84,7 +94,7 @@ python -m benchmarks.benchmark_cuda \
 ```
 
 The original backend remains unfused and acts as the reference baseline. The
-Pytorch and Triton backends always use one packed QKV projection.
+PyTorch and Triton backends always use one packed QKV projection.
 
 ## Pretrained task parity + speed
 
@@ -110,10 +120,7 @@ padding patterns, and C2P/P2C position modes while reporting raw max/mean errors
 
 ## Autotuning
 
-The current kernel retains the existing conservative Triton autotune candidates
-and early pruning. The next production step is an offline calibration sweep per
-GPU family, followed by shrinking the runtime candidate set to the minimum set
-that stays within a chosen regret target (for example 1-2% of the per-shape best).
+The autotuning is to be optimized in the future as it is currently greedy (evaluating too many configuration candidates). The next step is to run offline calibration sweeps per GPU family to determine and pre-select the fastest block configurations, significantly reducing runtime compilation and tuning overhead.
 
 Do not treat the current candidate table as a universal final table for every GPU.
 
@@ -264,7 +271,7 @@ The test verifies:
 - final encoder hidden states,
 - and the complete sequence-classification inference path.
 
-This test is reflecting a real pretrained DeBERTa model rather than only synthetic attention tensors.
+This test exercising a real pretrained DeBERTa model rather than only synthetic attention tensors.
 
 ### Test environment
 
@@ -277,11 +284,13 @@ All current CUDA benchmarks and pretrained-model parity tests were run on:
 | Compute capability | 8.9 |
 | CUDA | 13.0 |
 | PyTorch | 2.13.0+cu13 |
-| Transformers | 2.15.1 |
+| Transformers | 5.15.1 |
 | CPU | AMD Ryzen Threadripper PRO 7975WX, 32 cores |
 | System RAM | 512 GB |
 
 Latency numbers above are steady-state measurements. Triton compilation and autotuning startup cost are excluded from the reported p50 latency.
+
+Further validation and benchmarking are needed on other GPU architectures and configurations to guarantee optimal tuning and performance across different hardware.
 
 
 ## Attribution
@@ -289,3 +298,18 @@ Latency numbers above are steady-state measurements. Triton compilation and auto
 The auditable reference implementation is derived from Hugging Face Transformers
 4.57.6 DeBERTa-v2/v3 modeling code and retains its original Apache-2.0 header.
 See `THIRD_PARTY_NOTICES.md`.
+
+## Citation
+
+If you use DisentangledFlash in your research or project, please cite it as follows:
+
+```bibtex
+@software{boychev2026disentangledflash,
+  author = {Boychev, Delyan},
+  title = {DisentangledFlash: Fast exact DeBERTa-style disentangled attention in Triton},
+  url = {https://github.com/delyan-boychev/disentangled-flash},
+  version = {0.1.0},
+  year = {2026}
+}
+```
+

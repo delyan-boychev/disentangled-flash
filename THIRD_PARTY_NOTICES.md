@@ -5,4 +5,4 @@ Hugging Face Transformers 4.57.6 `models/deberta_v2/modeling_deberta_v2.py`. The
 retains the Microsoft and Hugging Face copyright notice and Apache License 2.0 header.
 
 The reference implementation is kept for auditable parity testing and to provide the minimal
-DeBERTa attention base used by the prepared inference implementation.
+DeBERTa attention base used by the PyTorch inference implementation.

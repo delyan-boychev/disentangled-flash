@@ -1,6 +1,6 @@
 """Isolated CUDA benchmark for standalone DeBERTa attention/encoder backends.
 
-By default this benchmarks the reference, prepared PyTorch, and Triton
+By default this benchmarks the reference, PyTorch, and Triton
 implementations under the four requested execution configurations:
 
 * FP16 eager
@@ -26,25 +26,25 @@ import sys
 import tempfile
 import time
 import types
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
-from disentangled_flash.deberta import DebertaV2InferenceEncoder
-from disentangled_flash._prepared import InferenceDisentangledSelfAttention
 from disentangled_flash._reference import (
     DebertaAttentionConfig,
     DebertaV2Encoder,
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
+from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
+from disentangled_flash.deberta import DebertaV2InferenceEncoder
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
-
 
 IMPLEMENTATIONS = {
     "original": OriginalDisentangledSelfAttention,
-    "optimized": InferenceDisentangledSelfAttention,
+    "torch": TorchInferenceDisentangledSelfAttention,
     "triton": TritonInferenceDisentangledSelfAttention,
 }
 DTYPES = {
@@ -76,9 +76,7 @@ def percentile(values: list[float], quantile: float) -> float:
 def configure_fp32(precision: str) -> None:
     torch.set_float32_matmul_precision("highest" if precision == "strict" else "high")
     try:
-        torch.backends.cuda.matmul.fp32_precision = (
-            "ieee" if precision == "strict" else "tf32"
-        )
+        torch.backends.cuda.matmul.fp32_precision = "ieee" if precision == "strict" else "tf32"
     except (AttributeError, RuntimeError):
         torch.backends.cuda.matmul.allow_tf32 = precision == "fast"
 
@@ -245,8 +243,8 @@ def make_models(
             fp32_precision=fp32_precision,
         )
         target.load_state_dict(reference.state_dict(), strict=True)
-    elif implementation == "optimized":
-        target = InferenceDisentangledSelfAttention(config)
+    elif implementation == "torch":
+        target = TorchInferenceDisentangledSelfAttention(config)
         target.load_state_dict(reference.state_dict(), strict=True)
     else:
         target = OriginalDisentangledSelfAttention(config)
@@ -397,9 +395,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
     if args.dtype not in DTYPES:
         raise ValueError(f"unknown dtype: {args.dtype}")
     if args.hidden_size != args.num_attention_heads * args.attention_head_size:
-        raise ValueError(
-            "hidden_size must equal num_attention_heads * attention_head_size"
-        )
+        raise ValueError("hidden_size must equal num_attention_heads * attention_head_size")
     if args.implementation == "triton":
         # Triton documents this switch as the supported way to report tuning
         # time and the winning configuration for every new tuning key.
@@ -772,7 +768,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--implementations",
         type=parse_csv,
-        default=["original", "optimized", "triton"],
+        default=["original", "torch", "triton"],
     )
     parser.add_argument("--dtypes", type=parse_csv, default=["fp16", "fp32"])
     parser.add_argument("--executions", type=parse_csv, default=["eager", "compile"])
@@ -805,7 +801,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--static", dest="dynamic", action="store_false")
 
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--implementation", choices=sorted(IMPLEMENTATIONS), help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--implementation", choices=sorted(IMPLEMENTATIONS.keys()), help=argparse.SUPPRESS
+    )
     parser.add_argument("--dtype", choices=sorted(DTYPES), help=argparse.SUPPRESS)
     parser.add_argument("--execution", choices=["eager", "compile"], help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", help=argparse.SUPPRESS)

@@ -12,8 +12,8 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ._prepared import InferenceDisentangledSelfAttention
 from ._reference import DebertaAttentionConfig
+from ._torch import TorchInferenceDisentangledSelfAttention
 from .position import SharedPositionPlanCache, canonical_device
 
 try:
@@ -41,16 +41,13 @@ if triton is not None:
         # tiny
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=1),
-
         # short / medium
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-
         # normal long path
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-
         # aggressive, but still sane
         triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
@@ -116,11 +113,12 @@ if triton is not None:
             # They use only one pipeline stage, and safe configurations above remain
             # available if Triton rejects one for resource usage.
             if not is_fp32 and head_dim <= 64:
-                allowed_shapes.update({
-                    (64, 128),
-                    (128, 64),
-                })
-
+                allowed_shapes.update(
+                    {
+                        (64, 128),
+                        (128, 64),
+                    }
+                )
 
         kept = [
             config
@@ -173,16 +171,10 @@ if triton is not None:
         value_base = value + batch_head * SEQUENCE_LENGTH * HEAD_DIM
         head = batch_head - batch * NUM_HEADS
 
-        output_base = (
-            output
-            + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM
-            + head * HEAD_DIM
-        )
+        output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
 
         query_values = tl.load(
-            query_base
-            + query_offsets[:, None] * HEAD_DIM
-            + dimension_offsets[None, :],
+            query_base + query_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
             mask=query_in_bounds[:, None],
             other=0.0,
         )
@@ -212,9 +204,7 @@ if triton is not None:
             ).to(tl.int1)
 
             key_values = tl.load(
-                key_base
-                + key_offsets[:, None] * HEAD_DIM
-                + dimension_offsets[None, :],
+                key_base + key_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
                 mask=key_in_bounds[:, None],
                 other=0.0,
             )
@@ -235,12 +225,7 @@ if triton is not None:
                 scores = tl.dot(query_values, tl.trans(key_values))
 
             pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
-            delta_index = (
-                query_offsets[:, None]
-                - key_offsets[None, :]
-                + SEQUENCE_LENGTH
-                - 1
-            )
+            delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -249,18 +234,14 @@ if triton is not None:
 
             if HAS_C2P:
                 scores += tl.load(
-                    c2p_base
-                    + query_offsets[:, None] * ACTIVE_SLOTS
-                    + local_slot,
+                    c2p_base + query_offsets[:, None] * ACTIVE_SLOTS + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
 
             if HAS_P2C:
                 scores += tl.load(
-                    p2c_base
-                    + key_offsets[None, :] * ACTIVE_SLOTS
-                    + local_slot,
+                    p2c_base + key_offsets[None, :] * ACTIVE_SLOTS + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
@@ -280,9 +261,7 @@ if triton is not None:
             )
 
             value_values = tl.load(
-                value_base
-                + key_offsets[:, None] * HEAD_DIM
-                + dimension_offsets[None, :],
+                value_base + key_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
                 mask=key_in_bounds[:, None],
                 other=0.0,
             )
@@ -365,7 +344,6 @@ if triton is not None:
             mask=query_in_bounds[:, None],
         )
 
-
     _autotune_kwargs: dict[str, Any] = {
         "configs": _AUTOTUNE_CONFIGS,
         "key": [
@@ -383,10 +361,9 @@ if triton is not None:
     }
     if "cache_results" in inspect.signature(triton.autotune).parameters:
         _autotune_kwargs["cache_results"] = True
-    _deberta_attention_autotuned_kernel = triton.autotune(
-        **_autotune_kwargs
-    )(_deberta_attention_forward_kernel)
-
+    _deberta_attention_autotuned_kernel = triton.autotune(**_autotune_kwargs)(
+        _deberta_attention_forward_kernel
+    )
 
     def _launch_deberta_attention(
         query: torch.Tensor,
@@ -451,7 +428,6 @@ if triton is not None:
         )
         return output
 
-
     if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
         _deberta_attention_op = torch.library.triton_op(
             "gliner2_attention::deberta_attention",
@@ -492,7 +468,7 @@ class TritonPreparedPositionPlan(NamedTuple):
     pos_query: torch.Tensor | None
 
 
-class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttention):
+class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention):
     """Forward-only CUDA Triton DeBERTa-v2/v3 self-attention.
 
     Head dimensions 32, 64, and 128 have explicit supported paths.  ``strict``
@@ -563,9 +539,7 @@ class TritonInferenceDisentangledSelfAttention(InferenceDisentangledSelfAttentio
         if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise TypeError("the Triton path supports FP16, BF16, and FP32")
         if self.attention_head_size not in {32, 64, 128}:
-            raise ValueError(
-                "the Triton path supports attention head dimensions 32, 64, and 128"
-            )
+            raise ValueError("the Triton path supports attention head dimensions 32, 64, and 128")
         self._validate_inference_call()
 
     def forward_prepared(

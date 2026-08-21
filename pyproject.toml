@@ -9,7 +9,7 @@ description = "Fast exact DeBERTa-style disentangled attention in Triton"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-authors = [{name = "Delyan Bocyehv", "email" = "delyan.boychev05@gmail.com"}]
+authors = [{name = "Delyan Boychev", "email" = "delyan.boychev05@gmail.com"}]
 dependencies = [
     "torch>=2.7",
 ]
@@ -41,3 +41,24 @@ markers = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+include = [
+    "validation/**/*.py",
+    "tests/**/*.py",
+    "src/**/*.py",
+    "benchmarks/**/*.py",
+    ".github/**/*.py",
+    "examples/**/*.py",
+]
+exclude = [
+    "src/disentangled_flash/_reference.py",
+]
+
+[tool.ruff.lint]
+exclude = [
+    ".github/**/*.py",
+    "examples/**/*.py",
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

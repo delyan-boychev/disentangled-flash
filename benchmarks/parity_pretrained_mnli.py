@@ -27,8 +27,8 @@ import argparse
 import statistics
 
 import torch
-from disentangled_flash.deberta import enable_deberta_inference
 
+from disentangled_flash.deberta import enable_deberta_inference
 
 EXAMPLES = [
     (
@@ -223,10 +223,7 @@ def main() -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be >= 1")
 
-    selected_examples = [
-        EXAMPLES[index % len(EXAMPLES)]
-        for index in range(args.batch_size)
-    ]
+    selected_examples = [EXAMPLES[index % len(EXAMPLES)] for index in range(args.batch_size)]
     premises = [premise for premise, _, _ in selected_examples]
     hypotheses = [hypothesis for _, hypothesis, _ in selected_examples]
 
@@ -253,10 +250,7 @@ def main() -> None:
     print("Loading / running Hugging Face reference...")
     reference = load_model(args.model, device=device, dtype=dtype)
 
-    id2label = {
-        int(index): label
-        for index, label in reference.config.id2label.items()
-    }
+    id2label = {int(index): label for index, label in reference.config.id2label.items()}
 
     reference_logits, reference_hidden = run_model(reference, inputs)
 
@@ -384,9 +378,7 @@ def main() -> None:
     print(f"p90 speedup: {p90_speedup:.4f}x")
 
     if not all_predictions_match:
-        raise SystemExit(
-            "\nTask-level parity FAILED: at least one predicted MNLI label changed"
-        )
+        raise SystemExit("\nTask-level parity FAILED: at least one predicted MNLI label changed")
 
     print("\nTask-level parity PASSED: all predicted labels are identical.")
 
