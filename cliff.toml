@@ -21,7 +21,7 @@ body = """
           {% if commit.breaking %}[**breaking**] {% endif %}\
           {{ commit.message | upper_first }} ([\
           {{- commit.id | truncate(length=7, end="") -}}\
-          ]({{ github_repo }}/commit/{{ commit.id }}))\
+          ](https://github.com/delyan-boychev/disentangled-flash/commit/{{ commit.id }}))\
     {% endfor %}
 {% endfor %}\n
 """
