@@ -21,7 +21,7 @@ body = """
           {% if commit.breaking %}[**breaking**] {% endif %}\
           {{ commit.message | upper_first }} ([\
           {{- commit.id | truncate(length=7, end="") -}}\
-          ]({{ github_repo }}/commit/{{ commit.id }}))\
+          ](https://github.com/delyan-boychev/disentangled-flash/commit/{{ commit.id }}))\
     {% endfor %}
 {% endfor %}\n
 """
@@ -41,17 +41,17 @@ filter_unconventional = false
 split_commits = false
 # regex for parsing and grouping commits
 commit_parsers = [
-    { message = "^feat", group = "⚡ Features" },
-    { message = "^fix", group = "🐛 Bug Fixes" },
-    { message = "^doc", group = "📚 Documentation" },
-    { message = "^perf", group = "🚀 Performance" },
-    { message = "^refactor", group = "🛠️ Refactors" },
-    { message = "^style", group = "💅 Styling" },
-    { message = "^test", group = "🧪 Testing" },
+    { message = "^feat", group = "Features" },
+    { message = "^fix", group = "Bug Fixes" },
+    { message = "^doc", group = "Documentation" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Refactors" },
+    { message = "^style", group = "Styling" },
+    { message = "^test", group = "Testing" },
     { message = "^chore\\(release\\)", skip = true },
-    { message = "^chore\\(deps\\)", group = "📦 Dependencies" },
-    { message = "^chore|ci", group = "⚙️ Miscellaneous Tasks" },
-    { body = ".*breaking.*", group = "💥 Breaking Changes" },
+    { message = "^chore\\(deps\\)", group = "Dependencies" },
+    { message = "^chore|ci", group = "Miscellaneous Tasks" },
+    { body = ".*breaking.*", group = "Breaking Changes" },
 ]
 # filter out the commits that are not matched by commit parsers
 filter_commits = false
