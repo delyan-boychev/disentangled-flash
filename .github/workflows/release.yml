@@ -12,13 +12,15 @@ on:
           - patch
           - minor
           - major
+          - none
 
 jobs:
   release:
-    name: Create Tag and GitHub Release
+    name: Create Tag, GitHub Release & Publish to PyPI
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write  # Required for OIDC PyPI trusted publishing
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,7 +44,6 @@ jobs:
           ruff check .
           ruff format --check .
           pytest
-
 
       - name: Configure Git
         run: |
@@ -81,6 +82,11 @@ jobs:
 
       - name: Build distribution package
         run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
