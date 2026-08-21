@@ -9,8 +9,8 @@ def main():
         sys.exit(1)
 
     bump_type = sys.argv[1].lower()
-    if bump_type not in ("major", "minor", "patch"):
-        print("Invalid bump type. Choose from: major, minor, patch")
+    if bump_type not in ("major", "minor", "patch", "none"):
+        print("Invalid bump type. Choose from: major, minor, patch, none")
         sys.exit(1)
 
     root = Path(__file__).parent.parent
@@ -27,7 +27,9 @@ def main():
     current_version = version_match.group(1)
     major, minor, patch = map(int, current_version.split("."))
 
-    if bump_type == "major":
+    if bump_type == "none":
+        new_version = current_version
+    elif bump_type == "major":
         new_version = f"{major + 1}.0.0"
     elif bump_type == "minor":
         new_version = f"{major}.{minor + 1}.0"
