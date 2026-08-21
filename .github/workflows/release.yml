@@ -12,19 +12,13 @@ on:
           - patch
           - minor
           - major
-      publish_pypi:
-        description: 'Publish package to PyPI (requires trusted publishing setup)'
-        required: true
-        default: true
-        type: boolean
 
 jobs:
   release:
-    name: Release & Publish
+    name: Create Tag and GitHub Release
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      id-token: write  # Required for OIDC PyPI trusted publishing
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -36,10 +30,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install build tools
+      - name: Install build tools and dev dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install build
+          python -m pip install -e ".[dev]"
+
+      - name: Run validation checks
+        run: |
+          ruff check .
+          ruff format --check .
+          pytest
+
 
       - name: Configure Git
         run: |
@@ -78,12 +80,6 @@ jobs:
 
       - name: Build distribution package
         run: python -m build
-
-      - name: Publish to PyPI
-        if: ${{ github.event.inputs.publish_pypi == true }}
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
