@@ -9,12 +9,7 @@ description = "Fast exact DeBERTa-style disentangled attention in Triton"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
-authors = [{name = "DisentangledFlash contributors"}]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: POSIX :: Linux",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
+authors = [{name = "Delyan Bocyehv", "email" = "delyan.boychev05@gmail.com"}]
 dependencies = [
     "torch>=2.7",
 ]
