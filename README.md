@@ -312,7 +312,7 @@ If you use DisentangledFlash in your research or project, please cite it as foll
   author = {Boychev, Delyan},
   title = {DisentangledFlash: Fast exact DeBERTa-style disentangled attention in Triton},
   url = {https://github.com/delyan-boychev/disentangled-flash},
-  version = {0.1.1},
+  version = {0.1.0},
   year = {2026}
 }
 ```
