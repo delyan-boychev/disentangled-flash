@@ -1,5 +1,6 @@
 # DisentangledFlash
 
+[![PyPI Version](https://img.shields.io/pypi/v/disentangled-flash.svg)](https://pypi.org/project/disentangled-flash/)
 [![CI](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml/badge.svg)](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
