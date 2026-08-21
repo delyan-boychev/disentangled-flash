@@ -118,6 +118,9 @@ python -m validation.validate_cuda
 The validation matrix covers FP16/BF16/FP32, boundary sequence lengths, several
 padding patterns, and C2P/P2C position modes while reporting raw max/mean errors.
 
+> [!NOTE]
+> **Test Coverage**: The current test suite is basic and incomplete. Expanding testing to cover more edge cases, parameters, and configurations is actively planned and is work to be done.
+
 ## Autotuning
 
 The autotuning is to be optimized in the future as it is currently greedy (evaluating too many configuration candidates). The next step is to run offline calibration sweeps per GPU family to determine and pre-select the fastest block configurations, significantly reducing runtime compilation and tuning overhead.
