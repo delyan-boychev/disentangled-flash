@@ -287,6 +287,7 @@ All current CUDA benchmarks and pretrained-model parity tests were run on:
 | Compute capability | 8.9 |
 | CUDA | 13.0 |
 | PyTorch | 2.13.0+cu13 |
+| Triton | 3.7.1 |
 | Transformers | 5.15.1 |
 | CPU | AMD Ryzen Threadripper PRO 7975WX, 32 cores |
 | System RAM | 512 GB |
