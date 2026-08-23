@@ -131,8 +131,7 @@ def named_tensor_stats(
     worst_rel_stats: dict[str, float] | None = None
     compared = 0
 
-    for name in reference:
-        ref_tensor = reference[name]
+    for name, ref_tensor in reference.items():
         cand_tensor = candidate[name]
         if ref_tensor is None or cand_tensor is None:
             if ref_tensor is not None or cand_tensor is not None:
