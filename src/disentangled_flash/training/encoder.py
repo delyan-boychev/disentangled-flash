@@ -49,9 +49,7 @@ class DebertaV2TrainingEncoder(nn.Module):
         )
         self.position_buckets = getattr(source_encoder, "position_buckets", -1)
         self.norm_rel_ebd = list(getattr(source_encoder, "norm_rel_ebd", ["none"]))
-        self.gradient_checkpointing = bool(
-            getattr(source_encoder, "gradient_checkpointing", False)
-        )
+        self.gradient_checkpointing = bool(getattr(source_encoder, "gradient_checkpointing", False))
 
         # Preserve HF module names and parameter ownership.
         self.layer = source_encoder.layer

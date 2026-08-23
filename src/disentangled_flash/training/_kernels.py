@@ -126,11 +126,7 @@ if triton is not None:
         query_base = query + batch * stride_qb + head * stride_qh
         key_base = key + batch * stride_kb + head * stride_kh
         value_base = value + batch * stride_vb + head * stride_vh
-        output_base = (
-            output
-            + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM
-            + head * HEAD_DIM
-        )
+        output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
         lse_base = lse_log2 + batch_head * SEQUENCE_LENGTH
 
         q = tl.load(
@@ -189,12 +185,7 @@ if triton is not None:
                 scores = tl.dot(q, tl.trans(k))
 
             pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
-            delta_index = (
-                query_offsets[:, None]
-                - key_offsets[None, :]
-                + SEQUENCE_LENGTH
-                - 1
-            )
+            delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -203,28 +194,20 @@ if triton is not None:
 
             if HAS_C2P:
                 scores += tl.load(
-                    c2p_base
-                    + query_offsets[:, None] * ACTIVE_SLOTS
-                    + local_slot,
+                    c2p_base + query_offsets[:, None] * ACTIVE_SLOTS + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
             if HAS_P2C:
                 scores += tl.load(
-                    p2c_base
-                    + key_offsets[None, :] * ACTIVE_SLOTS
-                    + local_slot,
+                    p2c_base + key_offsets[None, :] * ACTIVE_SLOTS + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
 
             scores *= SCORE_SCALE_LOG2
             if HAS_PADDING:
-                attended = (
-                    query_kept[:, None]
-                    & key_kept[None, :]
-                    & pair_in_bounds
-                )
+                attended = query_kept[:, None] & key_kept[None, :] & pair_in_bounds
                 scores = tl.where(attended, scores, -float("inf"))
                 padded_query = query_in_bounds[:, None] & ~query_kept[:, None]
                 # Match HF masked_fill(min) -> softmax semantics for padded rows:
@@ -258,13 +241,9 @@ if triton is not None:
                 new_row_sum = tl.sum(probabilities, axis=1)
                 if IS_FP32:
                     if STRICT_FP32:
-                        accumulator = tl.dot(
-                            probabilities, v, input_precision="ieee"
-                        )
+                        accumulator = tl.dot(probabilities, v, input_precision="ieee")
                     else:
-                        accumulator = tl.dot(
-                            probabilities, v, input_precision="tf32"
-                        )
+                        accumulator = tl.dot(probabilities, v, input_precision="tf32")
                 elif IS_BF16:
                     accumulator = tl.dot(probabilities.to(tl.bfloat16), v)
                 else:
@@ -291,13 +270,9 @@ if triton is not None:
                             input_precision="tf32",
                         )
                 elif IS_BF16:
-                    accumulator = tl.dot(
-                        probabilities.to(tl.bfloat16), v, accumulator
-                    )
+                    accumulator = tl.dot(probabilities.to(tl.bfloat16), v, accumulator)
                 else:
-                    accumulator = tl.dot(
-                        probabilities.to(tl.float16), v, accumulator
-                    )
+                    accumulator = tl.dot(probabilities.to(tl.float16), v, accumulator)
 
             row_max = new_row_max
             row_sum = new_row_sum
@@ -331,9 +306,7 @@ if triton is not None:
     }
     if "cache_results" in inspect.signature(triton.autotune).parameters:
         _FWD_AUTOTUNE_KWARGS["cache_results"] = True
-    _training_forward_autotuned = triton.autotune(**_FWD_AUTOTUNE_KWARGS)(
-        _training_forward_kernel
-    )
+    _training_forward_autotuned = triton.autotune(**_FWD_AUTOTUNE_KWARGS)(_training_forward_kernel)
 
     @triton.jit
     def _backward_preprocess_kernel(
@@ -814,8 +787,10 @@ def _empty_optional(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_empty((0,))
 
 
-if triton is not None and hasattr(torch.library, "triton_op") and hasattr(
-    torch.library, "wrap_triton"
+if (
+    triton is not None
+    and hasattr(torch.library, "triton_op")
+    and hasattr(torch.library, "wrap_triton")
 ):
 
     @torch.library.triton_op(
@@ -838,16 +813,8 @@ if triton is not None and hasattr(torch.library, "triton_op") and hasattr(
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        c2p = (
-            torch.matmul(query, pos_key.transpose(-1, -2))
-            if has_c2p
-            else _empty_optional(query)
-        )
-        p2c = (
-            torch.matmul(key, pos_query.transpose(-1, -2))
-            if has_p2c
-            else _empty_optional(key)
-        )
+        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
+        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
         output = torch.empty(
             (batch_size, sequence_length, num_heads * head_dim),
             device=query.device,
@@ -922,16 +889,8 @@ if triton is not None and hasattr(torch.library, "triton_op") and hasattr(
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        c2p = (
-            torch.matmul(query, pos_key.transpose(-1, -2))
-            if has_c2p
-            else _empty_optional(query)
-        )
-        p2c = (
-            torch.matmul(key, pos_query.transpose(-1, -2))
-            if has_p2c
-            else _empty_optional(key)
-        )
+        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
+        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
 
         output_heads = output.view(batch_size, sequence_length, num_heads, head_dim).permute(
             0, 2, 1, 3
@@ -967,9 +926,7 @@ if triton is not None and hasattr(torch.library, "triton_op") and hasattr(
             else torch.empty((0,), device=query.device, dtype=torch.float32)
         )
 
-        block_m, block_n, num_warps, num_stages = _backward_tile_config(
-            sequence_length, head_dim
-        )
+        block_m, block_n, num_warps, num_stages = _backward_tile_config(sequence_length, head_dim)
         preprocess_grid = (triton.cdiv(sequence_length, block_m), batch_size * num_heads)
         torch.library.wrap_triton(_backward_preprocess_kernel)[preprocess_grid](
             output_heads,
@@ -1154,41 +1111,35 @@ if triton is not None and hasattr(torch.library, "triton_op") and hasattr(
             output,
             lse_log2,
         ) = ctx.saved_tensors
-        grad_query, grad_key, grad_value, grad_c2p, grad_p2c = (
-            _training_attention_backward_op(
-                query,
-                key,
-                value,
-                pos_key,
-                pos_query,
-                delta_to_local,
-                attention_mask,
-                output,
-                lse_log2,
-                grad_output.contiguous(),
-                ctx.score_scale,
-                ctx.has_padding,
-                ctx.has_c2p,
-                ctx.has_p2c,
-                ctx.strict_fp32,
-            )
+        grad_query, grad_key, grad_value, grad_c2p, grad_p2c = _training_attention_backward_op(
+            query,
+            key,
+            value,
+            pos_key,
+            pos_query,
+            delta_to_local,
+            attention_mask,
+            output,
+            lse_log2,
+            grad_output.contiguous(),
+            ctx.score_scale,
+            ctx.has_padding,
+            ctx.has_c2p,
+            ctx.has_p2c,
+            ctx.strict_fp32,
         )
 
         grad_pos_key = None
         if ctx.has_c2p:
             grad_c2p_typed = grad_c2p.to(dtype=query.dtype)
             grad_query = grad_query + torch.matmul(grad_c2p_typed, pos_key)
-            grad_pos_key = torch.matmul(
-                grad_c2p_typed.transpose(-1, -2), query
-            ).sum(dim=0)
+            grad_pos_key = torch.matmul(grad_c2p_typed.transpose(-1, -2), query).sum(dim=0)
 
         grad_pos_query = None
         if ctx.has_p2c:
             grad_p2c_typed = grad_p2c.to(dtype=key.dtype)
             grad_key = grad_key + torch.matmul(grad_p2c_typed, pos_query)
-            grad_pos_query = torch.matmul(
-                grad_p2c_typed.transpose(-1, -2), key
-            ).sum(dim=0)
+            grad_pos_query = torch.matmul(grad_p2c_typed.transpose(-1, -2), key).sum(dim=0)
 
         return (
             grad_query,

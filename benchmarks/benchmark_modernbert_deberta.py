@@ -48,7 +48,7 @@ MAX_RELATIVE_POSITIONS = 512
 RESULT_PREFIX = "__BENCH_RESULT__="
 
 
-def gib(x: int | float) -> float:
+def gib(x: float) -> float:
     return float(x) / (1024.0**3)
 
 
@@ -181,9 +181,7 @@ def resolve_parameter_match(
         "modernbert_params": modern_params,
         "deberta_params": deberta_params,
         "deberta_intermediate_size": deberta_intermediate,
-        "parameter_difference_pct": 100.0
-        * (deberta_params - modern_params)
-        / modern_params,
+        "parameter_difference_pct": 100.0 * (deberta_params - modern_params) / modern_params,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
     }
@@ -227,8 +225,7 @@ def build_model(
             from flashdeberta import FlashDebertaV2Model
         except ImportError as exc:
             raise RuntimeError(
-                "deberta_flash requires FlashDeBERTa. Install it with: "
-                "pip install flashdeberta -U"
+                "deberta_flash requires FlashDeBERTa. Install it with: pip install flashdeberta -U"
             ) from exc
         # Direct construction keeps the exact same synthetic DeBERTa config as
         # the HF and DisentangledFlash variants.
@@ -298,9 +295,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "dtype": args.dtype,
         "modernbert_attn": (
-            args.modernbert_attn
-            if args.variant in {"modernbert", "modernbert_global"}
-            else None
+            args.modernbert_attn if args.variant in {"modernbert", "modernbert_global"} else None
         ),
         "status": "ok",
     }
@@ -361,9 +356,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             result.update(
                 {
                     "layer_types": layer_types,
-                    "num_full_attention_layers": sum(
-                        x == "full_attention" for x in layer_types
-                    ),
+                    "num_full_attention_layers": sum(x == "full_attention" for x in layer_types),
                     "num_sliding_attention_layers": sum(
                         x == "sliding_attention" for x in layer_types
                     ),
@@ -428,9 +421,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                 del out
         synchronize(torch, device)
 
-        latencies_ms = [
-            float(start.elapsed_time(end)) for start, end in zip(starts, ends)
-        ]
+        latencies_ms = [float(start.elapsed_time(end)) for start, end in zip(starts, ends)]
         median_ms = statistics.median(latencies_ms)
         result.update(
             {
@@ -544,19 +535,28 @@ def add_pairwise_metrics(results: list[dict[str, Any]]) -> None:
         if _ok(hf) and _ok(flash):
             flash["speedup_vs_deberta_hf"] = hf["latency_median_ms"] / flash["latency_median_ms"]
             if hf["incremental_peak_allocated_gib"] > 0:
-                flash["incremental_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
-                    hf["incremental_peak_allocated_gib"] - flash["incremental_peak_allocated_gib"]
-                ) / hf["incremental_peak_allocated_gib"]
+                flash["incremental_memory_reduction_vs_deberta_hf_pct"] = (
+                    100.0
+                    * (
+                        hf["incremental_peak_allocated_gib"]
+                        - flash["incremental_peak_allocated_gib"]
+                    )
+                    / hf["incremental_peak_allocated_gib"]
+                )
 
         if _ok(hf) and _ok(df):
             df["speedup_vs_deberta_hf"] = hf["latency_median_ms"] / df["latency_median_ms"]
-            df["peak_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
-                hf["peak_allocated_gib"] - df["peak_allocated_gib"]
-            ) / hf["peak_allocated_gib"]
+            df["peak_memory_reduction_vs_deberta_hf_pct"] = (
+                100.0
+                * (hf["peak_allocated_gib"] - df["peak_allocated_gib"])
+                / hf["peak_allocated_gib"]
+            )
             if hf["incremental_peak_allocated_gib"] > 0:
-                df["incremental_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
-                    hf["incremental_peak_allocated_gib"] - df["incremental_peak_allocated_gib"]
-                ) / hf["incremental_peak_allocated_gib"]
+                df["incremental_memory_reduction_vs_deberta_hf_pct"] = (
+                    100.0
+                    * (hf["incremental_peak_allocated_gib"] - df["incremental_peak_allocated_gib"])
+                    / hf["incremental_peak_allocated_gib"]
+                )
 
         if _ok(flash) and _ok(df):
             df["speedup_vs_flashdeberta"] = flash["latency_median_ms"] / df["latency_median_ms"]
@@ -579,9 +579,7 @@ def add_pairwise_metrics(results: list[dict[str, Any]]) -> None:
             )
 
         if _ok(mb_global) and _ok(df):
-            df["latency_ratio_vs_modernbert_global"] = _ratio(
-                df, mb_global, "latency_median_ms"
-            )
+            df["latency_ratio_vs_modernbert_global"] = _ratio(df, mb_global, "latency_median_ms")
             df["incremental_memory_ratio_vs_modernbert_global"] = _ratio(
                 df, mb_global, "incremental_peak_allocated_gib"
             )
@@ -617,7 +615,7 @@ def print_summary(results: list[dict[str, Any]]) -> None:
     print("-" * len(header))
     for r in results:
         print(
-            f"{r['variant']:<18} {r['length']:>6} {r.get('status','?'):>8} "
+            f"{r['variant']:<18} {r['length']:>6} {r.get('status', '?'):>8} "
             f"{fmt(r.get('latency_median_ms')):>10} "
             f"{fmt(r.get('tokens_per_s'), 0):>12} "
             f"{fmt(r.get('peak_allocated_gib'), 3):>10} "
@@ -626,9 +624,7 @@ def print_summary(results: list[dict[str, Any]]) -> None:
 
     by_key = {(r["variant"], r["length"]): r for r in results}
     print("\n=== DeBERTa implementation comparison ===")
-    print(
-        f"{'L':>6} {'Flash/HF speedup':>18} {'DF/HF speedup':>15} {'DF/Flash speedup':>18}"
-    )
+    print(f"{'L':>6} {'Flash/HF speedup':>18} {'DF/HF speedup':>15} {'DF/Flash speedup':>18}")
     print("-" * 64)
     for length in sorted({r["length"] for r in results}):
         flash = by_key.get(("deberta_flash", length), {})
