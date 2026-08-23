@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark ModernBERT and DeBERTa attention implementations.
 
 Variants:
@@ -136,7 +135,7 @@ def _construct_on_meta(constructor, config):
     try:
         with torch.device("meta"):
             return constructor(config)
-    except Exception:
+    except (RuntimeError, NotImplementedError):
         return constructor(config)
 
 
@@ -437,24 +436,15 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
         result["status"] = "oom"
         result["error"] = f"{type(exc).__name__}: {exc}"
-        try:
-            result["peak_allocated_gib"] = gib(torch.cuda.max_memory_allocated())
-            result["peak_reserved_gib"] = gib(torch.cuda.max_memory_reserved())
-        except Exception:
-            pass
-    except Exception as exc:
+        result["peak_allocated_gib"] = gib(torch.cuda.max_memory_allocated())
+        result["peak_reserved_gib"] = gib(torch.cuda.max_memory_reserved())
+    except Exception as exc:  # noqa: BLE001 - worker serializes arbitrary backend failures.
         result["status"] = "error"
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        try:
-            del model, input_ids, attention_mask
-        except Exception:
-            pass
+        del model, input_ids, attention_mask
         gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        torch.cuda.empty_cache()
     return result
 
 
@@ -491,7 +481,7 @@ def run_worker_subprocess(
     ]
     if args.allow_tf32:
         cmd.append("--allow-tf32")
-    proc = subprocess.run(cmd, text=True, capture_output=True)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     marker_line = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
