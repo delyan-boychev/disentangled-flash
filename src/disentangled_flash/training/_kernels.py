@@ -1,16 +1,14 @@
-"""Triton forward/backward kernels for trainable disentangled attention.
+"""Autograd integration and Triton backward kernels for disentangled attention.
 
-This module is intentionally separate from :mod:`disentangled_flash.kernel`,
-which remains the proven inference-only implementation.  The training forward
-uses the same tiled QK + compact relative lookup + online-softmax + PV
-algorithm, but additionally stores one FP32 log-sum-exp value per query row.
-Backward recomputes score/probability tiles and never materializes an L x L
-attention matrix.
+The canonical tiled forward lives in :mod:`disentangled_flash.kernel` and is
+shared by inference and training.  This module enables its ``STORE_LSE``
+specialization when gradients are enabled and owns the recompute-based
+backward.  Under ``no_grad()``/``inference_mode()`` it launches the same forward
+with ``STORE_LSE=False`` and allocates no LSE tensor.
 """
 
 from __future__ import annotations
 
-import inspect
 from typing import Any
 
 import torch
@@ -33,280 +31,7 @@ def _require_training_runtime() -> None:
 
 
 if triton is not None:
-    _FWD_CONFIGS = [
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-    ]
-
-    def _prune_fwd_configs(
-        configs: list[Any],
-        named_args: dict[str, Any],
-        **kwargs: Any,
-    ) -> list[Any]:
-        length_value = kwargs.get("SEQUENCE_LENGTH", named_args.get("SEQUENCE_LENGTH"))
-        head_dim_value = kwargs.get("HEAD_DIM", named_args.get("HEAD_DIM"))
-        is_fp32_value = kwargs.get("IS_FP32", named_args.get("IS_FP32"))
-        if length_value is None or head_dim_value is None:
-            return configs
-
-        length = int(length_value)
-        head_dim = int(head_dim_value)
-        is_fp32 = bool(is_fp32_value)
-        if length <= 16:
-            allowed = {(16, 16), (16, 32)}
-        elif length <= 32:
-            allowed = {(16, 16), (16, 32), (32, 32)}
-        elif length <= 64:
-            allowed = {(32, 32), (32, 64), (64, 32), (64, 64)}
-        else:
-            allowed = {(32, 32), (32, 64), (64, 32), (64, 64)}
-            if not is_fp32 and head_dim <= 64:
-                allowed.update({(64, 128), (128, 64)})
-        kept = [
-            config
-            for config in configs
-            if (config.kwargs["BLOCK_M"], config.kwargs["BLOCK_N"]) in allowed
-        ]
-        return kept or configs[:1]
-
-    @triton.jit
-    def _training_forward_kernel(
-        query,
-        key,
-        value,
-        c2p,
-        p2c,
-        delta_to_local_slot,
-        attention_mask,
-        output,
-        lse_log2,
-        stride_qb,
-        stride_qh,
-        stride_ql,
-        stride_qd,
-        stride_kb,
-        stride_kh,
-        stride_kl,
-        stride_kd,
-        stride_vb,
-        stride_vh,
-        stride_vl,
-        stride_vd,
-        ACTIVE_SLOTS: tl.constexpr,
-        BATCH_SIZE: tl.constexpr,
-        NUM_HEADS: tl.constexpr,
-        SEQUENCE_LENGTH: tl.constexpr,
-        HEAD_DIM: tl.constexpr,
-        SCORE_SCALE_LOG2: tl.constexpr,
-        HAS_C2P: tl.constexpr,
-        HAS_P2C: tl.constexpr,
-        HAS_PADDING: tl.constexpr,
-        IS_BF16: tl.constexpr,
-        IS_FP32: tl.constexpr,
-        STRICT_FP32: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_N: tl.constexpr,
-    ):
-        query_block = tl.program_id(0)
-        batch_head = tl.program_id(1)
-        batch = batch_head // NUM_HEADS
-        head = batch_head - batch * NUM_HEADS
-
-        query_offsets = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
-        key_lane = tl.arange(0, BLOCK_N)
-        dimension_offsets = tl.arange(0, HEAD_DIM)
-        query_in_bounds = query_offsets < SEQUENCE_LENGTH
-
-        query_base = query + batch * stride_qb + head * stride_qh
-        key_base = key + batch * stride_kb + head * stride_kh
-        value_base = value + batch * stride_vb + head * stride_vh
-        output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
-        lse_base = lse_log2 + batch_head * SEQUENCE_LENGTH
-
-        q = tl.load(
-            query_base
-            + query_offsets[:, None] * stride_ql
-            + dimension_offsets[None, :] * stride_qd,
-            mask=query_in_bounds[:, None],
-            other=0.0,
-        )
-
-        if HAS_PADDING:
-            query_kept = tl.load(
-                attention_mask + batch * SEQUENCE_LENGTH + query_offsets,
-                mask=query_in_bounds,
-                other=0,
-            ).to(tl.int1)
-        else:
-            query_kept = query_in_bounds
-
-        row_max = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
-        row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
-        accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-
-        if HAS_C2P:
-            c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
-        if HAS_P2C:
-            p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
-
-        for key_start in tl.range(0, SEQUENCE_LENGTH, BLOCK_N):
-            key_start = tl.multiple_of(key_start, BLOCK_N)
-            key_offsets = key_start + key_lane
-            key_in_bounds = key_offsets < SEQUENCE_LENGTH
-
-            if HAS_PADDING:
-                key_kept = tl.load(
-                    attention_mask + batch * SEQUENCE_LENGTH + key_offsets,
-                    mask=key_in_bounds,
-                    other=0,
-                ).to(tl.int1)
-            else:
-                key_kept = key_in_bounds
-
-            k = tl.load(
-                key_base
-                + key_offsets[:, None] * stride_kl
-                + dimension_offsets[None, :] * stride_kd,
-                mask=key_in_bounds[:, None],
-                other=0.0,
-            )
-            if IS_FP32:
-                if STRICT_FP32:
-                    scores = tl.dot(q, tl.trans(k), input_precision="ieee")
-                else:
-                    scores = tl.dot(q, tl.trans(k), input_precision="tf32")
-            else:
-                scores = tl.dot(q, tl.trans(k))
-
-            pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
-            delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
-            local_slot = tl.load(
-                delta_to_local_slot + delta_index,
-                mask=pair_in_bounds,
-                other=0,
-            ).to(tl.int32)
-
-            if HAS_C2P:
-                scores += tl.load(
-                    c2p_base + query_offsets[:, None] * ACTIVE_SLOTS + local_slot,
-                    mask=pair_in_bounds,
-                    other=0.0,
-                )
-            if HAS_P2C:
-                scores += tl.load(
-                    p2c_base + key_offsets[None, :] * ACTIVE_SLOTS + local_slot,
-                    mask=pair_in_bounds,
-                    other=0.0,
-                )
-
-            scores *= SCORE_SCALE_LOG2
-            if HAS_PADDING:
-                attended = query_kept[:, None] & key_kept[None, :] & pair_in_bounds
-                scores = tl.where(attended, scores, -float("inf"))
-                padded_query = query_in_bounds[:, None] & ~query_kept[:, None]
-                # Match HF masked_fill(min) -> softmax semantics for padded rows:
-                # all in-bounds keys receive equal probability.
-                scores = tl.where(
-                    padded_query & key_in_bounds[None, :],
-                    0.0,
-                    scores,
-                )
-            else:
-                scores = tl.where(pair_in_bounds, scores, -float("inf"))
-
-            # Keep unused rows in the final partial query tile numerically valid.
-            scores = tl.where(
-                ~query_in_bounds[:, None] & (key_offsets[None, :] == 0),
-                0.0,
-                scores,
-            )
-
-            v = tl.load(
-                value_base
-                + key_offsets[:, None] * stride_vl
-                + dimension_offsets[None, :] * stride_vd,
-                mask=key_in_bounds[:, None],
-                other=0.0,
-            )
-
-            if SEQUENCE_LENGTH <= BLOCK_N:
-                new_row_max = tl.max(scores, axis=1)
-                probabilities = tl.math.exp2(scores - new_row_max[:, None])
-                new_row_sum = tl.sum(probabilities, axis=1)
-                if IS_FP32:
-                    if STRICT_FP32:
-                        accumulator = tl.dot(probabilities, v, input_precision="ieee")
-                    else:
-                        accumulator = tl.dot(probabilities, v, input_precision="tf32")
-                elif IS_BF16:
-                    accumulator = tl.dot(probabilities.to(tl.bfloat16), v)
-                else:
-                    accumulator = tl.dot(probabilities.to(tl.float16), v)
-            else:
-                new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
-                correction = tl.math.exp2(row_max - new_row_max)
-                probabilities = tl.math.exp2(scores - new_row_max[:, None])
-                new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
-                accumulator *= correction[:, None]
-                if IS_FP32:
-                    if STRICT_FP32:
-                        accumulator = tl.dot(
-                            probabilities,
-                            v,
-                            accumulator,
-                            input_precision="ieee",
-                        )
-                    else:
-                        accumulator = tl.dot(
-                            probabilities,
-                            v,
-                            accumulator,
-                            input_precision="tf32",
-                        )
-                elif IS_BF16:
-                    accumulator = tl.dot(probabilities.to(tl.bfloat16), v, accumulator)
-                else:
-                    accumulator = tl.dot(probabilities.to(tl.float16), v, accumulator)
-
-            row_max = new_row_max
-            row_sum = new_row_sum
-
-        accumulator /= row_sum[:, None]
-        tl.store(
-            output_base
-            + query_offsets[:, None] * (NUM_HEADS * HEAD_DIM)
-            + dimension_offsets[None, :],
-            accumulator,
-            mask=query_in_bounds[:, None],
-        )
-        lse = row_max + tl.log(row_sum) * 1.4426950408889634
-        tl.store(lse_base + query_offsets, lse, mask=query_in_bounds)
-
-    _FWD_AUTOTUNE_KWARGS: dict[str, Any] = {
-        "configs": _FWD_CONFIGS,
-        "key": [
-            "BATCH_SIZE",
-            "SEQUENCE_LENGTH",
-            "HEAD_DIM",
-            "ACTIVE_SLOTS",
-            "HAS_C2P",
-            "HAS_P2C",
-            "HAS_PADDING",
-            "IS_BF16",
-            "IS_FP32",
-            "STRICT_FP32",
-        ],
-        "prune_configs_by": {"early_config_prune": _prune_fwd_configs},
-    }
-    if "cache_results" in inspect.signature(triton.autotune).parameters:
-        _FWD_AUTOTUNE_KWARGS["cache_results"] = True
-    _training_forward_autotuned = triton.autotune(**_FWD_AUTOTUNE_KWARGS)(_training_forward_kernel)
+    from ..kernel import _deberta_attention_autotuned_kernel
 
     @triton.jit
     def _backward_preprocess_kernel(
@@ -814,6 +539,7 @@ if (
         has_c2p: bool,
         has_p2c: bool,
         strict_fp32: bool,
+        store_lse: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
@@ -824,16 +550,21 @@ if (
             device=query.device,
             dtype=query.dtype,
         )
-        lse_log2 = torch.empty(
-            (batch_size, num_heads, sequence_length),
-            device=query.device,
-            dtype=torch.float32,
+        lse_log2 = (
+            torch.empty(
+                (batch_size, num_heads, sequence_length),
+                device=query.device,
+                dtype=torch.float32,
+            )
+            if store_lse
+            else torch.empty((0,), device=query.device, dtype=torch.float32)
         )
+        lse_storage = lse_log2 if store_lse else output
 
         def grid(meta: dict[str, Any]) -> tuple[int, int]:
             return triton.cdiv(sequence_length, meta["BLOCK_M"]), batch_size * num_heads
 
-        torch.library.wrap_triton(_training_forward_autotuned)[grid](
+        torch.library.wrap_triton(_deberta_attention_autotuned_kernel)[grid](
             query,
             key,
             value,
@@ -842,7 +573,7 @@ if (
             delta_to_local,
             attention_mask,
             output,
-            lse_log2,
+            lse_storage,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -867,6 +598,7 @@ if (
             IS_BF16=query.dtype == torch.bfloat16,
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
+            STORE_LSE=store_lse,
         )
         return output, lse_log2
 
@@ -1079,7 +811,10 @@ if (
             has_c2p,
             has_p2c,
             strict_fp32,
+            store_lse,
         ) = inputs
+        if not store_lse:
+            raise RuntimeError("differentiable training forward requires STORE_LSE=True")
         attention_output, lse_log2 = output
         ctx.save_for_backward(
             query,
@@ -1158,6 +893,7 @@ if (
             None,
             None,
             None,
+            None,
         )
 
     _training_attention_forward_op.register_autograd(
@@ -1187,8 +923,9 @@ def training_attention(
 
     ``query``, ``key`` and ``value`` are BHLD views.  ``pos_key`` and
     ``pos_query`` are HRD compact projected relative-position tables.  The
-    custom operator saves Q/K/V/O/LSE and the tiny position tables, but not the
-    BHLR C2P/P2C intermediates; those are recomputed in backward.
+    grad-enabled custom operator saves Q/K/V/O/LSE and the tiny position tables,
+    but not the BHLR C2P/P2C intermediates; those are recomputed in backward.
+    Under ``no_grad()`` the shared forward runs with ``STORE_LSE=False``.
     """
 
     _require_training_runtime()
@@ -1237,6 +974,7 @@ def training_attention(
         else:
             pos_query_tensor = _empty_optional(query)
 
+    store_lse = torch.is_grad_enabled()
     output, _lse = _training_attention_forward_op(
         query,
         key,
@@ -1250,6 +988,7 @@ def training_attention(
         bool(has_c2p),
         bool(has_p2c),
         bool(strict_fp32),
+        bool(store_lse),
     )
     return output
 

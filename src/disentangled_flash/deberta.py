@@ -1,10 +1,10 @@
-"""Encoder-level DeBERTa-v2/v3 inference fast path.
+"""Unified encoder-level DeBERTa-v2/v3 optimization integration.
 
 Hugging Face's regular encoder expands a 2-D padding mask to ``[B, 1, L, L]``
 and builds an ``[L, L]`` relative-position tensor before entering its layer
 loop.  This wrapper preserves the original layer output, FFN, convolution, and
-state-dict layout while passing the original 2-D mask and prepared position
-plans directly to the standalone attention implementations.
+state-dict layout while selecting either the Triton or optimized PyTorch
+attention backend for inference or differentiable training.
 """
 
 from __future__ import annotations
@@ -16,17 +16,58 @@ from typing import Any
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ._reference import BaseModelOutput
-from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
+from ._torch import (
+    TorchInferenceDisentangledSelfAttention,
+    TorchPositionPlan,
+    TorchTrainingDisentangledSelfAttention,
+)
 from .kernel import (
     TritonInferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
+    triton as _triton,
 )
 from .position import SharedPositionPlanCache
 from .tuning import KernelTuningOptions, ProfileRegistry
 
 PositionPlan = TorchPositionPlan | TritonPreparedPositionPlan
+
+
+def _resolve_backend(
+    backend: str,
+    *,
+    source_attention: nn.Module,
+    config: Any,
+    inference: bool,
+) -> str:
+    """Resolve backend selection without falling back to Hugging Face attention."""
+
+    if backend not in {"auto", "torch", "triton"}:
+        raise ValueError("backend must be 'auto', 'torch', or 'triton'")
+    if backend == "torch":
+        return "torch"
+
+    weight = source_attention.query_proj.weight
+    head_dim = getattr(config, "attention_head_size", None)
+    if head_dim is None:
+        head_dim = config.hidden_size // config.num_attention_heads
+    triton_supported = _triton is not None and int(head_dim) in {32, 64, 128}
+    if not inference:
+        triton_supported = triton_supported and hasattr(torch.library, "triton_op") and hasattr(
+            torch.library,
+            "wrap_triton",
+        )
+        if float(getattr(config, "attention_probs_dropout_prob", 0.0)) != 0.0:
+            triton_supported = False
+    if backend == "auto":
+        triton_supported = (
+            triton_supported
+            and weight.device.type == "cuda"
+            and weight.dtype in {torch.float16, torch.bfloat16, torch.float32}
+        )
+    return "triton" if triton_supported else "torch"
 
 
 def _invalidate_encoder_cache_after_load(
@@ -36,17 +77,18 @@ def _invalidate_encoder_cache_after_load(
     module.clear_inference_cache()
 
 
-class DebertaV2InferenceEncoder(nn.Module):
-    """Inference-only replacement for a Hugging Face ``DebertaV2Encoder``.
+class DebertaV2OptimizedEncoder(nn.Module):
+    """Single optimized replacement for a Hugging Face ``DebertaV2Encoder``.
 
     This module is a drop-in replacement for the Hugging Face encoder in DeBERTa-v2
     and DeBERTa-v3 models. It uses the fast, exact, Triton-fused or PyTorch-optimized
     disentangled self-attention mechanisms under the hood.
 
-    Call :meth:`prepare_for_inference` for all production bucket lengths, then
-    :meth:`activate_shape` before executing or compiling a bucket.  The hot
-    ``forward`` uses only the active immutable tuple of plans: no dictionary
-    lookup, relative-position construction, or cache mutation occurs there.
+    ``inference=True`` enables the parameter-derived packed/cached path and is
+    therefore intended for inference-only models.  ``inference=False`` keeps
+    parameter identities stable and projections differentiable.  In the latter
+    mode, ``model.eval()`` still permits backward; only ``no_grad()`` or
+    ``inference_mode()`` disables the Triton LSE/autograd state.
     """
 
     def __init__(
@@ -55,21 +97,24 @@ class DebertaV2InferenceEncoder(nn.Module):
         config: Any,
         *,
         backend: str = "triton",
+        inference: bool = True,
         fp32_precision: str = "strict",
         tuning: KernelTuningOptions | None = None,
         assume_unpadded: bool = False,
     ) -> None:
         super().__init__()
-        if backend not in {"torch", "triton"}:
-            raise ValueError("backend must be 'torch' or 'triton'")
-
-        if assume_unpadded and backend != "triton":
-            raise ValueError("assume_unpadded is supported only by the Triton backend")
-
         if not hasattr(source_encoder, "layer"):
             raise TypeError("source_encoder does not look like a DebertaV2Encoder")
 
-        self.backend = backend
+        first_attention = source_encoder.layer[0].attention.self
+        self.requested_backend = backend
+        self.inference = inference
+        self.backend = _resolve_backend(
+            backend,
+            source_attention=first_attention,
+            config=config,
+            inference=inference,
+        )
         self.fp32_precision = fp32_precision
         self.tuning = tuning or KernelTuningOptions()
         self.assume_unpadded = assume_unpadded
@@ -81,7 +126,11 @@ class DebertaV2InferenceEncoder(nn.Module):
         )
         self.position_buckets = getattr(source_encoder, "position_buckets", -1)
         self.norm_rel_ebd = list(getattr(source_encoder, "norm_rel_ebd", ["none"]))
-        self.gradient_checkpointing = False
+        self.gradient_checkpointing = (
+            False
+            if inference
+            else bool(getattr(source_encoder, "gradient_checkpointing", False))
+        )
 
         # Preserve the exact HF module names so checkpoint keys remain stable.
         self.layer = source_encoder.layer
@@ -107,11 +156,19 @@ class DebertaV2InferenceEncoder(nn.Module):
             uses_position_bias=uses_position_bias,
         )
 
-        attention_class: type[TorchInferenceDisentangledSelfAttention]
-        if backend == "triton":
+        attention_class: type[nn.Module]
+        if self.inference and self.backend == "triton":
             attention_class = TritonInferenceDisentangledSelfAttention
-        else:
+        elif self.inference:
             attention_class = TorchInferenceDisentangledSelfAttention
+        elif self.backend == "triton":
+            # Lazy import avoids a package-level cycle: training._kernels imports
+            # the canonical forward kernel from kernel.py.
+            from .training.attention import TritonTrainingDisentangledSelfAttention
+
+            attention_class = TritonTrainingDisentangledSelfAttention
+        else:
+            attention_class = TorchTrainingDisentangledSelfAttention
 
         profile_registry = (
             ProfileRegistry.from_options(self.tuning)
@@ -123,11 +180,12 @@ class DebertaV2InferenceEncoder(nn.Module):
             kwargs: dict[str, Any] = {
                 "position_plan_cache": self.position_plan_cache,
             }
-            if backend == "triton":
+            if self.backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
+            if self.inference and self.backend == "triton":
                 kwargs["tuning"] = self.tuning
                 kwargs["profile_registry"] = profile_registry
-                kwargs["assume_unpadded"] = assume_unpadded
+            kwargs["assume_unpadded"] = assume_unpadded
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(
@@ -140,7 +198,8 @@ class DebertaV2InferenceEncoder(nn.Module):
         self._prepared_plans: dict[int, tuple[PositionPlan, ...]] = {}
         self._active_sequence_length: int | None = None
         self._active_plans: tuple[PositionPlan, ...] | None = None
-        self.register_load_state_dict_post_hook(_invalidate_encoder_cache_after_load)
+        if self.inference:
+            self.register_load_state_dict_post_hook(_invalidate_encoder_cache_after_load)
 
     def get_rel_embedding(self) -> torch.Tensor | None:
         relative = self.rel_embeddings.weight if self.relative_attention else None
@@ -152,7 +211,14 @@ class DebertaV2InferenceEncoder(nn.Module):
         """Retain only the supported factorized mask; never expand it."""
 
         if attention_mask.dim() != 2:
-            raise ValueError("the inference encoder requires attention_mask with shape [B, L]")
+            raise ValueError("the optimized encoder requires attention_mask with shape [B, L]")
+        if (
+            not self.inference
+            and self.backend == "triton"
+            and not self.assume_unpadded
+            and (attention_mask.dtype != torch.bool or not attention_mask.is_contiguous())
+        ):
+            return attention_mask.bool().contiguous()
         return attention_mask
 
     def get_rel_pos(self, *args: Any, **kwargs: Any) -> None:
@@ -160,7 +226,7 @@ class DebertaV2InferenceEncoder(nn.Module):
 
         return
 
-    def _attention_modules(self) -> tuple[TorchInferenceDisentangledSelfAttention, ...]:
+    def _attention_modules(self) -> tuple[nn.Module, ...]:
         return tuple(layer.attention.self for layer in self.layer)
 
     def clear_inference_cache(self) -> None:
@@ -169,16 +235,17 @@ class DebertaV2InferenceEncoder(nn.Module):
         self._active_plans = None
         self.position_plan_cache.clear()
         for attention in self._attention_modules():
-            attention.clear_inference_cache()
+            if hasattr(attention, "clear_inference_cache"):
+                attention.clear_inference_cache()
 
-    def train(self, mode: bool = True) -> DebertaV2InferenceEncoder:
-        if mode and hasattr(self, "_prepared_plans"):
+    def train(self, mode: bool = True) -> DebertaV2OptimizedEncoder:
+        if self.inference and mode and hasattr(self, "_prepared_plans"):
             self.clear_inference_cache()
         return super().train(mode)
 
-    def _apply(self, fn: Any, recurse: bool = True) -> DebertaV2InferenceEncoder:
+    def _apply(self, fn: Any, recurse: bool = True) -> DebertaV2OptimizedEncoder:
         result = super()._apply(fn, recurse=recurse)
-        if hasattr(self, "_prepared_plans"):
+        if self.inference and hasattr(self, "_prepared_plans"):
             self.clear_inference_cache()
         return result
 
@@ -186,9 +253,13 @@ class DebertaV2InferenceEncoder(nn.Module):
     def prepare_for_inference(
         self,
         sequence_lengths: int | Iterable[int],
-    ) -> DebertaV2InferenceEncoder:
+    ) -> DebertaV2OptimizedEncoder:
         """Prepare every layer and every selected production bucket."""
 
+        if not self.inference:
+            raise RuntimeError(
+                "prepare_for_inference() requires optimize_deberta(..., inference=True)"
+            )
         if self.training:
             raise RuntimeError("prepare_for_inference() requires encoder.eval()")
         if isinstance(sequence_lengths, int):
@@ -221,9 +292,11 @@ class DebertaV2InferenceEncoder(nn.Module):
         self.activate_shape(lengths[0])
         return self
 
-    def activate_shape(self, sequence_length: int) -> DebertaV2InferenceEncoder:
+    def activate_shape(self, sequence_length: int) -> DebertaV2OptimizedEncoder:
         """Select a prebuilt bucket outside the compiled hot graph."""
 
+        if not self.inference:
+            raise RuntimeError("activate_shape() is available only when inference=True")
         try:
             plans = self._prepared_plans[sequence_length]
         except KeyError as error:
@@ -243,11 +316,13 @@ class DebertaV2InferenceEncoder(nn.Module):
         query_states: torch.Tensor | None,
         relative_pos: torch.Tensor | None,
     ) -> tuple[PositionPlan, ...]:
+        if not self.inference:
+            raise RuntimeError("prepared inference forward requires inference=True")
         if self.training:
-            raise RuntimeError("DebertaV2InferenceEncoder requires model.eval()")
+            raise RuntimeError("the cached inference path requires model.eval()")
         if torch.is_grad_enabled():
             raise RuntimeError(
-                "DebertaV2InferenceEncoder requires torch.no_grad() or inference_mode()"
+                "the cached inference path requires torch.no_grad() or inference_mode()"
             )
         if output_attentions:
             raise ValueError("output_attentions=True is not supported")
@@ -278,6 +353,9 @@ class DebertaV2InferenceEncoder(nn.Module):
         return_dict: bool = True,
     ) -> Any:
         """Execute the encoder without dense mask/relative-position construction."""
+
+        if not self.inference:
+            raise RuntimeError("forward_prepared() is available only when inference=True")
 
         all_hidden_states = (hidden_states,) if output_hidden_states else None
         next_kv = hidden_states
@@ -320,6 +398,97 @@ class DebertaV2InferenceEncoder(nn.Module):
             attentions=None,
         )
 
+    def _run_differentiable_layer(
+        self,
+        layer: nn.Module,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        rel_embeddings: torch.Tensor | None,
+    ) -> torch.Tensor:
+        self_output, _ = layer.attention.self(
+            hidden_states,
+            attention_mask,
+            output_attentions=False,
+            rel_embeddings=rel_embeddings,
+        )
+        attention_output = layer.attention.output(self_output, hidden_states)
+        intermediate_output = layer.intermediate(attention_output)
+        return layer.output(intermediate_output, attention_output)
+
+    def _forward_differentiable(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        output_hidden_states: bool,
+        output_attentions: bool,
+        query_states: torch.Tensor | None,
+        relative_pos: torch.Tensor | None,
+        return_dict: bool,
+    ) -> Any:
+        if output_attentions:
+            raise ValueError("output_attentions=True is not supported by the optimized path")
+        if query_states is not None:
+            raise ValueError("query_states/z_steps are not supported by the optimized path")
+        if relative_pos is not None:
+            raise ValueError("custom relative_pos tensors are not supported by the optimized path")
+        if attention_mask.shape[:2] != hidden_states.shape[:2]:
+            raise ValueError("attention_mask and hidden_states must have matching [B, L]")
+
+        layer_attention_mask = self.get_attention_mask(attention_mask)
+        rel_embeddings = self.get_rel_embedding()
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
+        next_kv = hidden_states
+        input_mask = attention_mask
+
+        for index, layer in enumerate(self.layer):
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                if rel_embeddings is None:
+                    output_states = checkpoint(
+                        lambda x, layer=layer: self._run_differentiable_layer(
+                            layer,
+                            x,
+                            layer_attention_mask,
+                            None,
+                        ),
+                        next_kv,
+                        use_reentrant=False,
+                    )
+                else:
+                    output_states = checkpoint(
+                        lambda x, rel, layer=layer: self._run_differentiable_layer(
+                            layer,
+                            x,
+                            layer_attention_mask,
+                            rel,
+                        ),
+                        next_kv,
+                        rel_embeddings,
+                        use_reentrant=False,
+                    )
+            else:
+                output_states = self._run_differentiable_layer(
+                    layer,
+                    next_kv,
+                    layer_attention_mask,
+                    rel_embeddings,
+                )
+
+            if index == 0 and self.conv is not None:
+                output_states = self.conv(hidden_states, output_states, input_mask)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (output_states,)
+            next_kv = output_states
+
+        if not return_dict:
+            values = (next_kv, all_hidden_states, None)
+            return tuple(value for value in values if value is not None)
+        return BaseModelOutput(
+            last_hidden_state=next_kv,
+            hidden_states=all_hidden_states,
+            attentions=None,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -330,6 +499,17 @@ class DebertaV2InferenceEncoder(nn.Module):
         relative_pos: torch.Tensor | None = None,
         return_dict: bool = True,
     ) -> Any:
+        if not self.inference:
+            return self._forward_differentiable(
+                hidden_states,
+                attention_mask,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                return_dict=return_dict,
+            )
+
         plans = self._validate_forward(
             hidden_states,
             attention_mask,
@@ -344,6 +524,86 @@ class DebertaV2InferenceEncoder(nn.Module):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+
+
+class DebertaV2InferenceEncoder(DebertaV2OptimizedEncoder):
+    """Compatibility wrapper for the unified encoder with ``inference=True``."""
+
+    def __init__(
+        self,
+        source_encoder: nn.Module,
+        config: Any,
+        *,
+        backend: str = "triton",
+        fp32_precision: str = "strict",
+        assume_unpadded: bool = False,
+    ) -> None:
+        super().__init__(
+            source_encoder,
+            config,
+            backend=backend,
+            inference=True,
+            fp32_precision=fp32_precision,
+            assume_unpadded=assume_unpadded,
+        )
+
+
+class DebertaV2TrainingEncoder(DebertaV2OptimizedEncoder):
+    """Compatibility wrapper for the unified encoder with ``inference=False``."""
+
+    def __init__(
+        self,
+        source_encoder: nn.Module,
+        config: Any,
+        *,
+        backend: str = "triton",
+        fp32_precision: str = "strict",
+        assume_unpadded: bool = False,
+    ) -> None:
+        super().__init__(
+            source_encoder,
+            config,
+            backend=backend,
+            inference=False,
+            fp32_precision=fp32_precision,
+            assume_unpadded=assume_unpadded,
+        )
+
+
+def _enable_deberta(
+    model: nn.Module,
+    *,
+    backend: str,
+    inference: bool,
+    sequence_lengths: Iterable[int] | int | None,
+    fp32_precision: str,
+    assume_unpadded: bool,
+) -> nn.Module:
+    if not hasattr(model, "encoder") or not hasattr(model, "embeddings"):
+        raise TypeError("model must be a Hugging Face DeBERTa-v2/v3 backbone")
+    if getattr(model, "z_steps", 0) > 1:
+        raise ValueError("DeBERTa z_steps > 1 is not supported by the optimized path")
+    if isinstance(model.encoder, DebertaV2OptimizedEncoder):
+        raise TypeError("the model already uses an optimized DeBERTa encoder")
+    if not inference and sequence_lengths is not None:
+        raise ValueError("sequence_lengths is only valid when inference=True")
+
+    was_training = model.training
+    if inference and sequence_lengths is not None and was_training:
+        raise RuntimeError("call model.eval() before preparing inference buckets")
+
+    encoder_class = DebertaV2InferenceEncoder if inference else DebertaV2TrainingEncoder
+    model.encoder = encoder_class(
+        model.encoder,
+        model.config,
+        backend=backend,
+        fp32_precision=fp32_precision,
+        assume_unpadded=assume_unpadded,
+    )
+    model.train(was_training)
+    if inference and sequence_lengths is not None:
+        model.encoder.prepare_for_inference(sequence_lengths)
+    return model
 
 
 def enable_deberta_inference(
@@ -362,28 +622,15 @@ def enable_deberta_inference(
     and inference-only.
     """
 
-    if not hasattr(model, "encoder") or not hasattr(model, "embeddings"):
-        raise TypeError("model must be a Hugging Face DeBERTa-v2/v3 backbone")
-    if getattr(model, "z_steps", 0) > 1:
-        raise ValueError("DeBERTa z_steps > 1 is not supported by the inference path")
-    if isinstance(model.encoder, DebertaV2InferenceEncoder):
-        raise TypeError("the model already uses DebertaV2InferenceEncoder")
-
-    was_training = model.training
-    if sequence_lengths is not None and was_training:
-        raise RuntimeError("call model.eval() before preparing inference buckets")
-    model.encoder = DebertaV2InferenceEncoder(
-        model.encoder,
-        model.config,
+    return _enable_deberta(
+        model,
         backend=backend,
+        inference=True,
+        sequence_lengths=sequence_lengths,
         fp32_precision=fp32_precision,
         tuning=tuning,
         assume_unpadded=assume_unpadded,
     )
-    model.train(was_training)
-    if sequence_lengths is not None:
-        model.encoder.prepare_for_inference(sequence_lengths)
-    return model
 
 
 def compile_deberta_buckets(
@@ -470,21 +717,54 @@ def compile_deberta_buckets(
 def optimize_deberta(
     model: nn.Module,
     *,
+    backend: str = "triton",
+    inference: bool = True,
     sequence_lengths: Iterable[int] | int | None = None,
     fp32_precision: str = "strict",
     tuning: KernelTuningOptions | None = None,
     assume_unpadded: bool = False,
 ) -> nn.Module:
-    """Enable the DisentangledFlash Triton backend on a Hugging Face DeBERTa backbone."""
+    """Enable the unified optimized DeBERTa backend.
 
-    return enable_deberta_inference(
+    ``inference=True`` is the default production mode and may install packed,
+    parameter-derived caches during inference preparation.  Set
+    ``inference=False`` before constructing an optimizer or training so
+    parameter identities remain stable and all projections stay differentiable.
+    ``backend='triton'`` falls back when the Triton runtime/model configuration
+    is unsupported. ``backend='auto'`` additionally considers the model's
+    current device and dtype before choosing Triton.
+    """
+
+    return _enable_deberta(
         model,
-        backend="triton",
+        backend=backend,
+        inference=inference,
         sequence_lengths=sequence_lengths,
         fp32_precision=fp32_precision,
         tuning=tuning,
         assume_unpadded=assume_unpadded,
     )
+
+
+def enable_deberta_training(
+    model: nn.Module,
+    *,
+    backend: str = "triton",
+    fp32_precision: str = "strict",
+    assume_unpadded: bool = False,
+) -> nn.Module:
+    """Enable the same optimized encoder with differentiable parameter handling."""
+
+    return optimize_deberta(
+        model,
+        backend=backend,
+        inference=False,
+        fp32_precision=fp32_precision,
+        assume_unpadded=assume_unpadded,
+    )
+
+
+optimize_deberta_training = enable_deberta_training
 
 
 # Compatibility alias for code from the standalone experiment.
@@ -493,8 +773,12 @@ enable_deberta_v2_inference = enable_deberta_inference
 
 __all__ = [
     "DebertaV2InferenceEncoder",
+    "DebertaV2OptimizedEncoder",
+    "DebertaV2TrainingEncoder",
     "compile_deberta_buckets",
     "enable_deberta_inference",
+    "enable_deberta_training",
     "enable_deberta_v2_inference",
     "optimize_deberta",
+    "optimize_deberta_training",
 ]

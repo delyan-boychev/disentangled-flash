@@ -1,9 +1,11 @@
-"""Pytorch inference-only DeBERTa-v2/v3 disentangled attention.
+"""Optimized PyTorch DeBERTa-v2/v3 disentangled attention backends.
 
 The hot path keeps the exact eager attention equation, while moving relative
 projection and position-index work into explicit preparation.  Position-index
 plans can be shared across every layer of an encoder; only the projected
-relative keys/queries remain layer-specific.
+relative keys/queries remain layer-specific.  Inference may additionally cache
+parameter-derived projections, while the training fallback keeps every
+projection differentiable and preserves parameter identities.
 """
 
 from __future__ import annotations
@@ -38,6 +40,72 @@ class TorchPositionPlan(NamedTuple):
     pos_query: torch.Tensor | None
 
 
+def _torch_disentangled_attention(
+    query_layer: torch.Tensor,
+    key_layer: torch.Tensor,
+    value_layer: torch.Tensor,
+    plan: TorchPositionPlan,
+    attention_mask: torch.Tensor,
+    *,
+    scale: float,
+    num_heads: int,
+    all_head_size: int,
+    assume_unpadded: bool,
+    dropout: nn.Module | None = None,
+) -> torch.Tensor:
+    """Shared exact PyTorch attention math for cached and differentiable paths."""
+
+    batch_size, _, sequence_length, _ = query_layer.shape
+    attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2) / scale)
+
+    if plan.pos_key is not None:
+        c2p_raw = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2)) / scale
+        attention_scores = attention_scores + torch.gather(
+            c2p_raw,
+            dim=-1,
+            index=plan.c2p_local.expand(
+                batch_size,
+                num_heads,
+                sequence_length,
+                sequence_length,
+            ),
+        )
+
+    if plan.pos_query is not None:
+        p2c_raw = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2)) / scale
+        attention_scores = attention_scores + torch.gather(
+            p2c_raw.transpose(-1, -2),
+            dim=-2,
+            index=plan.p2c_local.expand(
+                batch_size,
+                num_heads,
+                sequence_length,
+                sequence_length,
+            ),
+        )
+
+    if not assume_unpadded:
+        mask = _prepare_attention_mask(
+            attention_mask,
+            sequence_length,
+            sequence_length,
+        ).bool()
+        attention_scores = attention_scores.masked_fill(
+            ~mask,
+            torch.finfo(query_layer.dtype).min,
+        )
+
+    attention_probs = torch.softmax(attention_scores, dim=-1)
+    if dropout is not None:
+        attention_probs = dropout(attention_probs)
+    context_layer = torch.matmul(attention_probs, value_layer)
+    return (
+        context_layer.permute(0, 2, 1, 3)
+        .contiguous()
+        .view(batch_size, sequence_length, all_head_size)
+    )
+
+
 def _invalidate_attention_cache_after_load(
     module: torch.nn.Module,
     _incompatible_keys: Any,
@@ -59,6 +127,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         config: DebertaAttentionConfig | Any,
         *,
         position_plan_cache: SharedPositionPlanCache | None = None,
+        assume_unpadded: bool = False,
     ) -> None:
         super().__init__(config)
         if isinstance(self.pos_att_type, str):
@@ -74,6 +143,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             position_embedding_size=self.pos_ebd_size,
             uses_position_bias=uses_position_bias,
         )
+        self.assume_unpadded = assume_unpadded
         self.register_buffer("_cached_pos_key", None, persistent=False)
         self.register_buffer("_cached_pos_query", None, persistent=False)
         self.register_buffer("_cached_qkv_weight", None, persistent=False)
@@ -459,55 +529,21 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         key_layer = self._reshape_heads(key, batch_size, sequence_length)
         value_layer = self._reshape_heads(value, batch_size, sequence_length)
 
+        if self.relative_attention and "c2p" in self.pos_att_type and plan.pos_key is None:
+            raise ValueError("prepared plan has no content-to-position keys")
+        if self.relative_attention and "p2c" in self.pos_att_type and plan.pos_query is None:
+            raise ValueError("prepared plan has no position-to-content queries")
         scale_factor = 1 + int("c2p" in self.pos_att_type) + int("p2c" in self.pos_att_type)
-        scale = self._scale(scale_factor)
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2) / scale)
-
-        if self.relative_attention and "c2p" in self.pos_att_type:
-            if plan.pos_key is None:
-                raise ValueError("prepared plan has no content-to-position keys")
-            c2p_raw = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2)) / scale
-            attention_scores = attention_scores + torch.gather(
-                c2p_raw,
-                dim=-1,
-                index=plan.c2p_local.expand(
-                    batch_size,
-                    self.num_attention_heads,
-                    sequence_length,
-                    sequence_length,
-                ),
-            )
-
-        if self.relative_attention and "p2c" in self.pos_att_type:
-            if plan.pos_query is None:
-                raise ValueError("prepared plan has no position-to-content queries")
-            p2c_raw = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2)) / scale
-            attention_scores = attention_scores + torch.gather(
-                p2c_raw.transpose(-1, -2),
-                dim=-2,
-                index=plan.p2c_local.expand(
-                    batch_size,
-                    self.num_attention_heads,
-                    sequence_length,
-                    sequence_length,
-                ),
-            )
-
-        mask = _prepare_attention_mask(
+        context_layer = _torch_disentangled_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            plan,
             attention_mask,
-            sequence_length,
-            sequence_length,
-        ).bool()
-        attention_scores = attention_scores.masked_fill(
-            ~mask,
-            torch.finfo(query_layer.dtype).min,
-        )
-        attention_probs = torch.softmax(attention_scores, dim=-1)
-        context_layer = torch.matmul(attention_probs, value_layer)
-        context_layer = (
-            context_layer.permute(0, 2, 1, 3)
-            .contiguous()
-            .view(batch_size, sequence_length, self.all_head_size)
+            scale=self._scale(scale_factor),
+            num_heads=self.num_attention_heads,
+            all_head_size=self.all_head_size,
+            assume_unpadded=self.assume_unpadded,
         )
         return context_layer, None
 
@@ -583,4 +619,153 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         )
 
 
-__all__ = ["TorchInferenceDisentangledSelfAttention", "TorchPositionPlan"]
+class TorchTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention):
+    """Differentiable optimized PyTorch fallback with compact relative projections."""
+
+    def __init__(
+        self,
+        config: DebertaAttentionConfig | Any,
+        *,
+        position_plan_cache: SharedPositionPlanCache | None = None,
+        assume_unpadded: bool = False,
+    ) -> None:
+        super().__init__(config)
+        if isinstance(self.pos_att_type, str):
+            self.pos_att_type = tuple(
+                part.strip().lower() for part in self.pos_att_type.split("|") if part.strip()
+            )
+        uses_position_bias = self.relative_attention and bool(
+            {"c2p", "p2c"}.intersection(self.pos_att_type)
+        )
+        self.position_plan_cache = position_plan_cache or SharedPositionPlanCache(
+            position_buckets=self.position_buckets,
+            max_relative_positions=self.max_relative_positions,
+            position_embedding_size=self.pos_ebd_size,
+            uses_position_bias=uses_position_bias,
+        )
+        self.assume_unpadded = assume_unpadded
+
+    def set_position_plan_cache(
+        self,
+        cache: SharedPositionPlanCache,
+    ) -> TorchTrainingDisentangledSelfAttention:
+        self.position_plan_cache = cache
+        return self
+
+    def _reshape_heads(
+        self,
+        tensor: torch.Tensor,
+        batch_size: int,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        return tensor.view(
+            batch_size,
+            sequence_length,
+            self.num_attention_heads,
+            self.attention_head_size,
+        ).permute(0, 2, 1, 3)
+
+    def _project_active_positions(
+        self,
+        rel_embeddings: torch.Tensor,
+        active_slots: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        att_span = self.pos_ebd_size
+        relative = self.pos_dropout(rel_embeddings[: att_span * 2])
+        relative = relative.index_select(0, active_slots).unsqueeze(0)
+
+        pos_key = None
+        if self.relative_attention and "c2p" in self.pos_att_type:
+            projection = self.key_proj if self.share_att_key else self.pos_key_proj
+            pos_key = self.transpose_for_scores(
+                projection(relative),
+                self.num_attention_heads,
+            )
+
+        pos_query = None
+        if self.relative_attention and "p2c" in self.pos_att_type:
+            projection = self.query_proj if self.share_att_key else self.pos_query_proj
+            pos_query = self.transpose_for_scores(
+                projection(relative),
+                self.num_attention_heads,
+            )
+        return pos_key, pos_query
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_attentions: bool = False,
+        query_states: torch.Tensor | None = None,
+        relative_pos: torch.Tensor | None = None,
+        rel_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        if output_attentions:
+            raise ValueError("output_attentions=True is not supported by the optimized torch path")
+        if query_states is not None:
+            raise ValueError("the optimized torch path currently supports self-attention only")
+        if relative_pos is not None:
+            raise ValueError("custom relative_pos tensors are not supported by the optimized path")
+
+        batch_size, sequence_length = hidden_states.shape[:2]
+        if attention_mask.shape != (batch_size, sequence_length):
+            raise ValueError("attention_mask must have shape [B, L]")
+
+        query_layer = self._reshape_heads(
+            self.query_proj(hidden_states),
+            batch_size,
+            sequence_length,
+        )
+        key_layer = self._reshape_heads(
+            self.key_proj(hidden_states),
+            batch_size,
+            sequence_length,
+        )
+        value_layer = self._reshape_heads(
+            self.value_proj(hidden_states),
+            batch_size,
+            sequence_length,
+        )
+
+        indices = self.position_plan_cache.dense(sequence_length, hidden_states.device)
+        pos_key = None
+        pos_query = None
+        if self.relative_attention and {"c2p", "p2c"}.intersection(self.pos_att_type):
+            if rel_embeddings is None:
+                raise ValueError("rel_embeddings is required for relative attention")
+            pos_key, pos_query = self._project_active_positions(
+                rel_embeddings,
+                indices.active_slots,
+            )
+
+        plan = TorchPositionPlan(
+            sequence_length=sequence_length,
+            active_slots=indices.active_slots,
+            c2p_local=indices.pair_to_local,
+            p2c_local=indices.pair_to_local,
+            pos_key=pos_key,
+            pos_query=pos_query,
+        )
+        has_c2p = self.relative_attention and "c2p" in self.pos_att_type
+        has_p2c = self.relative_attention and "p2c" in self.pos_att_type
+        scale_factor = 1 + int(has_c2p) + int(has_p2c)
+        output = _torch_disentangled_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            plan,
+            attention_mask,
+            scale=math.sqrt(self.attention_head_size * scale_factor),
+            num_heads=self.num_attention_heads,
+            all_head_size=self.all_head_size,
+            assume_unpadded=self.assume_unpadded,
+            dropout=self.dropout,
+        )
+        return output, None
+
+
+__all__ = [
+    "TorchInferenceDisentangledSelfAttention",
+    "TorchPositionPlan",
+    "TorchTrainingDisentangledSelfAttention",
+]

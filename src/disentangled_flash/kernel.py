@@ -1,8 +1,10 @@
-"""CUDA Triton implementation of exact inference-only DeBERTa attention.
+"""CUDA Triton implementation of exact DeBERTa disentangled attention.
 
 QK, relative-score lookup, a factorized padding mask, online softmax, and PV
 are fused without constructing ``[B, H, L, L]`` scores/probabilities.  C2P and
-P2C remain regular GEMMs over the pruned active relative-position slots.
+P2C remain regular GEMMs over the pruned active relative-position slots.  The
+same forward kernel serves inference and training; training enables the
+compile-time ``STORE_LSE`` specialization needed by the custom backward.
 """
 
 from __future__ import annotations
@@ -146,6 +148,7 @@ if triton is not None:
         delta_to_local_slot,
         attention_mask,
         output,
+        lse_log2,
         stride_qb,
         stride_qh,
         stride_ql,
@@ -170,6 +173,7 @@ if triton is not None:
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
+        STORE_LSE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -188,6 +192,8 @@ if triton is not None:
         value_base = value + batch * stride_vb + head * stride_vh
 
         output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
+        if STORE_LSE:
+            lse_base = lse_log2 + batch_head * SEQUENCE_LENGTH
 
         query_values = tl.load(
             query_base
@@ -391,6 +397,9 @@ if triton is not None:
             accumulator,
             mask=query_in_bounds[:, None],
         )
+        if STORE_LSE:
+            lse = row_max + tl.log(row_sum) * 1.4426950408889634
+            tl.store(lse_base + query_offsets, lse, mask=query_in_bounds)
 
     _AUTOTUNE_KEY = [
         "BATCH_SIZE",
@@ -404,6 +413,7 @@ if triton is not None:
         "IS_BF16",
         "IS_FP32",
         "STRICT_FP32",
+        "STORE_LSE",
     ]
 
     def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
@@ -470,6 +480,7 @@ if triton is not None:
             "IS_BF16": is_bf16,
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,
+            "STORE_LSE": False,
         }
         torch.library.wrap_triton(autotuned_kernel)[grid](
             query,
@@ -479,6 +490,7 @@ if triton is not None:
             p2c,
             delta_to_local,
             attention_mask,
+            output,
             output,
             query.stride(0),
             query.stride(1),

@@ -7,12 +7,13 @@ from typing import Any
 
 import torch
 
-from .._reference import DebertaAttentionConfig, OriginalDisentangledSelfAttention
+from .._reference import DebertaAttentionConfig
+from .._torch import TorchTrainingDisentangledSelfAttention
 from ..position import SharedPositionPlanCache
 from ._kernels import training_attention
 
 
-class TritonTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention):
+class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAttention):
     """Trainable exact disentangled self-attention for CUDA.
 
     Parameter-derived inference caches are deliberately absent. Q/K/V and the
@@ -33,78 +34,15 @@ class TritonTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         fp32_precision: str = "strict",
         assume_unpadded: bool = False,
     ) -> None:
-        super().__init__(config)
-        if isinstance(self.pos_att_type, str):
-            self.pos_att_type = tuple(
-                part.strip().lower() for part in self.pos_att_type.split("|") if part.strip()
-            )
+        super().__init__(
+            config,
+            position_plan_cache=position_plan_cache,
+            assume_unpadded=assume_unpadded,
+        )
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
-        self.assume_unpadded = assume_unpadded
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
-
-        uses_position_bias = self.relative_attention and bool(
-            {"c2p", "p2c"}.intersection(self.pos_att_type)
-        )
-        self.position_plan_cache = position_plan_cache or SharedPositionPlanCache(
-            position_buckets=self.position_buckets,
-            max_relative_positions=self.max_relative_positions,
-            position_embedding_size=self.pos_ebd_size,
-            uses_position_bias=uses_position_bias,
-        )
-
-    def set_position_plan_cache(
-        self,
-        cache: SharedPositionPlanCache,
-    ) -> TritonTrainingDisentangledSelfAttention:
-        self.position_plan_cache = cache
-        return self
-
-    def _reshape_heads(
-        self,
-        tensor: torch.Tensor,
-        batch_size: int,
-        sequence_length: int,
-    ) -> torch.Tensor:
-        # Keep the same no-copy BHLD layout used by the inference Triton path.
-        return tensor.view(
-            batch_size,
-            sequence_length,
-            self.num_attention_heads,
-            self.attention_head_size,
-        ).permute(0, 2, 1, 3)
-
-    def _project_active_positions(
-        self,
-        rel_embeddings: torch.Tensor,
-        active_slots: torch.Tensor,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Project only active slots while preserving DeBERTa dropout semantics."""
-
-        att_span = self.pos_ebd_size
-        # HF applies positional dropout before projection. Apply it to the full
-        # 2*att_span table first so the stochastic operation has the same shape;
-        # only the small projection GEMMs are pruned to active slots.
-        relative = self.pos_dropout(rel_embeddings[: att_span * 2])
-        relative = relative.index_select(0, active_slots).unsqueeze(0)
-
-        pos_key = None
-        if self.relative_attention and "c2p" in self.pos_att_type:
-            projection = self.key_proj if self.share_att_key else self.pos_key_proj
-            pos_key = self.transpose_for_scores(
-                projection(relative),
-                self.num_attention_heads,
-            )
-
-        pos_query = None
-        if self.relative_attention and "p2c" in self.pos_att_type:
-            projection = self.query_proj if self.share_att_key else self.pos_query_proj
-            pos_query = self.transpose_for_scores(
-                projection(relative),
-                self.num_attention_heads,
-            )
-        return pos_key, pos_query
 
     def _normalize_mask(
         self,
