@@ -37,7 +37,7 @@ def test_cuda_benchmark_exposes_unpadded_mode():
 
 def test_make_models_accepts_unpadded_mode():
     import inspect
-    
+
     benchmark = load_benchmark_module()
     signature = inspect.signature(benchmark.make_models)
     assert "assume_unpadded" in signature.parameters

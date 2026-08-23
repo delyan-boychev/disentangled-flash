@@ -117,6 +117,7 @@ def build_pair(
         target = TritonInferenceDisentangledSelfAttention(
             config,
             fp32_precision=fp32_precision,
+            assume_unpadded=assume_unpadded,
         )
     else:
         target = TorchInferenceDisentangledSelfAttention(config)
