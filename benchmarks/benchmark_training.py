@@ -170,7 +170,7 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
         "--device",
         args.device,
     ]
-    proc = subprocess.run(cmd, text=True, capture_output=True)
+    proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     marker = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
@@ -215,7 +215,7 @@ def main() -> None:
                 "status": "oom",
                 "error": str(exc),
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - worker must serialize arbitrary failures.
             result = {
                 "variant": args.variant,
                 "length": args.length,
