@@ -36,10 +36,10 @@ def parse_csv_ints(value: str) -> list[int]:
 
 
 def error_stats(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
-    difference = (reference.float() - candidate.float()).abs()
+    difference = (reference.detach().float() - candidate.detach().float()).abs()
     return {
-        "max_abs": float(difference.max()),
-        "mean_abs": float(difference.mean()),
+        "max_abs": difference.max().item(),
+        "mean_abs": difference.mean().item(),
     }
 
 
