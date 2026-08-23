@@ -514,9 +514,11 @@ if triton is not None:
                 scores = tl.where(attended, scores, -float("inf"))
                 scores = tl.where(padded_pair, 0.0, scores)
                 active_pair = attended | padded_pair
+                score_grad_pair = attended
             else:
                 scores = tl.where(pair_in_bounds, scores, -float("inf"))
                 active_pair = pair_in_bounds
+                score_grad_pair = pair_in_bounds
 
             p = tl.math.exp2(scores - lse[:, None])
             p = tl.where(active_pair, p, 0.0)
@@ -529,7 +531,7 @@ if triton is not None:
             else:
                 dp = tl.dot(do, tl.trans(v))
             ds_raw = p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE
-            ds_raw = tl.where(active_pair, ds_raw, 0.0)
+            ds_raw = tl.where(score_grad_pair, ds_raw, 0.0)
 
             if IS_FP32:
                 if STRICT_FP32:
@@ -545,7 +547,7 @@ if triton is not None:
                 tl.atomic_add(
                     dc_base + rows[:, None] * ACTIVE_SLOTS + local_slot,
                     ds_raw,
-                    mask=active_pair,
+                    mask=score_grad_pair,
                 )
 
         tl.store(
@@ -717,9 +719,11 @@ if triton is not None:
                 scores = tl.where(attended, scores, -float("inf"))
                 scores = tl.where(padded_pair, 0.0, scores)
                 active_pair = attended | padded_pair
+                score_grad_pair = attended
             else:
                 scores = tl.where(pair_in_bounds, scores, -float("inf"))
                 active_pair = pair_in_bounds
+                score_grad_pair = pair_in_bounds
 
             p = tl.math.exp2(scores - lse[:, None])
             p = tl.where(active_pair, p, 0.0)
@@ -732,7 +736,7 @@ if triton is not None:
             else:
                 dp = tl.dot(do, tl.trans(v))
             ds_raw = p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE
-            ds_raw = tl.where(active_pair, ds_raw, 0.0)
+            ds_raw = tl.where(score_grad_pair, ds_raw, 0.0)
 
             if IS_FP32:
                 if STRICT_FP32:
@@ -752,7 +756,7 @@ if triton is not None:
                 tl.atomic_add(
                     dt_base + cols[None, :] * ACTIVE_SLOTS + local_slot,
                     ds_raw,
-                    mask=active_pair,
+                    mask=score_grad_pair,
                 )
 
         tl.store(
