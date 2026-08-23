@@ -1,46 +1,14 @@
 #!/usr/bin/env python3
-"""Benchmark ModernBERT vs DeBERTa vs DeBERTa+DisentangledFlash.
+"""Benchmark ModernBERT and DeBERTa attention implementations.
 
-This benchmark is intentionally inference-only and process-isolated per
-(model variant, sequence length) measurement.  It reports:
+Variants:
+  - modernbert: Hugging Face ModernBERT with its default local/global pattern
+  - modernbert_global: same ModernBERT block with full attention in every layer
+  - deberta_hf: parameter-matched Hugging Face DeBERTa-v3-style encoder
+  - deberta_flash: same DeBERTa config using Knowledgator FlashDeBERTa
+  - deberta_df: same DeBERTa config using DisentangledFlash
 
-- parameter count / theoretical parameter bytes
-- median / mean / p10 / p90 latency
-- sequences/s and tokens/s
-- CUDA baseline allocated/reserved memory
-- CUDA peak allocated/reserved memory
-- incremental peak allocated/reserved memory above the loaded model+inputs
-- OOM / error status
-
-The architectures are:
-  1) Hugging Face ModernBERT-base architecture with its default local/global
-     attention pattern
-  2) the same ModernBERT architecture forced to use full attention in every layer
-     (diagnostic only; isolates the effect of ModernBERT's sparse/local pattern)
-  3) parameter-matched DeBERTa-v3-style architecture (DebertaV2Model class,
-     c2p+p2c, shared attention keys, bucketed relative positions)
-  4) exactly the same DeBERTa model as (3), with only its encoder attention
-     path replaced by DisentangledFlash.
-
-To make parameter counts comparable, ModernBERT keeps its standard 22-layer,
-768-hidden, 12-head, 1152-intermediate architecture. DeBERTa keeps hidden=768,
-heads=12 and a DeBERTa-v3-style block, while using 15 layers and automatically
-choosing the FFN intermediate width (multiple of 64) that best matches the
-ModernBERT parameter count. This is therefore a parameter-matched DeBERTa-v3-style
-architecture, not the canonical microsoft/deberta-v3-base checkpoint architecture.
-
-Example:
-  python benchmark_modernbert_deberta.py \
-      --lengths 256 512 1024 2048 4096 8192 \
-      --batch-size 1 \
-      --dtype fp16 \
-      --modernbert-attn flash_attention_2 \
-      --warmup 5 \
-      --iters 20 \
-      --output-json encoder_scaling.json \
-      --output-csv encoder_scaling.csv
-
-For a dependency-light ModernBERT run, use --modernbert-attn sdpa.
+Each (variant, sequence length) is measured in a fresh subprocess.
 """
 
 from __future__ import annotations
@@ -61,8 +29,13 @@ from typing import Any
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-
-VARIANTS = ("modernbert", "modernbert_global", "deberta_hf", "deberta_df")
+VARIANTS = (
+    "modernbert",
+    "modernbert_global",
+    "deberta_hf",
+    "deberta_flash",
+    "deberta_df",
+)
 DEFAULT_LENGTHS = (256, 512, 1024, 2048, 4096, 8192)
 VOCAB_SIZE = 50_368
 HIDDEN_SIZE = 768
@@ -71,15 +44,12 @@ MODERNBERT_LAYERS = 22
 MODERNBERT_INTERMEDIATE = 1152
 DEBERTA_LAYERS = 15
 POSITION_BUCKETS = 256
+MAX_RELATIVE_POSITIONS = 512
 RESULT_PREFIX = "__BENCH_RESULT__="
 
 
 def gib(x: int | float) -> float:
     return float(x) / (1024.0**3)
-
-
-def mib(x: int | float) -> float:
-    return float(x) / (1024.0**2)
 
 
 def count_parameters(model: Any) -> int:
@@ -114,8 +84,6 @@ def percentile(values: list[float], q: float) -> float:
 def make_modernbert_config(max_length: int, *, all_global: bool = False):
     from transformers import ModernBertConfig
 
-    # Use the real ModernBERT-base dimensions while spelling out the main
-    # attention settings so results remain self-describing across versions.
     config = ModernBertConfig(
         vocab_size=VOCAB_SIZE,
         hidden_size=HIDDEN_SIZE,
@@ -128,21 +96,14 @@ def make_modernbert_config(max_length: int, *, all_global: bool = False):
         mlp_dropout=0.0,
         local_attention=128,
     )
-
     if all_global:
-        # Diagnostic only: preserve the complete ModernBERT block while forcing
-        # every layer to full attention. This isolates how much of the default
-        # ModernBERT speed/memory advantage comes from its local/global pattern.
         config.layer_types = ["full_attention"] * config.num_hidden_layers
-
     return config
 
 
 def make_deberta_config(max_length: int, intermediate_size: int):
     from transformers import DebertaV2Config
 
-    # This is DeBERTa-v3-style disentangled attention.  DeBERTa-v3 checkpoints
-    # use the DebertaV2Model implementation in Transformers.
     return DebertaV2Config(
         vocab_size=VOCAB_SIZE,
         hidden_size=HIDDEN_SIZE,
@@ -157,11 +118,9 @@ def make_deberta_config(max_length: int, intermediate_size: int):
         initializer_range=0.02,
         layer_norm_eps=1e-7,
         relative_attention=True,
-        # Preserve DeBERTa-v3-base relative-position geometry while allowing
-        # the encoder input itself to extend beyond 512 tokens. Leaving this at
-        # -1 would make it inherit max_position_embeddings (8192 here), changing
-        # the relative-bucket geometry in this long-context benchmark.
-        max_relative_positions=512,
+        # Keep DeBERTa-v3-base relative-position geometry while extending the
+        # sequence length itself.
+        max_relative_positions=MAX_RELATIVE_POSITIONS,
         position_buckets=POSITION_BUCKETS,
         norm_rel_ebd="layer_norm",
         share_att_key=True,
@@ -178,39 +137,38 @@ def _construct_on_meta(constructor, config):
         with torch.device("meta"):
             return constructor(config)
     except Exception:
-        # Fallback for older PyTorch/Transformers combinations.  This allocates
-        # the temporary model on CPU, so meta is strongly preferred.
         return constructor(config)
 
 
-def resolve_parameter_match(max_length: int, requested_intermediate: int | None) -> dict[str, Any]:
+def resolve_parameter_match(
+    max_length: int,
+    requested_intermediate: int | None,
+) -> dict[str, Any]:
     try:
         import torch
         import transformers
         from transformers import DebertaV2Model, ModernBertModel
     except ImportError as exc:
         raise SystemExit(
-            "This script requires PyTorch and a Transformers release containing ModernBERT. "
-            "Install/upgrade transformers (ModernBERT is available in recent releases)."
+            "This benchmark requires PyTorch and a Transformers release containing ModernBERT."
         ) from exc
 
-    modern_cfg = make_modernbert_config(max_length)
-    modern = _construct_on_meta(ModernBertModel, modern_cfg)
+    modern = _construct_on_meta(ModernBertModel, make_modernbert_config(max_length))
     modern_params = count_parameters(modern)
     del modern
     gc.collect()
 
-    if requested_intermediate is not None:
-        candidates = [requested_intermediate]
-    else:
-        # Keep the DeBERTa FFN close to its canonical 4x width while choosing
-        # the closest parameter match.  64-wide steps are GPU-friendly.
-        candidates = list(range(2560, 3585, 64))
-
+    candidates = (
+        [requested_intermediate]
+        if requested_intermediate is not None
+        else list(range(2560, 3585, 64))
+    )
     best: tuple[int, int] | None = None
     for intermediate in candidates:
-        cfg = make_deberta_config(max_length, intermediate)
-        model = _construct_on_meta(DebertaV2Model, cfg)
+        model = _construct_on_meta(
+            DebertaV2Model,
+            make_deberta_config(max_length, intermediate),
+        )
         params = count_parameters(model)
         del model
         gc.collect()
@@ -219,21 +177,19 @@ def resolve_parameter_match(max_length: int, requested_intermediate: int | None)
 
     assert best is not None
     deberta_intermediate, deberta_params = best
-    diff_pct = 100.0 * (deberta_params - modern_params) / modern_params
-
     return {
         "modernbert_params": modern_params,
         "deberta_params": deberta_params,
         "deberta_intermediate_size": deberta_intermediate,
-        "parameter_difference_pct": diff_pct,
+        "parameter_difference_pct": 100.0
+        * (deberta_params - modern_params)
+        / modern_params,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
     }
 
 
 def set_modernbert_attention_backend(model: Any, backend: str) -> None:
-    # Newer Transformers exposes a public runtime setter.  Older ModernBERT
-    # implementations read config._attn_implementation directly.
     if hasattr(model, "set_attn_implementation"):
         model.set_attn_implementation(backend)
     else:
@@ -255,7 +211,6 @@ def build_model(
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
     dtype = dtype_from_name(torch, dtype_name)
 
     if variant in {"modernbert", "modernbert_global"}:
@@ -263,10 +218,21 @@ def build_model(
             max_length,
             all_global=(variant == "modernbert_global"),
         )
-        # Set before construction for versions that choose masks/interfaces at init.
         config._attn_implementation = modernbert_attn
         model = ModernBertModel(config)
         set_modernbert_attention_backend(model, modernbert_attn)
+    elif variant == "deberta_flash":
+        config = make_deberta_config(max_length, deberta_intermediate)
+        try:
+            from flashdeberta import FlashDebertaV2Model
+        except ImportError as exc:
+            raise RuntimeError(
+                "deberta_flash requires FlashDeBERTa. Install it with: "
+                "pip install flashdeberta -U"
+            ) from exc
+        # Direct construction keeps the exact same synthetic DeBERTa config as
+        # the HF and DisentangledFlash variants.
+        model = FlashDebertaV2Model(config)
     else:
         config = make_deberta_config(max_length, deberta_intermediate)
         model = DebertaV2Model(config)
@@ -279,12 +245,8 @@ def build_model(
             from disentangled_flash import optimize_deberta
         except ImportError as exc:
             raise RuntimeError(
-                "deberta_df requires the DisentangledFlash package. From the repo, run: pip install -e ."
+                "deberta_df requires DisentangledFlash. From this repo run: pip install -e ."
             ) from exc
-
-        # Important: prepare ONLY this worker's one sequence length.  Preparing
-        # all benchmark buckets would make short-length baseline memory include
-        # caches belonging to the 8K case.
         optimize_deberta(
             model,
             sequence_lengths=[max_length],
@@ -315,14 +277,9 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
-
     requested_device = torch.device(args.device)
     if requested_device.type != "cuda":
         raise RuntimeError("this benchmark currently expects a CUDA device")
-
-    # Bare ``cuda`` has no explicit index and torch.cuda.set_device(torch.device("cuda"))
-    # can fail. Resolve it deterministically to logical cuda:0 (which is normally the
-    # allocated GPU inside a Slurm job).
     device_index = requested_device.index if requested_device.index is not None else 0
     torch.cuda.set_device(device_index)
     device = f"cuda:{device_index}"
@@ -331,7 +288,6 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     if hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.allow_tf32 = bool(args.allow_tf32)
 
-    # Make the allocator state as clean as possible inside this isolated process.
     gc.collect()
     torch.cuda.empty_cache()
     synchronize(torch, device)
@@ -348,10 +304,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "status": "ok",
     }
-
-    model = None
-    input_ids = None
-    attention_mask = None
+    model = input_ids = attention_mask = None
 
     try:
         model, config = build_model(
@@ -363,7 +316,6 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             dtype_name=args.dtype,
             seed=args.seed,
         )
-
         gc.collect()
         torch.cuda.empty_cache()
         synchronize(torch, device)
@@ -371,21 +323,21 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         params = count_parameters(model)
         dtype = dtype_from_name(torch, args.dtype)
         element_size = torch.tensor([], dtype=dtype).element_size()
-
-        # Avoid random pad/special IDs; token identity does not affect tensor shapes.
-        token_high = min(30_000, VOCAB_SIZE - 1)
         gen = torch.Generator(device=device)
         gen.manual_seed(args.seed + 17)
         input_ids = torch.randint(
-            low=10,
-            high=token_high,
-            size=(args.batch_size, args.length),
+            10,
+            min(30_000, VOCAB_SIZE - 1),
+            (args.batch_size, args.length),
             generator=gen,
             dtype=torch.long,
             device=device,
         )
+        # This synthetic scaling benchmark deliberately contains no padding.
         attention_mask = torch.ones(
-            (args.batch_size, args.length), dtype=torch.long, device=device
+            (args.batch_size, args.length),
+            dtype=torch.long,
+            device=device,
         )
 
         result.update(
@@ -397,7 +349,9 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                 "num_heads": int(config.num_attention_heads),
                 "intermediate_size": int(config.intermediate_size),
                 "gpu_name": torch.cuda.get_device_name(torch.device(device)),
-                "cuda_capability": ".".join(map(str, torch.cuda.get_device_capability(torch.device(device)))),
+                "cuda_capability": ".".join(
+                    map(str, torch.cuda.get_device_capability(torch.device(device)))
+                ),
                 "torch_version": torch.__version__,
             }
         )
@@ -408,10 +362,10 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                 {
                     "layer_types": layer_types,
                     "num_full_attention_layers": sum(
-                        layer_type == "full_attention" for layer_type in layer_types
+                        x == "full_attention" for x in layer_types
                     ),
                     "num_sliding_attention_layers": sum(
-                        layer_type == "sliding_attention" for layer_type in layer_types
+                        x == "sliding_attention" for x in layer_types
                     ),
                     "local_attention": int(getattr(config, "local_attention", 0)),
                 }
@@ -424,28 +378,28 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                     "relative_attention": bool(config.relative_attention),
                     "share_att_key": bool(config.share_att_key),
                     "pos_att_type": list(config.pos_att_type),
+                    "deberta_implementation": {
+                        "deberta_hf": "huggingface",
+                        "deberta_flash": "flashdeberta",
+                        "deberta_df": "disentangled_flash",
+                    }[args.variant],
                     "assume_unpadded": args.variant == "deberta_df",
                 }
             )
 
-        # Warm up kernel dispatch, FlashAttention/Triton compilation, and
-        # DisentangledFlash autotuning.  None of this is included in timing or peaks.
+        # Warmup includes FlashAttention/Triton compilation and autotuning.
         with torch.inference_mode():
             for _ in range(args.warmup):
                 out = forward_once(model, input_ids, attention_mask)
                 del out
         synchronize(torch, device)
-
         gc.collect()
         torch.cuda.empty_cache()
         synchronize(torch, device)
 
-        # Baseline includes model + persistent implementation caches + input tensors.
         baseline_alloc = torch.cuda.memory_allocated()
         baseline_reserved = torch.cuda.memory_reserved()
         torch.cuda.reset_peak_memory_stats()
-
-        # Dedicated peak-memory pass.
         with torch.inference_mode():
             out = forward_once(model, input_ids, attention_mask)
             synchronize(torch, device)
@@ -453,7 +407,6 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             peak_reserved = torch.cuda.max_memory_reserved()
             del out
         synchronize(torch, device)
-
         result.update(
             {
                 "baseline_allocated_gib": gib(baseline_alloc),
@@ -465,11 +418,8 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-        # Timing pass using CUDA events.  Events are created after the memory pass,
-        # so event setup is not part of the reported peak allocation.
         starts = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
         ends = [torch.cuda.Event(enable_timing=True) for _ in range(args.iters)]
-
         with torch.inference_mode():
             for i in range(args.iters):
                 starts[i].record()
@@ -478,14 +428,14 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                 del out
         synchronize(torch, device)
 
-        latencies_ms = [float(s.elapsed_time(e)) for s, e in zip(starts, ends)]
+        latencies_ms = [
+            float(start.elapsed_time(end)) for start, end in zip(starts, ends)
+        ]
         median_ms = statistics.median(latencies_ms)
-        mean_ms = statistics.fmean(latencies_ms)
-
         result.update(
             {
                 "latency_median_ms": median_ms,
-                "latency_mean_ms": mean_ms,
+                "latency_mean_ms": statistics.fmean(latencies_ms),
                 "latency_p10_ms": percentile(latencies_ms, 0.10),
                 "latency_p90_ms": percentile(latencies_ms, 0.90),
                 "sequences_per_s": args.batch_size * 1000.0 / median_ms,
@@ -493,7 +443,6 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                 "timings_ms": latencies_ms,
             }
         )
-
     except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
         result["status"] = "oom"
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -515,11 +464,15 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             torch.cuda.empty_cache()
         except Exception:
             pass
-
     return result
 
 
-def run_worker_subprocess(args: argparse.Namespace, variant: str, length: int, deberta_intermediate: int):
+def run_worker_subprocess(
+    args: argparse.Namespace,
+    variant: str,
+    length: int,
+    deberta_intermediate: int,
+):
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -547,13 +500,11 @@ def run_worker_subprocess(args: argparse.Namespace, variant: str, length: int, d
     ]
     if args.allow_tf32:
         cmd.append("--allow-tf32")
-
     proc = subprocess.run(cmd, text=True, capture_output=True)
     marker_line = None
     for line in proc.stdout.splitlines():
         if line.startswith(RESULT_PREFIX):
             marker_line = line[len(RESULT_PREFIX) :]
-
     if marker_line is None:
         return {
             "variant": variant,
@@ -566,79 +517,84 @@ def run_worker_subprocess(args: argparse.Namespace, variant: str, length: int, d
                 f"stdout={proc.stdout[-4000:]!r}; stderr={proc.stderr[-4000:]!r}"
             ),
         }
-
     result = json.loads(marker_line)
     if proc.stderr.strip():
-        # Keep warnings available for audit without spamming the main table.
         result["worker_stderr_tail"] = proc.stderr[-4000:]
     return result
+
+
+def _ok(row: dict[str, Any] | None) -> bool:
+    return bool(row and row.get("status") == "ok")
+
+
+def _ratio(a: dict[str, Any], b: dict[str, Any], key: str) -> float | None:
+    denom = b.get(key, 0)
+    return None if not denom else a[key] / denom
 
 
 def add_pairwise_metrics(results: list[dict[str, Any]]) -> None:
     by_key = {(r["variant"], r["length"]): r for r in results}
     for length in sorted({r["length"] for r in results}):
-        hf = by_key.get(("deberta_hf", length))
-        df = by_key.get(("deberta_df", length))
         mb = by_key.get(("modernbert", length))
         mb_global = by_key.get(("modernbert_global", length))
+        hf = by_key.get(("deberta_hf", length))
+        flash = by_key.get(("deberta_flash", length))
+        df = by_key.get(("deberta_df", length))
 
-        if hf and df and hf.get("status") == "ok" and df.get("status") == "ok":
-            hf_ms = hf["latency_median_ms"]
-            df_ms = df["latency_median_ms"]
-            df["speedup_vs_deberta_hf"] = hf_ms / df_ms
+        if _ok(hf) and _ok(flash):
+            flash["speedup_vs_deberta_hf"] = hf["latency_median_ms"] / flash["latency_median_ms"]
+            if hf["incremental_peak_allocated_gib"] > 0:
+                flash["incremental_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
+                    hf["incremental_peak_allocated_gib"] - flash["incremental_peak_allocated_gib"]
+                ) / hf["incremental_peak_allocated_gib"]
 
-            hf_mem = hf["peak_allocated_gib"]
-            df_mem = df["peak_allocated_gib"]
-            df["peak_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (hf_mem - df_mem) / hf_mem
+        if _ok(hf) and _ok(df):
+            df["speedup_vs_deberta_hf"] = hf["latency_median_ms"] / df["latency_median_ms"]
+            df["peak_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
+                hf["peak_allocated_gib"] - df["peak_allocated_gib"]
+            ) / hf["peak_allocated_gib"]
+            if hf["incremental_peak_allocated_gib"] > 0:
+                df["incremental_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (
+                    hf["incremental_peak_allocated_gib"] - df["incremental_peak_allocated_gib"]
+                ) / hf["incremental_peak_allocated_gib"]
 
-            hf_inc = hf["incremental_peak_allocated_gib"]
-            df_inc = df["incremental_peak_allocated_gib"]
-            if hf_inc > 0:
-                df["incremental_memory_reduction_vs_deberta_hf_pct"] = 100.0 * (hf_inc - df_inc) / hf_inc
-
-        if mb and df and mb.get("status") == "ok" and df.get("status") == "ok":
-            df["latency_ratio_vs_modernbert"] = df["latency_median_ms"] / mb["latency_median_ms"]
-            df["peak_memory_ratio_vs_modernbert"] = df["peak_allocated_gib"] / mb["peak_allocated_gib"]
-
-        if (
-            mb
-            and mb_global
-            and mb.get("status") == "ok"
-            and mb_global.get("status") == "ok"
-        ):
-            mb_global["latency_ratio_vs_modernbert_default"] = (
-                mb_global["latency_median_ms"] / mb["latency_median_ms"]
-            )
-            mb_global["incremental_memory_ratio_vs_modernbert_default"] = (
-                mb_global["incremental_peak_allocated_gib"]
-                / mb["incremental_peak_allocated_gib"]
-                if mb["incremental_peak_allocated_gib"] > 0
-                else None
+        if _ok(flash) and _ok(df):
+            df["speedup_vs_flashdeberta"] = flash["latency_median_ms"] / df["latency_median_ms"]
+            df["incremental_memory_ratio_vs_flashdeberta"] = _ratio(
+                df, flash, "incremental_peak_allocated_gib"
             )
 
-        if (
-            mb_global
-            and df
-            and mb_global.get("status") == "ok"
-            and df.get("status") == "ok"
-        ):
-            df["latency_ratio_vs_modernbert_global"] = (
-                df["latency_median_ms"] / mb_global["latency_median_ms"]
+        if _ok(mb) and _ok(mb_global):
+            mb_global["latency_ratio_vs_modernbert_default"] = _ratio(
+                mb_global, mb, "latency_median_ms"
+            )
+            mb_global["incremental_memory_ratio_vs_modernbert_default"] = _ratio(
+                mb_global, mb, "incremental_peak_allocated_gib"
+            )
+
+        if _ok(mb) and _ok(df):
+            df["latency_ratio_vs_modernbert"] = _ratio(df, mb, "latency_median_ms")
+            df["incremental_memory_ratio_vs_modernbert"] = _ratio(
+                df, mb, "incremental_peak_allocated_gib"
+            )
+
+        if _ok(mb_global) and _ok(df):
+            df["latency_ratio_vs_modernbert_global"] = _ratio(
+                df, mb_global, "latency_median_ms"
+            )
+            df["incremental_memory_ratio_vs_modernbert_global"] = _ratio(
+                df, mb_global, "incremental_peak_allocated_gib"
             )
 
 
 def save_csv(path: Path, results: list[dict[str, Any]]) -> None:
-    # Exclude the raw per-iteration timing array from CSV; it remains in JSON.
     keys: list[str] = []
     seen: set[str] = set()
     for row in results:
         for key in row:
-            if key == "timings_ms":
-                continue
-            if key not in seen:
+            if key != "timings_ms" and key not in seen:
                 seen.add(key)
                 keys.append(key)
-
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
         writer.writeheader()
@@ -648,69 +604,73 @@ def save_csv(path: Path, results: list[dict[str, Any]]) -> None:
 def fmt(x: Any, digits: int = 2) -> str:
     if x is None:
         return "-"
-    if isinstance(x, (int, float)):
-        return f"{x:.{digits}f}"
-    return str(x)
+    return f"{x:.{digits}f}" if isinstance(x, (int, float)) else str(x)
 
 
 def print_summary(results: list[dict[str, Any]]) -> None:
     print("\n=== Inference scaling summary ===")
     header = (
-        f"{'variant':<15} {'L':>6} {'status':>8} {'lat(ms)':>10} "
+        f"{'variant':<18} {'L':>6} {'status':>8} {'lat(ms)':>10} "
         f"{'tok/s':>12} {'peak GiB':>10} {'inc GiB':>10}"
     )
     print(header)
     print("-" * len(header))
     for r in results:
         print(
-            f"{r['variant']:<15} {r['length']:>6} {r.get('status','?'):>8} "
+            f"{r['variant']:<18} {r['length']:>6} {r.get('status','?'):>8} "
             f"{fmt(r.get('latency_median_ms')):>10} "
             f"{fmt(r.get('tokens_per_s'), 0):>12} "
             f"{fmt(r.get('peak_allocated_gib'), 3):>10} "
             f"{fmt(r.get('incremental_peak_allocated_gib'), 3):>10}"
         )
 
-    print("\n=== DisentangledFlash vs HF DeBERTa ===")
-    print(f"{'L':>6} {'speedup':>10} {'peak mem red.':>15} {'inc mem red.':>15}")
-    print("-" * 50)
-    for r in results:
-        if r["variant"] != "deberta_df":
-            continue
+    by_key = {(r["variant"], r["length"]): r for r in results}
+    print("\n=== DeBERTa implementation comparison ===")
+    print(
+        f"{'L':>6} {'Flash/HF speedup':>18} {'DF/HF speedup':>15} {'DF/Flash speedup':>18}"
+    )
+    print("-" * 64)
+    for length in sorted({r["length"] for r in results}):
+        flash = by_key.get(("deberta_flash", length), {})
+        df = by_key.get(("deberta_df", length), {})
         print(
-            f"{r['length']:>6} "
-            f"{fmt(r.get('speedup_vs_deberta_hf'), 2):>10} "
-            f"{(fmt(r.get('peak_memory_reduction_vs_deberta_hf_pct'), 1) + '%') if r.get('peak_memory_reduction_vs_deberta_hf_pct') is not None else '-':>15} "
-            f"{(fmt(r.get('incremental_memory_reduction_vs_deberta_hf_pct'), 1) + '%') if r.get('incremental_memory_reduction_vs_deberta_hf_pct') is not None else '-':>15}"
+            f"{length:>6} {fmt(flash.get('speedup_vs_deberta_hf')):>18} "
+            f"{fmt(df.get('speedup_vs_deberta_hf')):>15} "
+            f"{fmt(df.get('speedup_vs_flashdeberta')):>18}"
         )
 
     print("\n=== ModernBERT all-global diagnostic ===")
     print(f"{'L':>6} {'global/default lat':>20} {'global/default inc mem':>24}")
     print("-" * 54)
     for r in results:
-        if r["variant"] != "modernbert_global":
-            continue
-        print(
-            f"{r['length']:>6} "
-            f"{fmt(r.get('latency_ratio_vs_modernbert_default'), 2):>20} "
-            f"{fmt(r.get('incremental_memory_ratio_vs_modernbert_default'), 2):>24}"
-        )
+        if r["variant"] == "modernbert_global":
+            print(
+                f"{r['length']:>6} {fmt(r.get('latency_ratio_vs_modernbert_default')):>20} "
+                f"{fmt(r.get('incremental_memory_ratio_vs_modernbert_default')):>24}"
+            )
+
+    print("\n=== DisentangledFlash vs all-global ModernBERT ===")
+    print(f"{'L':>6} {'DF/global lat':>16} {'DF/global inc mem':>20}")
+    print("-" * 46)
+    for r in results:
+        if r["variant"] == "deberta_df":
+            print(
+                f"{r['length']:>6} {fmt(r.get('latency_ratio_vs_modernbert_global')):>16} "
+                f"{fmt(r.get('incremental_memory_ratio_vs_modernbert_global')):>20}"
+            )
 
 
 def main(args: argparse.Namespace) -> int:
     if args.worker:
-        res = worker(args)
-        print(RESULT_PREFIX + json.dumps(res, sort_keys=True))
+        print(RESULT_PREFIX + json.dumps(worker(args), sort_keys=True))
         return 0
-
     if not args.lengths:
         raise SystemExit("--lengths must not be empty")
     if min(args.lengths) < 1:
         raise SystemExit("all sequence lengths must be positive")
 
-    max_length = max(args.lengths)
-    match = resolve_parameter_match(max_length, args.deberta_intermediate)
+    match = resolve_parameter_match(max(args.lengths), args.deberta_intermediate)
     deberta_intermediate = int(match["deberta_intermediate_size"])
-
     print("=== Parameter match ===")
     print(f"ModernBERT: {match['modernbert_params']:,} params")
     print(
@@ -729,8 +689,6 @@ def main(args: argparse.Namespace) -> int:
     results: list[dict[str, Any]] = []
     total = len(VARIANTS) * len(args.lengths)
     n = 0
-
-    # Length-major ordering makes it easy to compare all three models as results arrive.
     for length in args.lengths:
         for variant in VARIANTS:
             n += 1
@@ -744,10 +702,9 @@ def main(args: argparse.Namespace) -> int:
                     f"incremental={res['incremental_peak_allocated_gib']:.3f} GiB"
                 )
             else:
-                print(f"    {res.get('status')}: {res.get('error', '')[:300]}")
+                print(f"    {res.get('status')}: {res.get('error', '')[:500]}")
 
     add_pairwise_metrics(results)
-
     payload = {
         "metadata": {
             "created_unix": time.time(),
@@ -764,20 +721,17 @@ def main(args: argparse.Namespace) -> int:
             "parameter_match": match,
             "note": (
                 "Each model/length pair is measured in a fresh subprocess. "
-                "DeBERTa-HF and DeBERTa-DF use the same architecture/config and deterministic seed; "
-                "DF changes only the inference attention implementation and uses the valid all-token "
-                "no-padding specialization because this synthetic benchmark supplies all-ones masks. "
-                "ModernBERT-global is a diagnostic variant that forces every ModernBERT layer to full attention."
+                "All three DeBERTa variants use the same synthetic architecture/config. "
+                "DisentangledFlash uses the no-padding specialization because masks are all ones. "
+                "ModernBERT-global forces every ModernBERT layer to full attention."
             ),
         },
         "results": results,
     }
-
     json_path = Path(args.output_json)
     csv_path = Path(args.output_csv)
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     save_csv(csv_path, results)
-
     print_summary(results)
     print(f"\nWrote {json_path}")
     print(f"Wrote {csv_path}")
@@ -786,7 +740,6 @@ def main(args: argparse.Namespace) -> int:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-
     p.add_argument("--lengths", type=int, nargs="+", default=list(DEFAULT_LENGTHS))
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
@@ -794,30 +747,24 @@ def parse_args() -> argparse.Namespace:
         "--modernbert-attn",
         choices=("flash_attention_2", "sdpa", "flex_attention", "eager"),
         default="flash_attention_2",
-        help="Attention backend used by ModernBERT. flash_attention_2 is the intended primary comparison.",
     )
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--device", default="cuda:0")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--allow-tf32", action="store_true")
-    p.add_argument(
-        "--deberta-intermediate",
-        type=int,
-        default=None,
-        help="Override automatic parameter matching for DeBERTa FFN width.",
-    )
+    p.add_argument("--deberta-intermediate", type=int, default=None)
     p.add_argument("--output-json", default="modernbert_deberta_scaling.json")
     p.add_argument("--output-csv", default="modernbert_deberta_scaling.csv")
-
-    # Internal worker flags.  Users normally do not set these directly.
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--variant", choices=VARIANTS, default="modernbert", help=argparse.SUPPRESS)
     p.add_argument("--length", type=int, default=256, help=argparse.SUPPRESS)
     p.add_argument(
-        "--deberta-intermediate-resolved", type=int, default=3200, help=argparse.SUPPRESS
+        "--deberta-intermediate-resolved",
+        type=int,
+        default=3200,
+        help=argparse.SUPPRESS,
     )
-
     args = p.parse_args()
     if args.warmup < 1:
         p.error("--warmup must be >= 1")
