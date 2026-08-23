@@ -1,7 +1,7 @@
 """Multi-step full-model training parity: legacy HF DeBERTa vs DisentangledFlash.
 
 This is an integration/trajectory test on top of the kernel-level gradient parity
-suite.  It seeds ordinary RNGs for reproducibility but intentionally does not
+suite. It seeds ordinary RNGs for reproducibility but intentionally does not
 force deterministic CUDA algorithms, so the execution remains representative
 of normal training.
 """
@@ -13,9 +13,10 @@ import copy
 import json
 import math
 import random
+from collections.abc import Iterable
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 import numpy as np
 import torch
@@ -240,9 +241,9 @@ def forward_loss(
             output_hidden_states=False,
             return_dict=True,
         ).last_hidden_state
-    # A deterministic random linear probe gives gradients to every output
-    # position without introducing a task head that differs between models.
-    loss = (output.float() * probe).mean()
+    # Stable positive objective with gradients at every output position. The
+    # same deterministic random target is used by both model trajectories.
+    loss = (output.float() - probe).square().mean()
     return output, loss
 
 
