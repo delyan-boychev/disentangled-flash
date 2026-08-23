@@ -204,6 +204,13 @@ class DebertaV2InferenceEncoder(nn.Module):
             self._prepared_plans[length] = tuple(
                 attention.prepare_shape(length, device) for attention in attentions
             )
+
+        # Every prepared shape now owns its compact projected position tensors.
+        # The full per-layer projected position tables were only preparation
+        # workspace and need not remain resident during inference.
+        for attention in attentions:
+            attention.release_position_projection_workspace()
+
         self.activate_shape(lengths[0])
         return self
 

@@ -146,6 +146,18 @@ if triton is not None:
         delta_to_local_slot,
         attention_mask,
         output,
+        stride_qb,
+        stride_qh,
+        stride_ql,
+        stride_qd,
+        stride_kb,
+        stride_kh,
+        stride_kl,
+        stride_kd,
+        stride_vb,
+        stride_vh,
+        stride_vl,
+        stride_vd,
         ACTIVE_SLOTS: tl.constexpr,
         BATCH_SIZE: tl.constexpr,
         NUM_HEADS: tl.constexpr,
@@ -154,6 +166,7 @@ if triton is not None:
         SCORE_SCALE_LOG2: tl.constexpr,
         HAS_C2P: tl.constexpr,
         HAS_P2C: tl.constexpr,
+        HAS_PADDING: tl.constexpr,
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
@@ -168,23 +181,33 @@ if triton is not None:
         dimension_offsets = tl.arange(0, HEAD_DIM)
         query_in_bounds = query_offsets < SEQUENCE_LENGTH
 
-        query_base = query + batch_head * SEQUENCE_LENGTH * HEAD_DIM
-        key_base = key + batch_head * SEQUENCE_LENGTH * HEAD_DIM
-        value_base = value + batch_head * SEQUENCE_LENGTH * HEAD_DIM
         head = batch_head - batch * NUM_HEADS
 
-        output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
+        query_base = query + batch * stride_qb + head * stride_qh
+        key_base = key + batch * stride_kb + head * stride_kh
+        value_base = value + batch * stride_vb + head * stride_vh
+
+        output_base = (
+            output
+            + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM
+            + head * HEAD_DIM
+        )
 
         query_values = tl.load(
-            query_base + query_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
+            query_base
+            + query_offsets[:, None] * stride_ql
+            + dimension_offsets[None, :] * stride_qd,
             mask=query_in_bounds[:, None],
             other=0.0,
         )
-        query_is_kept = tl.load(
-            attention_mask + batch * SEQUENCE_LENGTH + query_offsets,
-            mask=query_in_bounds,
-            other=0,
-        ).to(tl.int1)
+        if HAS_PADDING:
+            query_is_kept = tl.load(
+                attention_mask + batch * SEQUENCE_LENGTH + query_offsets,
+                mask=query_in_bounds,
+                other=0,
+            ).to(tl.int1)
+        else:
+            query_is_kept = query_in_bounds
 
         row_max = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
         row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
@@ -199,14 +222,19 @@ if triton is not None:
             key_start = tl.multiple_of(key_start, BLOCK_N)
             key_offsets = key_start + tl.arange(0, BLOCK_N)
             key_in_bounds = key_offsets < SEQUENCE_LENGTH
-            key_is_kept = tl.load(
-                attention_mask + batch * SEQUENCE_LENGTH + key_offsets,
-                mask=key_in_bounds,
-                other=0,
-            ).to(tl.int1)
+            if HAS_PADDING:
+                key_is_kept = tl.load(
+                    attention_mask + batch * SEQUENCE_LENGTH + key_offsets,
+                    mask=key_in_bounds,
+                    other=0,
+                ).to(tl.int1)
+            else:
+                key_is_kept = key_in_bounds
 
             key_values = tl.load(
-                key_base + key_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
+                key_base
+                + key_offsets[:, None] * stride_kl
+                + dimension_offsets[None, :] * stride_kd,
                 mask=key_in_bounds[:, None],
                 other=0.0,
             )
@@ -249,21 +277,44 @@ if triton is not None:
                 )
 
             scores *= SCORE_SCALE_LOG2
-            attended = query_is_kept[:, None] & key_is_kept[None, :] & pair_in_bounds
-            scores = tl.where(attended, scores, -float("inf"))
+            if HAS_PADDING:
+                attended = (
+                    query_is_kept[:, None]
+                    & key_is_kept[None, :]
+                    & pair_in_bounds
+                )
+                scores = tl.where(attended, scores, -float("inf"))
 
-            # HF masks every score of a padded query with one finite minimum;
-            # softmax therefore becomes uniform over the complete in-range row.
-            padded_query_row = query_in_bounds[:, None] & ~query_is_kept[:, None]
-            scores = tl.where(padded_query_row & key_in_bounds[None, :], 0.0, scores)
+                # Preserve Hugging Face semantics for padded query rows.
+                padded_query_row = (
+                    query_in_bounds[:, None]
+                    & ~query_is_kept[:, None]
+                )
+                scores = tl.where(
+                    padded_query_row & key_in_bounds[None, :],
+                    0.0,
+                    scores,
+                )
+            else:
+                scores = tl.where(
+                    pair_in_bounds,
+                    scores,
+                    -float("inf"),
+                )
+
+            # Keep the unused rows of the final partial BLOCK_M numerically
+            # well-defined. They are never written to output.
             scores = tl.where(
-                ~query_in_bounds[:, None] & (key_offsets[None, :] == 0),
+                ~query_in_bounds[:, None]
+                & (key_offsets[None, :] == 0),
                 0.0,
                 scores,
             )
 
             value_values = tl.load(
-                value_base + key_offsets[:, None] * HEAD_DIM + dimension_offsets[None, :],
+                value_base
+                + key_offsets[:, None] * stride_vl
+                + dimension_offsets[None, :] * stride_vd,
                 mask=key_in_bounds[:, None],
                 other=0.0,
             )
@@ -391,6 +442,7 @@ if triton is not None:
         sequence_length: int,
         active_slots: int,
         score_scale_log2: float,
+        has_padding: bool,
         has_c2p: bool,
         has_p2c: bool,
         is_bf16: bool,
@@ -425,6 +477,7 @@ if triton is not None:
             "SCORE_SCALE_LOG2": score_scale_log2,
             "HAS_C2P": has_c2p,
             "HAS_P2C": has_p2c,
+            "HAS_PADDING": has_padding,
             "IS_BF16": is_bf16,
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,
@@ -438,6 +491,18 @@ if triton is not None:
             delta_to_local,
             attention_mask,
             output,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query.stride(3),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key.stride(3),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value.stride(3),
             **kernel_kwargs,
         )
         return output
@@ -655,14 +720,17 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         fp32_precision: str = "strict",
         tuning: KernelTuningOptions | None = None,
         profile_registry: ProfileRegistry | None = None,
+        assume_unpadded: bool = False,
     ) -> None:
         super().__init__(
             config,
             position_plan_cache=position_plan_cache,
+            assume_unpadded=assume_unpadded,
         )
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
+        self.assume_unpadded = assume_unpadded
         self.tuning = tuning or KernelTuningOptions()
         self._profile_registry = (
             profile_registry
@@ -680,6 +748,19 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
+    def _reshape_heads(
+        self,
+        tensor: torch.Tensor,
+        batch_size: int,
+        sequence_length: int,
+    ) -> torch.Tensor:
+        """Return a BHLD view without materializing a contiguous copy."""
+        return tensor.view(
+            batch_size,
+            sequence_length,
+            self.num_attention_heads,
+            self.attention_head_size,
+        ).permute(0, 2, 1, 3)
 
     def clear_inference_cache(self) -> None:
         super().clear_inference_cache()
@@ -843,6 +924,7 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
             sequence_length,
             active_slot_count,
             score_scale_log2,
+            not self.assume_unpadded,
             has_c2p,
             has_p2c,
             hidden_states.dtype == torch.bfloat16,
