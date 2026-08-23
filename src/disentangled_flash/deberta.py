@@ -64,9 +64,7 @@ class DebertaV2InferenceEncoder(nn.Module):
             raise ValueError("backend must be 'torch' or 'triton'")
 
         if assume_unpadded and backend != "triton":
-            raise ValueError(
-                "assume_unpadded is supported only by the Triton backend"
-            )
+            raise ValueError("assume_unpadded is supported only by the Triton backend")
 
         if not hasattr(source_encoder, "layer"):
             raise TypeError("source_encoder does not look like a DebertaV2Encoder")
@@ -293,10 +291,7 @@ class DebertaV2InferenceEncoder(nn.Module):
         if (
             self.backend == "triton"
             and not self.assume_unpadded
-            and (
-                attention_mask.dtype != torch.bool
-                or not attention_mask.is_contiguous()
-            )
+            and (attention_mask.dtype != torch.bool or not attention_mask.is_contiguous())
         ):
             layer_attention_mask = attention_mask.bool().contiguous()
 

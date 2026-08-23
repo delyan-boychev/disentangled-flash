@@ -187,11 +187,7 @@ if triton is not None:
         key_base = key + batch * stride_kb + head * stride_kh
         value_base = value + batch * stride_vb + head * stride_vh
 
-        output_base = (
-            output
-            + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM
-            + head * HEAD_DIM
-        )
+        output_base = output + batch * SEQUENCE_LENGTH * NUM_HEADS * HEAD_DIM + head * HEAD_DIM
 
         query_values = tl.load(
             query_base
@@ -278,18 +274,11 @@ if triton is not None:
 
             scores *= SCORE_SCALE_LOG2
             if HAS_PADDING:
-                attended = (
-                    query_is_kept[:, None]
-                    & key_is_kept[None, :]
-                    & pair_in_bounds
-                )
+                attended = query_is_kept[:, None] & key_is_kept[None, :] & pair_in_bounds
                 scores = tl.where(attended, scores, -float("inf"))
 
                 # Preserve Hugging Face semantics for padded query rows.
-                padded_query_row = (
-                    query_in_bounds[:, None]
-                    & ~query_is_kept[:, None]
-                )
+                padded_query_row = query_in_bounds[:, None] & ~query_is_kept[:, None]
                 scores = tl.where(
                     padded_query_row & key_in_bounds[None, :],
                     0.0,
@@ -305,8 +294,7 @@ if triton is not None:
             # Keep the unused rows of the final partial BLOCK_M numerically
             # well-defined. They are never written to output.
             scores = tl.where(
-                ~query_in_bounds[:, None]
-                & (key_offsets[None, :] == 0),
+                ~query_in_bounds[:, None] & (key_offsets[None, :] == 0),
                 0.0,
                 scores,
             )
@@ -880,9 +868,7 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
             device,
             self._plan_device(),
         )
-        return self._triton_position_projection_cache.get(
-            (sequence_length, str(resolved_device))
-        )
+        return self._triton_position_projection_cache.get((sequence_length, str(resolved_device)))
 
     def _validate_triton_call(self, hidden_states: torch.Tensor) -> None:
         if triton is None:
@@ -1013,10 +999,7 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
             sequence_length,
             hidden_states.device,
         )
-        if (
-            cached_plan is not None
-            and self._cached_qkv_weight is not None
-        ):
+        if cached_plan is not None and self._cached_qkv_weight is not None:
             return self.forward_prepared(
                 hidden_states,
                 attention_mask,

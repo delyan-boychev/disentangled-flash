@@ -15,6 +15,7 @@ def test_compact_position_plan_is_linear_size():
     assert plan.active_slots.ndim == 1
     assert plan.active_slots.numel() <= 129
 
+
 def test_active_position_slots_are_contiguous_ranges():
     cache = SharedPositionPlanCache(
         position_buckets=256,

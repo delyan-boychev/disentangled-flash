@@ -198,6 +198,7 @@ def make_models(
     num_hidden_layers: int,
     intermediate_size: int,
     conv_kernel_size: int,
+    assume_unpadded: bool,
 ) -> tuple[
     torch.nn.Module,
     torch.nn.Module,
@@ -236,6 +237,7 @@ def make_models(
                 config,
                 backend=implementation,
                 fp32_precision=fp32_precision,
+                assume_unpadded=(assume_unpadded if implementation == "triton" else False),
             )
     elif implementation == "triton":
         target = TritonInferenceDisentangledSelfAttention(
@@ -421,6 +423,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         args.num_hidden_layers,
         args.intermediate_size,
         args.conv_kernel_size,
+        args.assume_unpadded,
     )
     embedding_table = make_embedding_table(
         args.vocab_size,
@@ -443,6 +446,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         "num_attention_heads": args.num_attention_heads,
         "attention_head_size": args.attention_head_size,
         "qkv_projection": "fused",
+        "assume_unpadded": (args.assume_unpadded and args.implementation == "triton"),
         "fp32_precision": args.fp32_precision,
         "num_hidden_layers": args.num_hidden_layers,
         "intermediate_size": args.intermediate_size,
@@ -546,10 +550,30 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                 torch.cuda.synchronize()
                 setup_ms = (time.perf_counter() - setup_started) * 1000.0
 
+                torch.cuda.synchronize()
+
+                baseline_allocated_bytes = torch.cuda.memory_allocated()
+                baseline_reserved_bytes = torch.cuda.memory_reserved()
+
                 torch.cuda.reset_peak_memory_stats()
-                timings, valid_tokens = measure_calls(call, measured_batches, log_prefix)
+
+                timings, valid_tokens = measure_calls(
+                    call,
+                    measured_batches,
+                    log_prefix,
+                )
+
                 peak_allocated_bytes = torch.cuda.max_memory_allocated()
                 peak_reserved_bytes = torch.cuda.max_memory_reserved()
+
+                incremental_peak_allocated_bytes = max(
+                    0,
+                    peak_allocated_bytes - baseline_allocated_bytes,
+                )
+                incremental_peak_reserved_bytes = max(
+                    0,
+                    peak_reserved_bytes - baseline_reserved_bytes,
+                )
                 max_error, mean_error = compare_outputs(
                     args.scope,
                     reference,
@@ -573,8 +597,12 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                     "mean_abs_error": mean_error,
                     "compile_ms_for_length": compile_ms,
                     "warmup_ms": setup_ms,
+                    "baseline_allocated_bytes": baseline_allocated_bytes,
+                    "baseline_reserved_bytes": baseline_reserved_bytes,
                     "peak_allocated_bytes": peak_allocated_bytes,
                     "peak_reserved_bytes": peak_reserved_bytes,
+                    "incremental_peak_allocated_bytes": incremental_peak_allocated_bytes,
+                    "incremental_peak_reserved_bytes": incremental_peak_reserved_bytes,
                 }
                 results.append(result)
                 print(
@@ -642,6 +670,13 @@ def print_summary(payloads: list[dict[str, Any]]) -> None:
 
 
 def run_parent(args: argparse.Namespace) -> None:
+    if args.assume_unpadded and not math.isclose(
+        args.minimum_length_fraction,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("--assume-unpadded requires --minimum-length-fraction 1.0")
     invalid_implementations = set(args.implementations) - set(IMPLEMENTATIONS)
     invalid_dtypes = set(args.dtypes) - set(DTYPES)
     invalid_executions = set(args.executions) - {"eager", "compile"}
@@ -714,6 +749,8 @@ def run_parent(args: argparse.Namespace) -> None:
                         f"execution={execution}",
                         flush=True,
                     )
+                    if args.assume_unpadded:
+                        command.append("--assume-unpadded")
                     completed = subprocess.run(command, cwd=os.getcwd(), check=False)
                     if completed.returncode != 0:
                         failures.append(
@@ -795,6 +832,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--vocab-size", type=int, default=8192)
     parser.add_argument("--minimum-length-fraction", type=float, default=0.60)
+    parser.add_argument(
+        "--assume-unpadded",
+        action="store_true",
+        help=("Use the Triton no-padding specialization. Requires --minimum-length-fraction 1.0."),
+    )
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--output", default="attention_cuda_results.json")
     parser.add_argument("--fullgraph", action=argparse.BooleanOptionalAction, default=True)

@@ -45,27 +45,15 @@ def test_qkv_is_fused_and_shares_parameter_storage():
 
     packed_storage = packed_weight.untyped_storage().data_ptr()
 
-    assert (
-        module.query_proj.weight.untyped_storage().data_ptr()
-        == packed_storage
-    )
-    assert (
-        module.key_proj.weight.untyped_storage().data_ptr()
-        == packed_storage
-    )
-    assert (
-        module.value_proj.weight.untyped_storage().data_ptr()
-        == packed_storage
-    )
+    assert module.query_proj.weight.untyped_storage().data_ptr() == packed_storage
+    assert module.key_proj.weight.untyped_storage().data_ptr() == packed_storage
+    assert module.value_proj.weight.untyped_storage().data_ptr() == packed_storage
 
     elements_per_projection = config.hidden_size * config.hidden_size
 
     assert module.query_proj.weight.storage_offset() == 0
     assert module.key_proj.weight.storage_offset() == elements_per_projection
-    assert (
-        module.value_proj.weight.storage_offset()
-        == 2 * elements_per_projection
-    )
+    assert module.value_proj.weight.storage_offset() == 2 * elements_per_projection
 
     hidden = torch.randn(2, 8, 64)
 
@@ -114,10 +102,7 @@ def test_state_dict_round_trip_after_qkv_packing():
 
     source.prepare_for_inference(relative)
 
-    state = {
-        key: value.detach().clone()
-        for key, value in source.state_dict().items()
-    }
+    state = {key: value.detach().clone() for key, value in source.state_dict().items()}
 
     restored = TorchInferenceDisentangledSelfAttention(config).eval()
     restored.load_state_dict(state, strict=True)
