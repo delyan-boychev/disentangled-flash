@@ -4,6 +4,13 @@ This is an integration/trajectory test on top of the kernel-level gradient parit
 suite. It seeds ordinary RNGs for reproducibility but intentionally does not
 force deterministic CUDA algorithms, so the execution remains representative
 of normal training.
+
+The training data is a small deterministic structured task rather than fresh
+random targets. Each sequence contains a sequence-level anchor plus local
+symbols. Every valid output position is trained toward a fixed mixture of the
+local-symbol target and the sequence-anchor target. Reusing a finite dataset
+therefore produces a meaningful decreasing loss curve while still exercising
+contextual attention.
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ COMPUTE_DTYPES = {
     "bf16": torch.bfloat16,
     "fp32": torch.float32,
 }
+Batch = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 
 
 def seed_everything(seed: int) -> None:
@@ -37,7 +45,6 @@ def seed_everything(seed: int) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
-    # Do not replace normal training kernels with deterministic alternatives.
     torch.use_deterministic_algorithms(False)
 
 
@@ -51,9 +58,6 @@ def make_config(max_length: int):
         num_attention_heads=12,
         intermediate_size=3200,
         hidden_act="gelu",
-        # The initial trajectory test isolates the attention implementation.
-        # Attention-probability dropout is not yet supported by the training
-        # kernel, and disabling hidden dropout avoids unrelated RNG drift.
         hidden_dropout_prob=0.0,
         attention_probs_dropout_prob=0.0,
         max_position_embeddings=max(8192, max_length),
@@ -149,7 +153,6 @@ def named_tensor_stats(
             max_abs = stats["max_abs"]
             worst_abs_name = name
             worst_abs_stats = stats
-        # Relative error is not informative for an exactly-zero reference.
         if stats["reference_norm"] > 0.0 and (
             worst_rel_stats is None or stats["relative_l2"] > worst_rel_stats["relative_l2"]
         ):
@@ -186,38 +189,74 @@ def gradient_items(model: torch.nn.Module) -> list[tuple[str, torch.Tensor | Non
     return [(name, parameter.grad) for name, parameter in model.named_parameters()]
 
 
-def make_batch(
+def make_attention_mask(batch_size: int, length: int, pattern: str) -> torch.Tensor:
+    mask = torch.ones((batch_size, length), dtype=torch.bool)
+    if pattern == "none":
+        return mask
+    if pattern != "right":
+        raise ValueError(f"unsupported mask pattern: {pattern}")
+    for batch in range(batch_size):
+        keep = max(1, length - (batch + 1) * max(1, length // (batch_size + 2)))
+        mask[batch, keep:] = False
+    return mask
+
+
+def build_structured_dataset(
     *,
     generator: torch.Generator,
+    dataset_batches: int,
     batch_size: int,
     length: int,
     hidden_size: int,
     mask_pattern: str,
+    num_anchors: int,
+    symbol_vocab_size: int,
+    target_std: float,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    input_ids = torch.randint(
-        10,
-        30_000,
-        (batch_size, length),
-        generator=generator,
-        dtype=torch.long,
-    )
-    attention_mask = torch.ones((batch_size, length), dtype=torch.bool)
-    if mask_pattern == "right":
-        for batch in range(batch_size):
-            keep = max(1, length - (batch + 1) * max(1, length // (batch_size + 2)))
-            attention_mask[batch, keep:] = False
-            input_ids[batch, keep:] = 0
-    elif mask_pattern != "none":
-        raise ValueError(f"unsupported mask pattern: {mask_pattern}")
+) -> tuple[list[Batch], int]:
+    """Create a finite learnable local+contextual regression dataset."""
 
-    probe = torch.empty((batch_size, length, hidden_size), dtype=torch.float32)
-    probe.normal_(mean=0.0, std=0.2, generator=generator)
-    return (
-        input_ids.to(device=device, non_blocking=True),
-        attention_mask.to(device=device, non_blocking=True),
-        probe.to(device=device, non_blocking=True),
-    )
+    anchor_table = torch.empty((num_anchors, hidden_size), dtype=torch.float32)
+    anchor_table.normal_(mean=0.0, std=target_std, generator=generator)
+    symbol_table = torch.empty((symbol_vocab_size, hidden_size), dtype=torch.float32)
+    symbol_table.normal_(mean=0.0, std=target_std, generator=generator)
+
+    anchor_span = max(1, length // 64)
+    dataset: list[Batch] = []
+    for _ in range(dataset_batches):
+        anchors = torch.randint(
+            0,
+            num_anchors,
+            (batch_size,),
+            generator=generator,
+            dtype=torch.long,
+        )
+        symbols = torch.randint(
+            0,
+            symbol_vocab_size,
+            (batch_size, length),
+            generator=generator,
+            dtype=torch.long,
+        )
+        symbols[:, :anchor_span] = anchors[:, None] % symbol_vocab_size
+
+        input_ids = 1000 + symbols
+        input_ids[:, :anchor_span] = 10 + anchors[:, None]
+        attention_mask = make_attention_mask(batch_size, length, mask_pattern)
+        input_ids = input_ids.masked_fill(~attention_mask, 0)
+
+        local_target = symbol_table[symbols]
+        anchor_target = anchor_table[anchors][:, None, :]
+        target = 0.5 * local_target + 0.5 * anchor_target
+
+        dataset.append(
+            (
+                input_ids.to(device=device, non_blocking=True),
+                attention_mask.to(device=device, non_blocking=True),
+                target.to(device=device, non_blocking=True),
+            )
+        )
+    return dataset, anchor_span
 
 
 def autocast_context(dtype: torch.dtype):
@@ -230,7 +269,7 @@ def forward_loss(
     model: torch.nn.Module,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
-    probe: torch.Tensor,
+    target: torch.Tensor,
     compute_dtype: torch.dtype,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     with autocast_context(compute_dtype):
@@ -240,10 +279,21 @@ def forward_loss(
             output_hidden_states=False,
             return_dict=True,
         ).last_hidden_state
-    # Stable positive objective with gradients at every output position. The
-    # same deterministic random target is used by both model trajectories.
-    loss = (output.float() - probe).square().mean()
+    per_token = (output.float() - target).square().mean(dim=-1)
+    weights = attention_mask.float()
+    loss = (per_token * weights).sum() / weights.sum().clamp_min(1.0)
     return output, loss
+
+
+@torch.no_grad()
+def evaluate_loss(
+    model: torch.nn.Module,
+    batch: Batch,
+    compute_dtype: torch.dtype,
+) -> float:
+    input_ids, attention_mask, target = batch
+    _, loss = forward_loss(model, input_ids, attention_mask, target, compute_dtype)
+    return loss.item()
 
 
 def main() -> None:
@@ -251,6 +301,10 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--length", type=int, default=1024)
     parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--dataset-batches", type=int, default=4)
+    parser.add_argument("--num-anchors", type=int, default=32)
+    parser.add_argument("--symbol-vocab-size", type=int, default=64)
+    parser.add_argument("--target-std", type=float, default=0.5)
     parser.add_argument("--dtype", choices=tuple(COMPUTE_DTYPES), default="bf16")
     parser.add_argument("--mask-pattern", choices=("none", "right"), default="none")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -265,6 +319,12 @@ def main() -> None:
 
     if args.steps < 1:
         raise ValueError("--steps must be >= 1")
+    if args.dataset_batches < 1:
+        raise ValueError("--dataset-batches must be >= 1")
+    if args.num_anchors < 2:
+        raise ValueError("--num-anchors must be >= 2")
+    if args.symbol_vocab_size < 2:
+        raise ValueError("--symbol-vocab-size must be >= 2")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
@@ -281,8 +341,6 @@ def main() -> None:
     from transformers import __version__ as transformers_version
 
     config = make_config(args.length)
-    # Construct one legacy HF model, then deepcopy it so the two trajectories
-    # begin bit-identically before converting only the candidate encoder.
     reference = DebertaV2Model(config)
     candidate = copy.deepcopy(reference)
 
@@ -306,6 +364,23 @@ def main() -> None:
     if initial_stats["max_abs"] != 0.0:
         raise RuntimeError(f"models are not identical at step 0: {initial_stats}")
 
+    data_generator = torch.Generator(device="cpu").manual_seed(args.seed + 10_000)
+    dataset, anchor_span = build_structured_dataset(
+        generator=data_generator,
+        dataset_batches=args.dataset_batches,
+        batch_size=args.batch_size,
+        length=args.length,
+        hidden_size=config.hidden_size,
+        mask_pattern=args.mask_pattern,
+        num_anchors=args.num_anchors,
+        symbol_vocab_size=args.symbol_vocab_size,
+        target_std=args.target_std,
+        device=device,
+    )
+
+    initial_fixed_reference_loss = evaluate_loss(reference, dataset[0], compute_dtype)
+    initial_fixed_candidate_loss = evaluate_loss(candidate, dataset[0], compute_dtype)
+
     optimizer_kwargs = {
         "lr": args.learning_rate,
         "betas": (args.beta1, args.beta2),
@@ -315,18 +390,10 @@ def main() -> None:
     reference_optimizer = torch.optim.AdamW(reference.parameters(), **optimizer_kwargs)
     candidate_optimizer = torch.optim.AdamW(candidate.parameters(), **optimizer_kwargs)
 
-    data_generator = torch.Generator(device="cpu").manual_seed(args.seed + 10_000)
     rows: list[dict[str, Any]] = []
-
     for step in range(args.steps):
-        input_ids, attention_mask, probe = make_batch(
-            generator=data_generator,
-            batch_size=args.batch_size,
-            length=args.length,
-            hidden_size=config.hidden_size,
-            mask_pattern=args.mask_pattern,
-            device=device,
-        )
+        batch_index = step % len(dataset)
+        input_ids, attention_mask, target = dataset[batch_index]
 
         reference_optimizer.zero_grad(set_to_none=True)
         candidate_optimizer.zero_grad(set_to_none=True)
@@ -335,7 +402,7 @@ def main() -> None:
             reference,
             input_ids,
             attention_mask,
-            probe,
+            target,
             compute_dtype,
         )
         reference_loss.backward()
@@ -345,7 +412,7 @@ def main() -> None:
             candidate,
             input_ids,
             attention_mask,
-            probe,
+            target,
             compute_dtype,
         )
         candidate_loss.backward()
@@ -367,13 +434,20 @@ def main() -> None:
             parameter_items(reference),
             parameter_items(candidate),
         )
+        fixed_reference_loss = evaluate_loss(reference, dataset[0], compute_dtype)
+        fixed_candidate_loss = evaluate_loss(candidate, dataset[0], compute_dtype)
+        fixed_loss_abs = abs(fixed_candidate_loss - fixed_reference_loss)
 
         row = {
             "step": step + 1,
+            "batch_index": batch_index,
             "reference_loss": reference_loss.detach().item(),
             "candidate_loss": candidate_loss.detach().item(),
             "loss_abs": loss_abs,
             "loss_relative": loss_abs / loss_scale,
+            "fixed_reference_loss_after_step": fixed_reference_loss,
+            "fixed_candidate_loss_after_step": fixed_candidate_loss,
+            "fixed_loss_abs_after_step": fixed_loss_abs,
             "output": output_error,
             "gradients": gradient_error,
             "parameters_after_step": parameter_error,
@@ -381,13 +455,14 @@ def main() -> None:
         rows.append(row)
         print(
             f"step={step + 1:>3}/{args.steps} "
-            f"lossHF={row['reference_loss']:+.8e} "
-            f"lossDF={row['candidate_loss']:+.8e} "
-            f"dLoss={row['loss_abs']:.3e} "
+            f"batch={batch_index} "
+            f"trainHF={row['reference_loss']:.6f} "
+            f"trainDF={row['candidate_loss']:.6f} "
+            f"fixedHF={fixed_reference_loss:.6f} "
+            f"fixedDF={fixed_candidate_loss:.6f} "
             f"gRel={gradient_error['relative_l2']:.3e} "
             f"gCos={gradient_error['cosine']:.8f} "
-            f"pRel={parameter_error['relative_l2']:.3e} "
-            f"pMax={parameter_error['max_abs']:.3e}",
+            f"pRel={parameter_error['relative_l2']:.3e}",
             flush=True,
         )
 
@@ -403,7 +478,18 @@ def main() -> None:
             "reference": "transformers.DebertaV2Model legacy attention",
             "candidate": "DisentangledFlash training attention",
         },
+        "task": {
+            "name": "anchor_symbol_regression",
+            "description": (
+                "Each token target mixes a local-symbol code with a sequence-level anchor code; "
+                "the anchor is encoded in the first anchor_span tokens."
+            ),
+            "anchor_span": anchor_span,
+            "dataset_batches": args.dataset_batches,
+        },
         "initial_parameter_parity": initial_stats,
+        "initial_fixed_reference_loss": initial_fixed_reference_loss,
+        "initial_fixed_candidate_loss": initial_fixed_candidate_loss,
         "steps": rows,
         "final": rows[-1],
     }
