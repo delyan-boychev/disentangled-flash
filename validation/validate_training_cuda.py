@@ -36,10 +36,31 @@ def parse_csv_ints(value: str) -> list[int]:
 
 
 def error_stats(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float]:
-    difference = (reference.detach().float() - candidate.detach().float()).abs()
+    reference_float = reference.detach().float()
+    candidate_float = candidate.detach().float()
+    difference = candidate_float - reference_float
+    absolute_difference = difference.abs()
+
+    reference_flat = reference_float.reshape(-1)
+    candidate_flat = candidate_float.reshape(-1)
+    difference_flat = difference.reshape(-1)
+    reference_norm = torch.linalg.vector_norm(reference_flat)
+    candidate_norm = torch.linalg.vector_norm(candidate_flat)
+    difference_norm = torch.linalg.vector_norm(difference_flat)
+    eps = torch.finfo(torch.float32).eps
+
+    relative_l2 = difference_norm / torch.clamp(reference_norm, min=eps)
+    denominator = reference_norm * candidate_norm
+    if denominator.item() == 0.0:
+        cosine = 1.0 if reference_norm.item() == 0.0 and candidate_norm.item() == 0.0 else 0.0
+    else:
+        cosine = torch.dot(reference_flat, candidate_flat) / denominator
+
     return {
-        "max_abs": difference.max().item(),
-        "mean_abs": difference.mean().item(),
+        "max_abs": absolute_difference.max().item(),
+        "mean_abs": absolute_difference.mean().item(),
+        "relative_l2": relative_l2.item(),
+        "cosine": float(cosine),
     }
 
 
@@ -138,7 +159,18 @@ def run_case(
     worst_parameter = max(
         parameter_errors.items(),
         key=lambda item: item[1]["max_abs"],
-        default=("none", {"max_abs": 0.0, "mean_abs": 0.0}),
+        default=(
+            "none",
+            {"max_abs": 0.0, "mean_abs": 0.0, "relative_l2": 0.0, "cosine": 1.0},
+        ),
+    )
+    worst_relative_parameter = max(
+        parameter_errors.items(),
+        key=lambda item: item[1]["relative_l2"],
+        default=(
+            "none",
+            {"max_abs": 0.0, "mean_abs": 0.0, "relative_l2": 0.0, "cosine": 1.0},
+        ),
     )
     row: dict[str, object] = {
         "length": length,
@@ -151,6 +183,8 @@ def run_case(
         "relative_grad": error_stats(relative_ref.grad, relative_candidate.grad),
         "worst_parameter": worst_parameter[0],
         "worst_parameter_error": worst_parameter[1],
+        "worst_relative_parameter": worst_relative_parameter[0],
+        "worst_relative_parameter_error": worst_relative_parameter[1],
         "parameter_errors": parameter_errors,
     }
     return row
@@ -191,8 +225,14 @@ def main() -> None:
                 f"L={length:>4} B={batch_size} {args.dtype:>4} {args.mask_pattern:>5} "
                 f"out={row['output']['max_abs']:.7g} "
                 f"dX={row['hidden_grad']['max_abs']:.7g} "
+                f"dXrel={row['hidden_grad']['relative_l2']:.3e} "
+                f"dXcos={row['hidden_grad']['cosine']:.8f} "
                 f"dRel={row['relative_grad']['max_abs']:.7g} "
-                f"worst={row['worst_parameter']}:{row['worst_parameter_error']['max_abs']:.7g}",
+                f"worst={row['worst_parameter']}:{row['worst_parameter_error']['max_abs']:.7g} "
+                f"rel={row['worst_parameter_error']['relative_l2']:.3e} "
+                f"cos={row['worst_parameter_error']['cosine']:.8f} "
+                f"worstRel={row['worst_relative_parameter']}:"
+                f"{row['worst_relative_parameter_error']['relative_l2']:.3e}",
                 flush=True,
             )
             torch.cuda.empty_cache()
