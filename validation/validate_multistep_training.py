@@ -277,7 +277,8 @@ def main() -> None:
 
     seed_everything(args.seed)
 
-    from transformers import DebertaV2Model, __version__ as transformers_version
+    from transformers import DebertaV2Model
+    from transformers import __version__ as transformers_version
 
     config = make_config(args.length)
     # Construct one legacy HF model, then deepcopy it so the two trajectories
