@@ -402,7 +402,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
 
-        if variant in {"modernbert", "modernbert_global"}:
+        if args.variant in {"modernbert", "modernbert_global"}:
             layer_types = list(getattr(config, "layer_types", []))
             result.update(
                 {
@@ -424,7 +424,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
                     "relative_attention": bool(config.relative_attention),
                     "share_att_key": bool(config.share_att_key),
                     "pos_att_type": list(config.pos_att_type),
-                    "assume_unpadded": variant == "deberta_df",
+                    "assume_unpadded": args.variant == "deberta_df",
                 }
             )
 
