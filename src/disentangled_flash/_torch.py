@@ -12,6 +12,7 @@ import math
 from typing import Any, NamedTuple
 
 import torch
+from torch import nn
 from torch.nn import functional as F
 
 from ._reference import (
@@ -111,16 +112,83 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
     @torch.no_grad()
     def _prepare_fused_qkv(self) -> None:
-        self._cached_qkv_weight = torch.cat(
-            (self.query_proj.weight, self.key_proj.weight, self.value_proj.weight),
+        """Pack Q/K/V once and rebind the original parameters as storage views.
+
+        This preserves the original query_proj/key_proj/value_proj state-dict
+        keys while avoiding a second resident copy of all QKV weights.
+        """
+        weight_requires_grad = (
+            self.query_proj.weight.requires_grad,
+            self.key_proj.weight.requires_grad,
+            self.value_proj.weight.requires_grad,
+        )
+
+        packed_weight = torch.cat(
+            (
+                self.query_proj.weight,
+                self.key_proj.weight,
+                self.value_proj.weight,
+            ),
             dim=0,
         ).contiguous()
-        biases = (self.query_proj.bias, self.key_proj.bias, self.value_proj.bias)
-        self._cached_qkv_bias = (
-            torch.cat(biases, dim=0).contiguous()
-            if all(bias is not None for bias in biases)
-            else None
+
+        self._cached_qkv_weight = packed_weight
+
+        q_weight, k_weight, v_weight = packed_weight.split(
+            self.all_head_size,
+            dim=0,
         )
+
+        self.query_proj.weight = nn.Parameter(
+            q_weight,
+            requires_grad=weight_requires_grad[0],
+        )
+        self.key_proj.weight = nn.Parameter(
+            k_weight,
+            requires_grad=weight_requires_grad[1],
+        )
+        self.value_proj.weight = nn.Parameter(
+            v_weight,
+            requires_grad=weight_requires_grad[2],
+        )
+
+        biases = (
+            self.query_proj.bias,
+            self.key_proj.bias,
+            self.value_proj.bias,
+        )
+
+        if all(bias is not None for bias in biases):
+            bias_requires_grad = tuple(
+                bias.requires_grad for bias in biases if bias is not None
+            )
+
+            packed_bias = torch.cat(biases, dim=0).contiguous()
+            self._cached_qkv_bias = packed_bias
+
+            q_bias, k_bias, v_bias = packed_bias.split(
+                self.all_head_size,
+                dim=0,
+            )
+
+            self.query_proj.bias = nn.Parameter(
+                q_bias,
+                requires_grad=bias_requires_grad[0],
+            )
+            self.key_proj.bias = nn.Parameter(
+                k_bias,
+                requires_grad=bias_requires_grad[1],
+            )
+            self.value_proj.bias = nn.Parameter(
+                v_bias,
+                requires_grad=bias_requires_grad[2],
+            )
+        else:
+            if any(bias is not None for bias in biases):
+                raise RuntimeError(
+                    "mixed Q/K/V bias configuration is not supported by fused QKV"
+                )
+            self._cached_qkv_bias = None
 
     @torch.no_grad()
     def prepare_for_inference(
@@ -184,6 +252,14 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 raise RuntimeError("call prepare_for_inference() before prepare_shape()")
             pos_query = self._cached_pos_query.index_select(1, active_slots).contiguous()
         return pos_key, pos_query
+    def release_position_projection_workspace(self) -> None:
+        """Release full projected relative tables after all shape plans exist.
+
+        Prepared per-length plans own the compact active-slot tensors they need,
+        so retaining the full projected tables only duplicates inference memory.
+        """
+        self._cached_pos_key = None
+        self._cached_pos_query = None
 
     @torch.no_grad()
     def prepare_shape(
