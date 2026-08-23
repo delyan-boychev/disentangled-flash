@@ -391,6 +391,13 @@ def compare_outputs(
 
 
 def run_worker(args: argparse.Namespace) -> dict[str, Any]:
+    if args.assume_unpadded and not math.isclose(
+        args.minimum_length_fraction,
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError("--assume-unpadded requires --minimum-length-fraction 1.0")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available")
     if args.implementation not in IMPLEMENTATIONS:
@@ -781,6 +788,7 @@ def run_parent(args: argparse.Namespace) -> None:
             "num_attention_heads": args.num_attention_heads,
             "attention_head_size": args.attention_head_size,
             "qkv_projection": "fused",
+            "assume_unpadded": args.assume_unpadded,
             "fp32_precision": args.fp32_precision,
             "num_hidden_layers": args.num_hidden_layers,
             "intermediate_size": args.intermediate_size,
