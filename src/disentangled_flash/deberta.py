@@ -27,6 +27,8 @@ from ._torch import (
 from .kernel import (
     TritonInferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
+)
+from .kernel import (
     triton as _triton,
 )
 from .position import SharedPositionPlanCache
@@ -55,9 +57,13 @@ def _resolve_backend(
         head_dim = config.hidden_size // config.num_attention_heads
     triton_supported = _triton is not None and int(head_dim) in {32, 64, 128}
     if not inference:
-        triton_supported = triton_supported and hasattr(torch.library, "triton_op") and hasattr(
-            torch.library,
-            "wrap_triton",
+        triton_supported = (
+            triton_supported
+            and hasattr(torch.library, "triton_op")
+            and hasattr(
+                torch.library,
+                "wrap_triton",
+            )
         )
         if float(getattr(config, "attention_probs_dropout_prob", 0.0)) != 0.0:
             triton_supported = False
@@ -127,9 +133,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
         self.position_buckets = getattr(source_encoder, "position_buckets", -1)
         self.norm_rel_ebd = list(getattr(source_encoder, "norm_rel_ebd", ["none"]))
         self.gradient_checkpointing = (
-            False
-            if inference
-            else bool(getattr(source_encoder, "gradient_checkpointing", False))
+            False if inference else bool(getattr(source_encoder, "gradient_checkpointing", False))
         )
 
         # Preserve the exact HF module names so checkpoint keys remain stable.

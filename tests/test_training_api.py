@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import copy
 
-import disentangled_flash
 import torch
+
+import disentangled_flash
 from disentangled_flash._reference import (
     DebertaAttentionConfig,
     DebertaV2Encoder,
