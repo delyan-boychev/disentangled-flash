@@ -78,7 +78,19 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self.register_buffer("_cached_pos_query", None, persistent=False)
         self.register_buffer("_cached_qkv_weight", None, persistent=False)
         self.register_buffer("_cached_qkv_bias", None, persistent=False)
-        self._position_projection_cache: dict[tuple[int, str], TorchPositionPlan] = {}
+
+        self._position_projection_cache: dict[
+            tuple[int, str], TorchPositionPlan
+        ] = {}
+
+        # Multiple sequence lengths often use the exact same contiguous set of
+        # DeBERTa relative-position slots. Cache the compact projected tables by
+        # active-slot range so 1K/2K/4K/8K plans can share the same storage.
+        self._compact_position_projection_cache: dict[
+            tuple[int, int, str],
+            tuple[torch.Tensor | None, torch.Tensor | None],
+        ] = {}
+
         self.register_load_state_dict_post_hook(_invalidate_attention_cache_after_load)
 
     def set_position_plan_cache(
@@ -99,6 +111,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self._cached_qkv_weight = None
         self._cached_qkv_bias = None
         self._position_projection_cache.clear()
+        self._compact_position_projection_cache.clear()
 
     def train(self, mode: bool = True) -> TorchInferenceDisentangledSelfAttention:
         if mode:
@@ -240,24 +253,70 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self,
         active_slots: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return compact projected positions, shared across equivalent buckets."""
+
+        slot_count = int(active_slots.numel())
+        if slot_count == 0:
+            return None, None
+
+        # DeBERTa's monotonic log bucketing maps the complete symmetric delta
+        # interval to one contiguous range of embedding slots. Assert that
+        # invariant here because it lets different sequence lengths reuse one
+        # compact projected tensor.
+        slot_start = int(active_slots[0].item())
+
+        if slot_count > 1:
+            contiguous_slots = torch.all(
+                active_slots[1:] == active_slots[:-1] + 1
+            )
+            if not bool(contiguous_slots.item()):
+                raise RuntimeError(
+                    "active relative-position slots are unexpectedly non-contiguous"
+                )
+
+        cache_key = (
+            slot_start,
+            slot_count,
+            str(active_slots.device),
+        )
+
+        cached = self._compact_position_projection_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         pos_key = None
         if self.relative_attention and "c2p" in self.pos_att_type:
             if self._cached_pos_key is None:
-                raise RuntimeError("call prepare_for_inference() before prepare_shape()")
-            pos_key = self._cached_pos_key.index_select(1, active_slots).contiguous()
+                raise RuntimeError(
+                    "call prepare_for_inference() before prepare_shape()"
+                )
+
+            pos_key = (
+                self._cached_pos_key
+                .narrow(1, slot_start, slot_count)
+                .contiguous()
+            )
 
         pos_query = None
         if self.relative_attention and "p2c" in self.pos_att_type:
             if self._cached_pos_query is None:
-                raise RuntimeError("call prepare_for_inference() before prepare_shape()")
-            pos_query = self._cached_pos_query.index_select(1, active_slots).contiguous()
-        return pos_key, pos_query
-    def release_position_projection_workspace(self) -> None:
-        """Release full projected relative tables after all shape plans exist.
+                raise RuntimeError(
+                    "call prepare_for_inference() before prepare_shape()"
+                )
 
-        Prepared per-length plans own the compact active-slot tensors they need,
-        so retaining the full projected tables only duplicates inference memory.
-        """
+            pos_query = (
+                self._cached_pos_query
+                .narrow(1, slot_start, slot_count)
+                .contiguous()
+            )
+
+        projected = (pos_key, pos_query)
+        self._compact_position_projection_cache[cache_key] = projected
+        return projected
+
+    def release_position_projection_workspace(self) -> None:
+        """Release full projected tables after compact bucket tables are built."""
+
         self._cached_pos_key = None
         self._cached_pos_query = None
 
@@ -293,6 +352,19 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         )
         self._position_projection_cache[cache_key] = plan
         return plan
+
+    def _get_cached_shape_plan(
+        self,
+        sequence_length: int,
+        device: torch.device | str,
+    ) -> TorchPositionPlan | None:
+        resolved_device = canonical_device(
+            device,
+            self._plan_device(),
+        )
+        return self._position_projection_cache.get(
+            (sequence_length, str(resolved_device))
+        )
 
     def _dynamic_position_plan(
         self,
@@ -479,8 +551,30 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         if query_states is not None:
             raise ValueError("the torch inference path supports self-attention only")
 
+        sequence_length = hidden_states.size(1)
+
+        # A prepared plan remains completely valid after the full projected
+        # position workspace has been released. Use it directly rather than
+        # interpreting _cached_pos_key/_cached_pos_query == None as "unprepared".
+        if relative_pos is None:
+            cached_plan = self._get_cached_shape_plan(
+                sequence_length,
+                hidden_states.device,
+            )
+            if (
+                cached_plan is not None
+                and self._cached_qkv_weight is not None
+            ):
+                return self.forward_prepared(
+                    hidden_states,
+                    attention_mask,
+                    cached_plan,
+                )
+
         needs_key = (
-            self.relative_attention and "c2p" in self.pos_att_type and self._cached_pos_key is None
+            self.relative_attention
+            and "c2p" in self.pos_att_type
+            and self._cached_pos_key is None
         )
         needs_query = (
             self.relative_attention
@@ -488,12 +582,15 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             and self._cached_pos_query is None
         )
         needs_qkv = self._cached_qkv_weight is None
+
         if needs_key or needs_query or needs_qkv:
             self.prepare_for_inference(rel_embeddings)
 
-        sequence_length = hidden_states.size(1)
         if relative_pos is None:
-            plan = self.prepare_shape(sequence_length, hidden_states.device)
+            plan = self.prepare_shape(
+                sequence_length,
+                hidden_states.device,
+            )
         else:
             query_layer = hidden_states.view(
                 hidden_states.size(0),
@@ -501,8 +598,17 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 sequence_length,
                 hidden_states.size(-1),
             )
-            plan = self._dynamic_position_plan(query_layer, query_layer, relative_pos)
-        return self.forward_prepared(hidden_states, attention_mask, plan)
+            plan = self._dynamic_position_plan(
+                query_layer,
+                query_layer,
+                relative_pos,
+            )
+
+        return self.forward_prepared(
+            hidden_states,
+            attention_mask,
+            plan,
+        )
 
 
 __all__ = ["TorchInferenceDisentangledSelfAttention", "TorchPositionPlan"]

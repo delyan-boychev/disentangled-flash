@@ -90,6 +90,7 @@ def build_pair(
     position_mode: str,
     fp32_precision: str,
     seed: int,
+    assume_unpadded: bool = False,
 ) -> tuple[
     OriginalDisentangledSelfAttention,
     torch.nn.Module,
@@ -181,6 +182,14 @@ def main() -> None:
     parser.add_argument("--mask-patterns", type=parse_csv, default=list(MASK_PATTERNS))
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
     parser.add_argument("--fp32-precision", choices=["strict", "fast"], default="strict")
+    parser.add_argument(
+        "--assume-unpadded",
+        action="store_true",
+        help=(
+            "Exercise the Triton HAS_PADDING=False specialization. "
+            "Requires --backends triton and --mask-patterns none."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=29)
     parser.add_argument("--output", default="attention_cuda_validation.json")
     args = parser.parse_args()
@@ -197,6 +206,16 @@ def main() -> None:
         raise ValueError(f"position modes must be selected from {sorted(POSITION_MODES)}")
     if set(args.mask_patterns) - set(MASK_PATTERNS):
         raise ValueError(f"mask patterns must be selected from {list(MASK_PATTERNS)}")
+    if args.assume_unpadded:
+        if set(args.backends) != {"triton"}:
+            raise ValueError(
+                "--assume-unpadded requires --backends triton"
+            )
+
+        if set(args.mask_patterns) != {"none"}:
+            raise ValueError(
+                "--assume-unpadded requires --mask-patterns none"
+            )
     if set(args.head_dims) - {32, 64, 128}:
         raise ValueError("head dimensions must be selected from 32, 64, and 128")
 
@@ -215,6 +234,7 @@ def main() -> None:
                         position_mode,
                         args.fp32_precision,
                         args.seed,
+                        assume_unpadded=args.assume_unpadded,
                     )
                     with torch.inference_mode():
                         for sequence_length in args.lengths:
