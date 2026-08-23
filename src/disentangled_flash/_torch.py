@@ -79,9 +79,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self.register_buffer("_cached_qkv_weight", None, persistent=False)
         self.register_buffer("_cached_qkv_bias", None, persistent=False)
 
-        self._position_projection_cache: dict[
-            tuple[int, str], TorchPositionPlan
-        ] = {}
+        self._position_projection_cache: dict[tuple[int, str], TorchPositionPlan] = {}
 
         # Multiple sequence lengths often use the exact same contiguous set of
         # DeBERTa relative-position slots. Cache the compact projected tables by
@@ -101,6 +99,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
         self.position_plan_cache = cache
         self._position_projection_cache.clear()
+        self._compact_position_projection_cache.clear()
         return self
 
     def clear_inference_cache(self) -> None:
@@ -172,9 +171,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         )
 
         if all(bias is not None for bias in biases):
-            bias_requires_grad = tuple(
-                bias.requires_grad for bias in biases if bias is not None
-            )
+            bias_requires_grad = tuple(bias.requires_grad for bias in biases if bias is not None)
 
             packed_bias = torch.cat(biases, dim=0).contiguous()
             self._cached_qkv_bias = packed_bias
@@ -198,9 +195,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             )
         else:
             if any(bias is not None for bias in biases):
-                raise RuntimeError(
-                    "mixed Q/K/V bias configuration is not supported by fused QKV"
-                )
+                raise RuntimeError("mixed Q/K/V bias configuration is not supported by fused QKV")
             self._cached_qkv_bias = None
 
     @torch.no_grad()
@@ -266,13 +261,9 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         slot_start = int(active_slots[0].item())
 
         if slot_count > 1:
-            contiguous_slots = torch.all(
-                active_slots[1:] == active_slots[:-1] + 1
-            )
+            contiguous_slots = torch.all(active_slots[1:] == active_slots[:-1] + 1)
             if not bool(contiguous_slots.item()):
-                raise RuntimeError(
-                    "active relative-position slots are unexpectedly non-contiguous"
-                )
+                raise RuntimeError("active relative-position slots are unexpectedly non-contiguous")
 
         cache_key = (
             slot_start,
@@ -287,28 +278,16 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         pos_key = None
         if self.relative_attention and "c2p" in self.pos_att_type:
             if self._cached_pos_key is None:
-                raise RuntimeError(
-                    "call prepare_for_inference() before prepare_shape()"
-                )
+                raise RuntimeError("call prepare_for_inference() before prepare_shape()")
 
-            pos_key = (
-                self._cached_pos_key
-                .narrow(1, slot_start, slot_count)
-                .contiguous()
-            )
+            pos_key = self._cached_pos_key.narrow(1, slot_start, slot_count).contiguous()
 
         pos_query = None
         if self.relative_attention and "p2c" in self.pos_att_type:
             if self._cached_pos_query is None:
-                raise RuntimeError(
-                    "call prepare_for_inference() before prepare_shape()"
-                )
+                raise RuntimeError("call prepare_for_inference() before prepare_shape()")
 
-            pos_query = (
-                self._cached_pos_query
-                .narrow(1, slot_start, slot_count)
-                .contiguous()
-            )
+            pos_query = self._cached_pos_query.narrow(1, slot_start, slot_count).contiguous()
 
         projected = (pos_key, pos_query)
         self._compact_position_projection_cache[cache_key] = projected
@@ -362,9 +341,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             device,
             self._plan_device(),
         )
-        return self._position_projection_cache.get(
-            (sequence_length, str(resolved_device))
-        )
+        return self._position_projection_cache.get((sequence_length, str(resolved_device)))
 
     def _dynamic_position_plan(
         self,
@@ -561,10 +538,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 sequence_length,
                 hidden_states.device,
             )
-            if (
-                cached_plan is not None
-                and self._cached_qkv_weight is not None
-            ):
+            if cached_plan is not None and self._cached_qkv_weight is not None:
                 return self.forward_prepared(
                     hidden_states,
                     attention_mask,
@@ -572,9 +546,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 )
 
         needs_key = (
-            self.relative_attention
-            and "c2p" in self.pos_att_type
-            and self._cached_pos_key is None
+            self.relative_attention and "c2p" in self.pos_att_type and self._cached_pos_key is None
         )
         needs_query = (
             self.relative_attention

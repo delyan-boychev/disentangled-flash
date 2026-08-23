@@ -208,14 +208,10 @@ def main() -> None:
         raise ValueError(f"mask patterns must be selected from {list(MASK_PATTERNS)}")
     if args.assume_unpadded:
         if set(args.backends) != {"triton"}:
-            raise ValueError(
-                "--assume-unpadded requires --backends triton"
-            )
+            raise ValueError("--assume-unpadded requires --backends triton")
 
         if set(args.mask_patterns) != {"none"}:
-            raise ValueError(
-                "--assume-unpadded requires --mask-patterns none"
-            )
+            raise ValueError("--assume-unpadded requires --mask-patterns none")
     if set(args.head_dims) - {32, 64, 128}:
         raise ValueError("head dimensions must be selected from 32, 64, and 128")
 

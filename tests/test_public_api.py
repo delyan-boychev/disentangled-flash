@@ -22,11 +22,5 @@ def test_unpadded_fast_path_is_exposed_publicly():
     assert "assume_unpadded" in optimize_signature.parameters
     assert "assume_unpadded" in enable_signature.parameters
 
-    assert (
-        optimize_signature.parameters["assume_unpadded"].default
-        is False
-    )
-    assert (
-        enable_signature.parameters["assume_unpadded"].default
-        is False
-    )
+    assert optimize_signature.parameters["assume_unpadded"].default is False
+    assert enable_signature.parameters["assume_unpadded"].default is False
