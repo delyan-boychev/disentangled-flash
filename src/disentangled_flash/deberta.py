@@ -57,16 +57,24 @@ class DebertaV2InferenceEncoder(nn.Module):
         backend: str = "triton",
         fp32_precision: str = "strict",
         tuning: KernelTuningOptions | None = None,
+        assume_unpadded: bool = False,
     ) -> None:
         super().__init__()
         if backend not in {"torch", "triton"}:
             raise ValueError("backend must be 'torch' or 'triton'")
+
+        if assume_unpadded and backend != "triton":
+            raise ValueError(
+                "assume_unpadded is supported only by the Triton backend"
+            )
+
         if not hasattr(source_encoder, "layer"):
             raise TypeError("source_encoder does not look like a DebertaV2Encoder")
 
         self.backend = backend
         self.fp32_precision = fp32_precision
         self.tuning = tuning or KernelTuningOptions()
+        self.assume_unpadded = assume_unpadded
         self.relative_attention = getattr(source_encoder, "relative_attention", False)
         self.max_relative_positions = getattr(
             source_encoder,
@@ -121,6 +129,7 @@ class DebertaV2InferenceEncoder(nn.Module):
                 kwargs["fp32_precision"] = fp32_precision
                 kwargs["tuning"] = self.tuning
                 kwargs["profile_registry"] = profile_registry
+                kwargs["assume_unpadded"] = assume_unpadded
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(
@@ -276,10 +285,25 @@ class DebertaV2InferenceEncoder(nn.Module):
         next_kv = hidden_states
         input_mask = attention_mask
 
+        # Normalize a real padding mask only once for the complete encoder.
+        # With assume_unpadded=True the Triton kernel never reads the mask, so
+        # preserve the original tensor without allocating a bool copy.
+        layer_attention_mask = attention_mask
+
+        if (
+            self.backend == "triton"
+            and not self.assume_unpadded
+            and (
+                attention_mask.dtype != torch.bool
+                or not attention_mask.is_contiguous()
+            )
+        ):
+            layer_attention_mask = attention_mask.bool().contiguous()
+
         for index, (layer, plan) in enumerate(zip(self.layer, plans)):
             self_output, _ = layer.attention.self.forward_prepared(
                 next_kv,
-                attention_mask,
+                layer_attention_mask,
                 plan,
             )
             attention_output = layer.attention.output(self_output, next_kv)
@@ -334,6 +358,7 @@ def enable_deberta_inference(
     sequence_lengths: Iterable[int] | int | None = None,
     fp32_precision: str = "strict",
     tuning: KernelTuningOptions | None = None,
+    assume_unpadded: bool = False,
 ) -> nn.Module:
     """Replace a HF DeBERTa-v2/v3 encoder without changing checkpoint keys.
 
@@ -358,6 +383,7 @@ def enable_deberta_inference(
         backend=backend,
         fp32_precision=fp32_precision,
         tuning=tuning,
+        assume_unpadded=assume_unpadded,
     )
     model.train(was_training)
     if sequence_lengths is not None:
@@ -452,6 +478,7 @@ def optimize_deberta(
     sequence_lengths: Iterable[int] | int | None = None,
     fp32_precision: str = "strict",
     tuning: KernelTuningOptions | None = None,
+    assume_unpadded: bool = False,
 ) -> nn.Module:
     """Enable the DisentangledFlash Triton backend on a Hugging Face DeBERTa backbone."""
 
@@ -461,6 +488,7 @@ def optimize_deberta(
         sequence_lengths=sequence_lengths,
         fp32_precision=fp32_precision,
         tuning=tuning,
+        assume_unpadded=assume_unpadded,
     )
 
 

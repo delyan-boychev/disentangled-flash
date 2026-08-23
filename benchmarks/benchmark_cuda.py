@@ -241,6 +241,7 @@ def make_models(
         target = TritonInferenceDisentangledSelfAttention(
             config,
             fp32_precision=fp32_precision,
+            assume_unpadded=assume_unpadded,
         )
         target.load_state_dict(reference.state_dict(), strict=True)
     elif implementation == "torch":

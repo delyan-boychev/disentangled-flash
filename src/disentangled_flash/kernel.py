@@ -412,6 +412,7 @@ if triton is not None:
         "ACTIVE_SLOTS",
         "HAS_C2P",
         "HAS_P2C",
+        "HAS_PADDING",
         "IS_BF16",
         "IS_FP32",
         "STRICT_FP32",
@@ -673,23 +674,42 @@ if triton is not None:
         return launch
 
 
-def _require_2d_padding_mask(
+def _validate_2d_padding_mask(
     attention_mask: torch.Tensor,
     batch_size: int,
     sequence_length: int,
-) -> torch.Tensor:
-    """Validate the fast path's factorized per-token padding-mask contract."""
+) -> None:
+    """Validate only the shape of the factorized padding mask."""
 
     if attention_mask.dim() != 2:
         raise ValueError(
             "the Triton fast path requires a factorized padding mask with shape "
             "[B, L]; arbitrary pairwise masks are not supported"
         )
+
     if attention_mask.shape != (batch_size, sequence_length):
         raise ValueError(
             f"attention_mask shape {tuple(attention_mask.shape)} does not match "
             f"[{batch_size}, {sequence_length}]"
         )
+
+
+def _require_2d_padding_mask(
+    attention_mask: torch.Tensor,
+    batch_size: int,
+    sequence_length: int,
+) -> torch.Tensor:
+    """Return the normalized bool padding mask used by the padded kernel."""
+
+    _validate_2d_padding_mask(
+        attention_mask,
+        batch_size,
+        sequence_length,
+    )
+
+    if attention_mask.dtype == torch.bool and attention_mask.is_contiguous():
+        return attention_mask
+
     return attention_mask.bool().contiguous()
 
 
@@ -748,6 +768,7 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
+
     def _reshape_heads(
         self,
         tensor: torch.Tensor,
@@ -850,6 +871,19 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         self._triton_position_projection_cache[cache_key] = plan
         return plan
 
+    def _get_cached_shape_plan(
+        self,
+        sequence_length: int,
+        device: torch.device | str,
+    ) -> TritonPreparedPositionPlan | None:
+        resolved_device = canonical_device(
+            device,
+            self._plan_device(),
+        )
+        return self._triton_position_projection_cache.get(
+            (sequence_length, str(resolved_device))
+        )
+
     def _validate_triton_call(self, hidden_states: torch.Tensor) -> None:
         if triton is None:
             raise RuntimeError("Triton is not installed; this backend requires CUDA and Triton")
@@ -876,11 +910,21 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
                 f"prepared length {plan.sequence_length} does not match input length "
                 f"{sequence_length}"
             )
-        base_mask = _require_2d_padding_mask(
-            attention_mask,
-            batch_size,
-            sequence_length,
-        )
+        if self.assume_unpadded:
+            # The kernel will compile away every mask load. Validate only the
+            # external API contract; do not allocate a bool/contiguous copy.
+            _validate_2d_padding_mask(
+                attention_mask,
+                batch_size,
+                sequence_length,
+            )
+            base_mask = attention_mask
+        else:
+            base_mask = _require_2d_padding_mask(
+                attention_mask,
+                batch_size,
+                sequence_length,
+            )
 
         query, key, value = self._project_qkv(hidden_states)
         query_layer = self._reshape_heads(query, batch_size, sequence_length)
@@ -963,16 +1007,42 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         if relative_pos is not None:
             raise ValueError("custom relative_pos tensors are not supported by the Triton path")
 
+        sequence_length = hidden_states.size(1)
+
+        cached_plan = self._get_cached_shape_plan(
+            sequence_length,
+            hidden_states.device,
+        )
+        if (
+            cached_plan is not None
+            and self._cached_qkv_weight is not None
+        ):
+            return self.forward_prepared(
+                hidden_states,
+                attention_mask,
+                cached_plan,
+            )
+
         has_c2p = self.relative_attention and "c2p" in self.pos_att_type
         has_p2c = self.relative_attention and "p2c" in self.pos_att_type
+
         needs_key = has_c2p and self._cached_pos_key is None
         needs_query = has_p2c and self._cached_pos_query is None
         needs_qkv = self._cached_qkv_weight is None
+
         if needs_key or needs_query or needs_qkv:
             self.prepare_for_inference(rel_embeddings)
 
-        plan = self.prepare_shape(hidden_states.size(1), hidden_states.device)
-        return self.forward_prepared(hidden_states, attention_mask, plan)
+        plan = self.prepare_shape(
+            sequence_length,
+            hidden_states.device,
+        )
+
+        return self.forward_prepared(
+            hidden_states,
+            attention_mask,
+            plan,
+        )
 
 
 DisentangledFlashAttention = TritonInferenceDisentangledSelfAttention
