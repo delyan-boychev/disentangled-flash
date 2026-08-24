@@ -731,16 +731,11 @@ def enable_deberta_training(
 optimize_deberta_training = enable_deberta_training
 
 
-# Compatibility alias for code from the standalone experiment.
-enable_deberta_v2_inference = enable_deberta_inference
-
-
 __all__ = [
     "DebertaV2OptimizedEncoder",
     "compile_deberta_buckets",
     "enable_deberta_inference",
     "enable_deberta_training",
-    "enable_deberta_v2_inference",
     "optimize_deberta",
     "optimize_deberta_training",
 ]

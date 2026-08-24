@@ -15,9 +15,8 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ._reference import DebertaAttentionConfig
 from ._torch import TorchInferenceDisentangledSelfAttention
-from .position import SharedPositionPlanCache, canonical_device
+from .position import canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
     HardwareSpec,
@@ -723,7 +722,7 @@ class TritonPreparedPositionPlan(NamedTuple):
     pos_query: torch.Tensor | None
 
 
-class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention):
+class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention):
     """Forward-only CUDA Triton DeBERTa-v2/v3 self-attention.
 
     Head dimensions 32, 64, and 128 have explicit supported paths.  ``strict``
@@ -734,21 +733,28 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
 
     def __init__(
         self,
-        config: DebertaAttentionConfig | Any,
+        config,
         *,
-        position_plan_cache: SharedPositionPlanCache | None = None,
+        backend: str = "triton",
+        position_plan_cache=None,
         fp32_precision: str = "strict",
         tuning: KernelTuningOptions | None = None,
         profile_registry: ProfileRegistry | None = None,
         assume_unpadded: bool = False,
-    ) -> None:
+    ):
         super().__init__(
             config,
             position_plan_cache=position_plan_cache,
             assume_unpadded=assume_unpadded,
         )
+
+        if backend not in {"torch", "triton"}:
+            raise ValueError("backend must be 'torch' or 'triton'")
+
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
+
+        self.backend = backend
         self.fp32_precision = fp32_precision
         self.assume_unpadded = assume_unpadded
         self.tuning = tuning or KernelTuningOptions()
@@ -847,7 +853,8 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         device: torch.device | str | None = None,
     ) -> TritonPreparedPositionPlan:
         """Prepare layer projections while keeping position indexing ``O(L)``."""
-
+        if self.backend == "torch":
+            return super().prepare_shape(sequence_length, device)
         if self.training:
             raise RuntimeError("prepare_shape() requires module.eval()")
         resident_device = self._plan_device()

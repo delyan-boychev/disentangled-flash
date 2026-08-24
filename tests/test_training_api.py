@@ -11,7 +11,7 @@ from disentangled_flash._reference import (
     OriginalDisentangledSelfAttention,
 )
 from disentangled_flash._torch import TorchTrainingDisentangledSelfAttention
-from disentangled_flash.deberta import DebertaV2TrainingEncoder
+from disentangled_flash.deberta import DebertaV2OptimizedEncoder
 from disentangled_flash.training import TritonTrainingDisentangledSelfAttention
 
 
@@ -40,7 +40,7 @@ def test_training_attention_preserves_parameter_layout() -> None:
 
 def test_training_public_api_is_exported() -> None:
     assert disentangled_flash.TritonTrainingDisentangledSelfAttention is not None
-    assert disentangled_flash.DebertaV2TrainingEncoder is not None
+    assert disentangled_flash.DebertaV2OptimizedEncoder is not None
     assert callable(disentangled_flash.enable_deberta_training)
     assert callable(disentangled_flash.optimize_deberta_training)
 
@@ -95,10 +95,11 @@ def test_unified_training_encoder_auto_falls_back_to_torch_on_cpu() -> None:
     )
     source = DebertaV2Encoder(config)
     reference_keys = tuple(source.state_dict())
-    target = DebertaV2TrainingEncoder(
+    target = DebertaV2OptimizedEncoder(
         copy.deepcopy(source),
         config,
         backend="auto",
+        inference=False,
     )
 
     assert target.backend == "torch"
