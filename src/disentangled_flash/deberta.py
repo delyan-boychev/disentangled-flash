@@ -596,11 +596,11 @@ def _enable_deberta(
     if inference and sequence_lengths is not None and was_training:
         raise RuntimeError("call model.eval() before preparing inference buckets")
 
-    encoder_class = DebertaV2InferenceEncoder if inference else DebertaV2TrainingEncoder
-    model.encoder = encoder_class(
+    model.encoder = DebertaV2OptimizedEncoder(
         model.encoder,
         model.config,
         backend=backend,
+        inference=inference,
         fp32_precision=fp32_precision,
         assume_unpadded=assume_unpadded,
     )
@@ -638,7 +638,7 @@ def enable_deberta_inference(
 
 
 def compile_deberta_buckets(
-    encoder: DebertaV2InferenceEncoder,
+    encoder: DebertaV2OptimizedEncoder,
     sequence_lengths: Iterable[int] | None = None,
     *,
     mode: str = "max-autotune-no-cudagraphs",
@@ -654,6 +654,11 @@ def compile_deberta_buckets(
     workaround.  Supplying ``examples`` executes one example per bucket so
     Dynamo, Inductor, and Triton autotuning finish during startup.
     """
+    if not encoder.inference:
+        raise ValueError(
+            "compile_deberta_buckets() requires an encoder configured "
+            "with inference=True"
+        )
 
     if sequence_lengths is None:
         lengths = tuple(sorted(encoder._prepared_plans))
