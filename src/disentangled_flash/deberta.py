@@ -530,50 +530,6 @@ class DebertaV2OptimizedEncoder(nn.Module):
         )
 
 
-class DebertaV2InferenceEncoder(DebertaV2OptimizedEncoder):
-    """Compatibility wrapper for the unified encoder with ``inference=True``."""
-
-    def __init__(
-        self,
-        source_encoder: nn.Module,
-        config: Any,
-        *,
-        backend: str = "triton",
-        fp32_precision: str = "strict",
-        assume_unpadded: bool = False,
-    ) -> None:
-        super().__init__(
-            source_encoder,
-            config,
-            backend=backend,
-            inference=True,
-            fp32_precision=fp32_precision,
-            assume_unpadded=assume_unpadded,
-        )
-
-
-class DebertaV2TrainingEncoder(DebertaV2OptimizedEncoder):
-    """Compatibility wrapper for the unified encoder with ``inference=False``."""
-
-    def __init__(
-        self,
-        source_encoder: nn.Module,
-        config: Any,
-        *,
-        backend: str = "triton",
-        fp32_precision: str = "strict",
-        assume_unpadded: bool = False,
-    ) -> None:
-        super().__init__(
-            source_encoder,
-            config,
-            backend=backend,
-            inference=False,
-            fp32_precision=fp32_precision,
-            assume_unpadded=assume_unpadded,
-        )
-
-
 def _enable_deberta(
     model: nn.Module,
     *,
@@ -656,8 +612,7 @@ def compile_deberta_buckets(
     """
     if not encoder.inference:
         raise ValueError(
-            "compile_deberta_buckets() requires an encoder configured "
-            "with inference=True"
+            "compile_deberta_buckets() requires an encoder configured with inference=True"
         )
 
     if sequence_lengths is None:
@@ -781,9 +736,7 @@ enable_deberta_v2_inference = enable_deberta_inference
 
 
 __all__ = [
-    "DebertaV2InferenceEncoder",
     "DebertaV2OptimizedEncoder",
-    "DebertaV2TrainingEncoder",
     "compile_deberta_buckets",
     "enable_deberta_inference",
     "enable_deberta_training",

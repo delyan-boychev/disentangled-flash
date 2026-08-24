@@ -39,7 +39,7 @@ from disentangled_flash._reference import (
     _prepare_attention_mask,
 )
 from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
-from disentangled_flash.deberta import DebertaV2InferenceEncoder
+from disentangled_flash.deberta import DebertaV2OptimizedEncoder
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
 
 IMPLEMENTATIONS = {
@@ -232,7 +232,7 @@ def make_models(
         if implementation == "original":
             target = source
         else:
-            target = DebertaV2InferenceEncoder(
+            target = DebertaV2OptimizedEncoder(
                 source,
                 config,
                 backend=implementation,

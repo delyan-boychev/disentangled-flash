@@ -2,7 +2,7 @@ from disentangled_flash._reference import (
     DebertaAttentionConfig,
     DebertaV2Encoder,
 )
-from disentangled_flash.deberta import DebertaV2InferenceEncoder
+from disentangled_flash.deberta import DebertaV2OptimizedEncoder
 
 
 def test_encoder_propagates_assume_unpadded():
@@ -25,7 +25,7 @@ def test_encoder_propagates_assume_unpadded():
 
     source = DebertaV2Encoder(config)
 
-    encoder = DebertaV2InferenceEncoder(
+    encoder = DebertaV2OptimizedEncoder(
         source,
         config,
         backend="triton",
