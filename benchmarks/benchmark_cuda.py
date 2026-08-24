@@ -38,14 +38,13 @@ from disentangled_flash._reference import (
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
-from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 from disentangled_flash.deberta import DebertaV2OptimizedEncoder
-from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
+from disentangled_flash.kernel import InferenceDisentangledSelfAttention
 
 IMPLEMENTATIONS = {
     "original": OriginalDisentangledSelfAttention,
-    "torch": TorchInferenceDisentangledSelfAttention,
-    "triton": TritonInferenceDisentangledSelfAttention,
+    "torch": InferenceDisentangledSelfAttention,
+    "triton": InferenceDisentangledSelfAttention,
 }
 DTYPES = {
     "fp16": torch.float16,
@@ -239,15 +238,13 @@ def make_models(
                 fp32_precision=fp32_precision,
                 assume_unpadded=(assume_unpadded if implementation == "triton" else False),
             )
-    elif implementation == "triton":
-        target = TritonInferenceDisentangledSelfAttention(
+    elif implementation in {"torch", "triton"}:
+        target = InferenceDisentangledSelfAttention(
             config,
+            backend=implementation,
             fp32_precision=fp32_precision,
-            assume_unpadded=assume_unpadded,
+            assume_unpadded=(assume_unpadded if implementation == "triton" else False),
         )
-        target.load_state_dict(reference.state_dict(), strict=True)
-    elif implementation == "torch":
-        target = TorchInferenceDisentangledSelfAttention(config)
         target.load_state_dict(reference.state_dict(), strict=True)
     else:
         target = OriginalDisentangledSelfAttention(config)

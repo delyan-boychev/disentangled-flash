@@ -14,7 +14,7 @@ from disentangled_flash._reference import (
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
-from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
+from disentangled_flash.kernel import InferenceDisentangledSelfAttention
 
 
 def synchronize() -> None:
@@ -91,7 +91,12 @@ def main() -> None:
 
     reference = OriginalDisentangledSelfAttention(config).to(device=device, dtype=dtype).eval()
     optimized = (
-        TorchInferenceDisentangledSelfAttention(config).to(device=device, dtype=dtype).eval()
+        InferenceDisentangledSelfAttention(config, backend="torch")
+        .to(
+            device=device,
+            dtype=dtype,
+        )
+        .eval()
     )
     optimized.load_state_dict(reference.state_dict(), strict=True)
     rel_embeddings = torch.randn(

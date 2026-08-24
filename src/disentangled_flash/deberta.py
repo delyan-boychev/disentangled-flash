@@ -20,12 +20,11 @@ from torch.utils.checkpoint import checkpoint
 
 from ._reference import BaseModelOutput
 from ._torch import (
-    TorchInferenceDisentangledSelfAttention,
     TorchPositionPlan,
     TorchTrainingDisentangledSelfAttention,
 )
 from .kernel import (
-    TritonInferenceDisentangledSelfAttention,
+    InferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
 )
 from .kernel import (
@@ -161,10 +160,8 @@ class DebertaV2OptimizedEncoder(nn.Module):
         )
 
         attention_class: type[nn.Module]
-        if self.inference and self.backend == "triton":
-            attention_class = TritonInferenceDisentangledSelfAttention
-        elif self.inference:
-            attention_class = TorchInferenceDisentangledSelfAttention
+        if self.inference:
+            attention_class = InferenceDisentangledSelfAttention
         elif self.backend == "triton":
             # Lazy import avoids a package-level cycle: training._kernels imports
             # the canonical forward kernel from kernel.py.
@@ -183,13 +180,16 @@ class DebertaV2OptimizedEncoder(nn.Module):
             original_attention = layer.attention.self
             kwargs: dict[str, Any] = {
                 "position_plan_cache": self.position_plan_cache,
+                "assume_unpadded": assume_unpadded,
             }
-            if self.backend == "triton":
+            if self.inference:
+                kwargs["backend"] = self.backend
+                kwargs["fp32_precision"] = fp32_precision
+            elif self.backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
             if self.inference and self.backend == "triton":
                 kwargs["tuning"] = self.tuning
                 kwargs["profile_registry"] = profile_registry
-            kwargs["assume_unpadded"] = assume_unpadded
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(

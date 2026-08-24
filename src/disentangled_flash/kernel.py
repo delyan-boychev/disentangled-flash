@@ -15,7 +15,7 @@ from typing import Any, NamedTuple
 
 import torch
 
-from ._torch import TorchInferenceDisentangledSelfAttention
+from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
 from .position import canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
@@ -723,12 +723,12 @@ class TritonPreparedPositionPlan(NamedTuple):
 
 
 class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention):
-    """Forward-only CUDA Triton DeBERTa-v2/v3 self-attention.
+    """Cached DeBERTa-v2/v3 inference attention with Torch/Triton dispatch.
 
-    Head dimensions 32, 64, and 128 have explicit supported paths.  ``strict``
-    FP32 uses IEEE dot products; ``fast`` opts into TF32 inside the fused kernel.
-    PyTorch's global FP32 matmul setting still governs the separate C2P/P2C and
-    projection GEMMs.
+    One module owns the original DeBERTa parameters and inference caches.  The
+    selected backend only changes the prepared position representation and the
+    attention execution: ``torch`` uses the optimized PyTorch implementation,
+    while ``triton`` uses the compact O(L) position plan and fused CUDA kernel.
     """
 
     def __init__(
@@ -851,8 +851,8 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         self,
         sequence_length: int,
         device: torch.device | str | None = None,
-    ) -> TritonPreparedPositionPlan:
-        """Prepare layer projections while keeping position indexing ``O(L)``."""
+    ) -> TorchPositionPlan | TritonPreparedPositionPlan:
+        """Prepare only the position representation required by the backend."""
         if self.backend == "torch":
             return super().prepare_shape(sequence_length, device)
         if self.training:
@@ -882,7 +882,9 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         self,
         sequence_length: int,
         device: torch.device | str,
-    ) -> TritonPreparedPositionPlan | None:
+    ) -> TorchPositionPlan | TritonPreparedPositionPlan | None:
+        if self.backend == "torch":
+            return super()._get_cached_shape_plan(sequence_length, device)
         resolved_device = canonical_device(
             device,
             self._plan_device(),
@@ -893,7 +895,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         if triton is None:
             raise RuntimeError("Triton is not installed; this backend requires CUDA and Triton")
         if hidden_states.device.type != "cuda":
-            raise RuntimeError("TritonInferenceDisentangledSelfAttention requires CUDA")
+            raise RuntimeError("the Triton inference backend requires CUDA")
         if hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise TypeError("the Triton path supports FP16, BF16, and FP32")
         if self.attention_head_size not in {32, 64, 128}:
@@ -904,9 +906,21 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
-        plan: TritonPreparedPositionPlan,
+        plan: TorchPositionPlan | TritonPreparedPositionPlan,
     ) -> tuple[torch.Tensor, None]:
-        """Pure forward using a plan prepared completely outside the hot path."""
+        """Pure backend-dispatched forward using an already prepared plan."""
+
+        if self.backend == "torch":
+            if not isinstance(plan, TorchPositionPlan):
+                raise TypeError("the Torch inference backend requires a TorchPositionPlan")
+            return super().forward_prepared(
+                hidden_states,
+                attention_mask,
+                plan,
+            )
+
+        if not isinstance(plan, TritonPreparedPositionPlan):
+            raise TypeError("the Triton inference backend requires a TritonPreparedPositionPlan")
 
         self._validate_triton_call(hidden_states)
         batch_size, sequence_length = hidden_states.shape[:2]
@@ -1002,7 +1016,17 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Convenience wrapper with lazy preparation outside the pure hot path."""
+        """Convenience wrapper with lazy backend-specific preparation."""
+
+        if self.backend == "torch":
+            return super().forward(
+                hidden_states,
+                attention_mask,
+                output_attentions=output_attentions,
+                query_states=query_states,
+                relative_pos=relative_pos,
+                rel_embeddings=rel_embeddings,
+            )
 
         self._validate_triton_call(hidden_states)
         if output_attentions:
@@ -1047,10 +1071,10 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         )
 
 
-DisentangledFlashAttention = TritonInferenceDisentangledSelfAttention
+DisentangledFlashAttention = InferenceDisentangledSelfAttention
 
 __all__ = [
     "DisentangledFlashAttention",
-    "TritonInferenceDisentangledSelfAttention",
+    "InferenceDisentangledSelfAttention",
     "TritonPreparedPositionPlan",
 ]
