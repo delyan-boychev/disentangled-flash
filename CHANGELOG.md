@@ -2,7 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.2] - 2026-09-01
+
 ## [0.1.1] - 2026-09-01
+
+### Bug Fixes
+
+- Standardize torch backend name ([cfbcde5](https://github.com/delyan-boychev/disentangled-flash/commit/cfbcde5a7f92fbe267f0f9ff2abb1f4ed178be28))
 
 ### Documentation
 
