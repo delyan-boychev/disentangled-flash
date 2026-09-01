@@ -17,7 +17,7 @@ Example:
 
 Optional:
     python parity_pretrained_mnli.py --dtype fp32
-    python parity_pretrained_mnli.py --backend optimized
+    python parity_pretrained_mnli.py --backend torch
     python parity_pretrained_mnli.py --warmup 20 --iterations 100
 """
 
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("triton", "optimized"),
+        choices=("triton", "torch"),
         default="triton",
     )
     parser.add_argument(
