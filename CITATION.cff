@@ -5,6 +5,6 @@ authors:
     given-names: "Delyan"
     email: "delyan.boychev05@gmail.com"
 title: "DisentangledFlash: Fast exact DeBERTa-style disentangled attention in Triton"
-version: 0.1.0
+version: 0.1.1
 date-released: 2026-08-21
 url: "https://github.com/delyan-boychev/disentangled-flash"

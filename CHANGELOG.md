@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-09-01
+
+### Documentation
+
+- Add PyPI version badge to README.md ([141b420](https://github.com/delyan-boychev/disentangled-flash/commit/141b420020a1889886bf0eb76c0c32d7cfca453a))
+
 ## [0.1.0] - 2026-08-21
 
 ### Bug Fixes
