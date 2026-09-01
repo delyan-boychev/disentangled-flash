@@ -299,8 +299,15 @@ if triton is not None:
                     )
             else:
                 new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
-                correction = tl.math.exp2(row_max - new_row_max)
-                probabilities = tl.math.exp2(scores - new_row_max[:, None])
+                # NaN bug fix, 0 as a normalization center (mainly left padding affected)
+                row_has_scores = new_row_max != -float("inf")
+                normalization_center = tl.where(row_has_scores, new_row_max, 0.0)
+                correction = tl.where(
+                    row_has_scores,
+                    tl.math.exp2(row_max - normalization_center),
+                    1.0,
+                )
+                probabilities = tl.math.exp2(scores - normalization_center[:, None])
                 new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
 
                 accumulator *= correction[:, None]

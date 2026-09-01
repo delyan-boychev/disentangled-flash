@@ -27,6 +27,7 @@ from disentangled_flash._reference import (
     _prepare_attention_mask,
 )
 from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
+from disentangled_flash._validation import require_finite
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
 
 DTYPES = {
@@ -264,6 +265,16 @@ def main() -> None:
                                             rel_embeddings=relative,
                                         )[0]
                                         target_output = call(hidden_states, mask)
+                                        case = (
+                                            f"backend={backend}, dtype={dtype_name}, "
+                                            f"execution={execution}, head_dim={head_dim}, "
+                                            f"position_mode={position_mode}, "
+                                            f"batch_size={batch_size}, "
+                                            f"sequence_length={sequence_length}, "
+                                            f"mask_pattern={pattern}"
+                                        )
+                                        require_finite(reference_output, "reference", case)
+                                        require_finite(target_output, "target", case)
                                         difference = (
                                             reference_output.float() - target_output.float()
                                         ).abs()
