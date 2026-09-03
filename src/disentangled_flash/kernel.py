@@ -168,7 +168,7 @@ if triton is not None:
         SCORE_SCALE_LOG2: tl.constexpr,
         HAS_C2P: tl.constexpr,
         HAS_P2C: tl.constexpr,
-        HAS_PADDING: tl.constexpr,
+        USE_PADDING_MASK: tl.constexpr,
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
@@ -201,7 +201,7 @@ if triton is not None:
             mask=query_in_bounds[:, None],
             other=0.0,
         )
-        if HAS_PADDING:
+        if USE_PADDING_MASK:
             query_is_kept = tl.load(
                 attention_mask + batch * SEQUENCE_LENGTH + query_offsets,
                 mask=query_in_bounds,
@@ -223,7 +223,7 @@ if triton is not None:
             key_start = tl.multiple_of(key_start, BLOCK_N)
             key_offsets = key_start + tl.arange(0, BLOCK_N)
             key_in_bounds = key_offsets < SEQUENCE_LENGTH
-            if HAS_PADDING:
+            if USE_PADDING_MASK:
                 key_is_kept = tl.load(
                     attention_mask + batch * SEQUENCE_LENGTH + key_offsets,
                     mask=key_in_bounds,
@@ -278,7 +278,7 @@ if triton is not None:
                 )
 
             scores *= SCORE_SCALE_LOG2
-            if HAS_PADDING:
+            if USE_PADDING_MASK:
                 attended = query_is_kept[:, None] & key_is_kept[None, :] & pair_in_bounds
                 scores = tl.where(attended, scores, -float("inf"))
 
@@ -345,7 +345,7 @@ if triton is not None:
                     )
             else:
                 new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
-                if HAS_PADDING:
+                if USE_PADDING_MASK:
                     # A left-padded sequence can produce a completely masked
                     # first K/V tile. Avoid -inf - -inf in the online-softmax
                     # recurrence until the first kept key is encountered.
@@ -416,7 +416,7 @@ if triton is not None:
         "ACTIVE_SLOTS",
         "HAS_C2P",
         "HAS_P2C",
-        "HAS_PADDING",
+        "USE_PADDING_MASK",
         "IS_BF16",
         "IS_FP32",
         "STRICT_FP32",
@@ -448,7 +448,7 @@ if triton is not None:
         sequence_length: int,
         active_slots: int,
         score_scale_log2: float,
-        has_padding: bool,
+        use_padding_mask: bool,
         has_c2p: bool,
         has_p2c: bool,
         is_bf16: bool,
@@ -483,7 +483,7 @@ if triton is not None:
             "SCORE_SCALE_LOG2": score_scale_log2,
             "HAS_C2P": has_c2p,
             "HAS_P2C": has_p2c,
-            "HAS_PADDING": has_padding,
+            "USE_PADDING_MASK": use_padding_mask,
             "IS_BF16": is_bf16,
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,

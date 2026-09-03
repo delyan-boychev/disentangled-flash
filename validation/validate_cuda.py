@@ -187,7 +187,7 @@ def main() -> None:
         "--assume-unpadded",
         action="store_true",
         help=(
-            "Exercise the Triton HAS_PADDING=False specialization. "
+            "Exercise the Triton USE_PADDING_MASK=False specialization. "
             "Requires --backends triton and --mask-patterns none."
         ),
     )

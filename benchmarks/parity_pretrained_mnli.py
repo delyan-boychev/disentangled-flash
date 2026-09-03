@@ -3,7 +3,7 @@
 Runs an official DeBERTa-v2 model fine-tuned on MNLI as:
   1. untouched Hugging Face reference
   2. one candidate implementation:
-       - triton / optimized: same HF checkpoint with only the encoder replaced
+       - triton / torch: same HF checkpoint with only the encoder replaced
          by DisentangledFlash
        - flashdeberta: FlashDeBERTa's sequence-classification class loaded from
          the exact same pretrained checkpoint
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("triton", "optimized", "flashdeberta"),
+        choices=("triton", "torch", "flashdeberta"),
         default="triton",
         help="Candidate implementation compared against untouched Hugging Face.",
     )
