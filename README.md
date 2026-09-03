@@ -73,7 +73,7 @@ optimize_deberta(
 existing layer output, residual, FFN, convolution, classifier, and checkpoint
 parameter names are preserved.
 
-For lower-level experiments, `enable_deberta_inference(..., backend="torch")`
+For lower-level experiments, `enable_deberta_inference(..., backend="optimized")`
 selects the PyTorch backend instead of Triton.
 
 ## CUDA benchmark
@@ -89,7 +89,7 @@ Full encoder:
 ```bash
 python -m benchmarks.benchmark_cuda \
   --scope encoder \
-  --implementations original,torch,triton \
+  --implementations original,optimized,triton \
   --dtypes fp16,fp32 \
   --output encoder_attention_cuda_results.json
 ```

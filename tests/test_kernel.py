@@ -36,6 +36,7 @@ def test_online_softmax_handles_completely_masked_first_tile():
         sequence_length,
         1,
         1.0,
+        True,
         False,
         False,
         False,

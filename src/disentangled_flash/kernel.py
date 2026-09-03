@@ -345,15 +345,23 @@ if triton is not None:
                     )
             else:
                 new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
-                # NaN bug fix, 0 as a normalization center (mainly left padding affected)
-                row_has_scores = new_row_max != -float("inf")
-                normalization_center = tl.where(row_has_scores, new_row_max, 0.0)
-                correction = tl.where(
-                    row_has_scores,
-                    tl.math.exp2(row_max - normalization_center),
-                    1.0,
-                )
-                probabilities = tl.math.exp2(scores - normalization_center[:, None])
+                if HAS_PADDING:
+                    # A left-padded sequence can produce a completely masked
+                    # first K/V tile. Avoid -inf - -inf in the online-softmax
+                    # recurrence until the first kept key is encountered.
+                    row_has_scores = new_row_max != -float("inf")
+                    normalization_center = tl.where(row_has_scores, new_row_max, 0.0)
+                    correction = tl.where(
+                        row_has_scores,
+                        tl.math.exp2(row_max - normalization_center),
+                        1.0,
+                    )
+                    probabilities = tl.math.exp2(scores - normalization_center[:, None])
+                else:
+                    # Keep the no-padding specialization free of mask-related
+                    # normalization work.
+                    correction = tl.math.exp2(row_max - new_row_max)
+                    probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
 
                 accumulator *= correction[:, None]
