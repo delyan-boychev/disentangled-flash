@@ -128,6 +128,7 @@ if triton is not None:
         HAS_C2P: tl.constexpr,
         HAS_P2C: tl.constexpr,
         HAS_PADDING: tl.constexpr,
+        PHYSICAL_PAIRS: tl.constexpr,
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
@@ -212,7 +213,10 @@ if triton is not None:
                 scores = tl.dot(q, tl.trans(k))
 
             pair_in_bounds = row_mask[:, None] & col_mask[None, :]
-            delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
+            if PHYSICAL_PAIRS:
+                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[None, :]
+            else:
+                delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -330,6 +334,7 @@ if triton is not None:
         HAS_C2P: tl.constexpr,
         HAS_P2C: tl.constexpr,
         HAS_PADDING: tl.constexpr,
+        PHYSICAL_PAIRS: tl.constexpr,
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
@@ -417,7 +422,10 @@ if triton is not None:
                 scores = tl.dot(q, tl.trans(k))
 
             pair_in_bounds = row_mask[:, None] & col_mask[None, :]
-            delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
+            if PHYSICAL_PAIRS:
+                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[None, :]
+            else:
+                delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -595,6 +603,7 @@ if (
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
             USE_PADDING_MASK=has_padding,
+            PHYSICAL_PAIRS=delta_to_local.ndim == 3,
             IS_BF16=query.dtype == torch.bfloat16,
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
@@ -729,6 +738,7 @@ if (
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
             HAS_PADDING=has_padding,
+            PHYSICAL_PAIRS=delta_to_local.ndim == 3,
             IS_BF16=query.dtype == torch.bfloat16,
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
@@ -787,6 +797,7 @@ if (
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
             HAS_PADDING=has_padding,
+            PHYSICAL_PAIRS=delta_to_local.ndim == 3,
             IS_BF16=query.dtype == torch.bfloat16,
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
@@ -941,8 +952,13 @@ def training_attention(
         raise ValueError("delta_to_local must be a contiguous int32 tensor")
     batch_size, num_heads, sequence_length, head_dim = query.shape
     del num_heads, head_dim
-    if delta_to_local.numel() != 2 * sequence_length - 1:
-        raise ValueError("delta_to_local must contain 2*L-1 entries")
+    if delta_to_local.device != query.device:
+        raise ValueError("position lookup must be on the query device")
+    if delta_to_local.ndim == 3:
+        if delta_to_local.shape != (batch_size, sequence_length, sequence_length):
+            raise ValueError("physical pair lookup must have shape [B, L, L]")
+    elif delta_to_local.ndim != 1 or delta_to_local.numel() != 2 * sequence_length - 1:
+        raise ValueError("delta_to_local must contain 2*L-1 entries or a [B, L, L] map")
     if attention_mask.shape != (batch_size, sequence_length):
         raise ValueError("attention_mask must have shape [B, L]")
     if has_padding and (attention_mask.dtype != torch.bool or not attention_mask.is_contiguous()):

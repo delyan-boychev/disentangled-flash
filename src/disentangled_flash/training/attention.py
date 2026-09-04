@@ -69,6 +69,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         query_states: torch.Tensor | None = None,
         relative_pos: torch.Tensor | None = None,
         rel_embeddings: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if output_attentions:
             raise ValueError("output_attentions=True is not supported by the training Triton path")
@@ -102,7 +103,14 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         key_layer = self._reshape_heads(key, batch_size, sequence_length)
         value_layer = self._reshape_heads(value, batch_size, sequence_length)
 
-        plan = self.position_plan_cache.compact(sequence_length, hidden_states.device)
+        if position_ids is not None:
+            if position_ids.shape != (batch_size, sequence_length):
+                raise ValueError("position_ids must have shape [B, L]")
+            if position_ids.device != hidden_states.device:
+                raise ValueError("position_ids must be on the hidden_states device")
+            plan = self.position_plan_cache.physical(position_ids)
+        else:
+            plan = self.position_plan_cache.compact(sequence_length, hidden_states.device)
         pos_key = None
         pos_query = None
         if self.relative_attention and {"c2p", "p2c"}.intersection(self.pos_att_type):

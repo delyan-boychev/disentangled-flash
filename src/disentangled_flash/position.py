@@ -128,6 +128,35 @@ class SharedPositionPlanCache:
         return plan
 
     @torch.no_grad()
+    def physical(self, position_ids: torch.Tensor) -> SharedPositionIndexPlan:
+        """Exact batch-specific packed pair map; never infer distances from rank.
+
+        Unlike contiguous plans this depends on example contents and is not cached.
+        The map is O(B*N*N) int32, shared across heads. Only used embedding slots
+        are projected. Forward and backward consume this identical map.
+        """
+        if position_ids.ndim != 2 or not all(position_ids.shape):
+            raise ValueError("position_ids must have nonempty shape [B, N]")
+        if position_ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("position_ids must be int32 or int64")
+        ids = position_ids.to(torch.int64)
+        deltas = ids[:, :, None] - ids[:, None, :]
+        if self.uses_position_bias:
+            if self.position_buckets > 0:
+                deltas = make_log_bucket_position(
+                    deltas, self.position_buckets, self.max_relative_positions
+                ).to(torch.long)
+            slots = (deltas + self.position_embedding_size).clamp(
+                0, self.position_embedding_size * 2 - 1
+            )
+            active, inverse = torch.unique(slots, sorted=True, return_inverse=True)
+            lookup = inverse.to(torch.int32).contiguous()
+        else:
+            active = ids.new_empty(0)
+            lookup = torch.zeros_like(deltas, dtype=torch.int32)
+        return SharedPositionIndexPlan(position_ids.shape[1], active, lookup)
+
+    @torch.no_grad()
     def dense(
         self,
         sequence_length: int,

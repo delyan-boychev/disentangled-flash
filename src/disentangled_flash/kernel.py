@@ -175,6 +175,7 @@ if triton is not None:
         STORE_LSE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        PHYSICAL_PAIRS: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -256,7 +257,10 @@ if triton is not None:
                 scores = tl.dot(query_values, tl.trans(key_values))
 
             pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
-            delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
+            if PHYSICAL_PAIRS:
+                delta_index = (batch * SEQUENCE_LENGTH + query_offsets[:, None]) * SEQUENCE_LENGTH + key_offsets[None, :]
+            else:
+                delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -421,6 +425,7 @@ if triton is not None:
         "IS_FP32",
         "STRICT_FP32",
         "STORE_LSE",
+        "PHYSICAL_PAIRS",
     ]
 
     def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
@@ -488,6 +493,7 @@ if triton is not None:
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,
             "STORE_LSE": False,
+            "PHYSICAL_PAIRS": False,
         }
         torch.library.wrap_triton(autotuned_kernel)[grid](
             query,
