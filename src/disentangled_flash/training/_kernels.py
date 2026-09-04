@@ -594,7 +594,7 @@ if (
             SCORE_SCALE_LOG2=score_scale * _LOG2E,
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
-            HAS_PADDING=has_padding,
+            USE_PADDING_MASK=has_padding,
             IS_BF16=query.dtype == torch.bfloat16,
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
