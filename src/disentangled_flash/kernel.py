@@ -8,6 +8,7 @@ P2C remain regular GEMMs over the pruned active relative-position slots.
 from __future__ import annotations
 
 import inspect
+from functools import cache
 from typing import Any, NamedTuple
 
 import torch
@@ -15,6 +16,14 @@ import torch
 from ._reference import DebertaAttentionConfig
 from ._torch import TorchInferenceDisentangledSelfAttention
 from .position import SharedPositionPlanCache, canonical_device
+from .tuning import (
+    DEFAULT_KERNEL_CONFIGS,
+    HardwareSpec,
+    KernelConfig,
+    KernelTuningOptions,
+    ProfileRegistry,
+    WorkloadKey,
+)
 
 try:
     import triton
@@ -37,21 +46,14 @@ if triton is not None:
     # Keep all schedules at one pipeline stage. Most candidates stay within
     # 64x64; a pair of asymmetric larger tiles is retained for FP16/BF16 and
     # pruned out for heavier FP32/head-dim workloads.
-    _AUTOTUNE_CONFIGS = [
-        # tiny
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 16, "BLOCK_N": 32}, num_warps=2, num_stages=1),
-        # short / medium
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32}, num_warps=4, num_stages=1),
-        # normal long path
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-        # aggressive, but still sane
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64}, num_warps=4, num_stages=1),
-    ]
+    def _as_triton_config(config: KernelConfig) -> Any:
+        return triton.Config(
+            {"BLOCK_M": config.block_m, "BLOCK_N": config.block_n},
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+        )
+
+    _AUTOTUNE_CONFIGS = [_as_triton_config(config) for config in DEFAULT_KERNEL_CONFIGS]
 
     def _prune_autotune_configs(
         configs: list[Any],
@@ -351,28 +353,33 @@ if triton is not None:
             mask=query_in_bounds[:, None],
         )
 
-    _autotune_kwargs: dict[str, Any] = {
-        "configs": _AUTOTUNE_CONFIGS,
-        "key": [
-            "BATCH_SIZE",
-            "SEQUENCE_LENGTH",
-            "HEAD_DIM",
-            "ACTIVE_SLOTS",
-            "HAS_C2P",
-            "HAS_P2C",
-            "IS_BF16",
-            "IS_FP32",
-            "STRICT_FP32",
-        ],
-        "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
-    }
-    if "cache_results" in inspect.signature(triton.autotune).parameters:
-        _autotune_kwargs["cache_results"] = True
-    _deberta_attention_autotuned_kernel = triton.autotune(**_autotune_kwargs)(
-        _deberta_attention_forward_kernel
-    )
+    _AUTOTUNE_KEY = [
+        "BATCH_SIZE",
+        "NUM_HEADS",
+        "SEQUENCE_LENGTH",
+        "HEAD_DIM",
+        "ACTIVE_SLOTS",
+        "HAS_C2P",
+        "HAS_P2C",
+        "IS_BF16",
+        "IS_FP32",
+        "STRICT_FP32",
+    ]
 
-    def _launch_deberta_attention(
+    def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
+        autotune_kwargs: dict[str, Any] = {
+            "configs": [_as_triton_config(config) for config in configs],
+            "key": _AUTOTUNE_KEY,
+            "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
+        }
+        if "cache_results" in inspect.signature(triton.autotune).parameters:
+            autotune_kwargs["cache_results"] = True
+        return triton.autotune(**autotune_kwargs)(_deberta_attention_forward_kernel)
+
+    _deberta_attention_autotuned_kernel = _make_autotuned_kernel(DEFAULT_KERNEL_CONFIGS)
+
+    def _launch_autotuned_kernel(
+        autotuned_kernel: Any,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -422,7 +429,7 @@ if triton is not None:
             "IS_FP32": is_fp32,
             "STRICT_FP32": strict_fp32,
         }
-        torch.library.wrap_triton(_deberta_attention_autotuned_kernel)[grid](
+        torch.library.wrap_triton(autotuned_kernel)[grid](
             query,
             key,
             value,
@@ -435,14 +442,170 @@ if triton is not None:
         )
         return output
 
+    def _launch_deberta_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        c2p: torch.Tensor,
+        p2c: torch.Tensor,
+        delta_to_local: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_heads: int,
+        sequence_length: int,
+        active_slots: int,
+        score_scale_log2: float,
+        has_c2p: bool,
+        has_p2c: bool,
+        is_bf16: bool,
+        is_fp32: bool,
+        strict_fp32: bool,
+    ) -> torch.Tensor:
+        return _launch_autotuned_kernel(
+            _deberta_attention_autotuned_kernel,
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            attention_mask,
+            num_heads,
+            sequence_length,
+            active_slots,
+            score_scale_log2,
+            has_c2p,
+            has_p2c,
+            is_bf16,
+            is_fp32,
+            strict_fp32,
+        )
+
+    def _launch_deberta_attention_configured(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        c2p: torch.Tensor,
+        p2c: torch.Tensor,
+        delta_to_local: torch.Tensor,
+        attention_mask: torch.Tensor,
+        num_heads: int,
+        sequence_length: int,
+        active_slots: int,
+        score_scale_log2: float,
+        has_c2p: bool,
+        has_p2c: bool,
+        is_bf16: bool,
+        is_fp32: bool,
+        strict_fp32: bool,
+        block_m: int,
+        block_n: int,
+        num_warps: int,
+        num_stages: int,
+    ) -> torch.Tensor:
+        batch_size = query.size(0)
+        head_dim = query.size(-1)
+        output = torch.empty(
+            (batch_size, sequence_length, num_heads * head_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        grid = (triton.cdiv(sequence_length, block_m), batch_size * num_heads)
+        torch.library.wrap_triton(_deberta_attention_forward_kernel)[grid](
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            attention_mask,
+            output,
+            ACTIVE_SLOTS=active_slots,
+            BATCH_SIZE=batch_size,
+            NUM_HEADS=num_heads,
+            SEQUENCE_LENGTH=sequence_length,
+            HEAD_DIM=head_dim,
+            SCORE_SCALE_LOG2=score_scale_log2,
+            HAS_C2P=has_c2p,
+            HAS_P2C=has_p2c,
+            IS_BF16=is_bf16,
+            IS_FP32=is_fp32,
+            STRICT_FP32=strict_fp32,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return output
+
     if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
         _deberta_attention_op = torch.library.triton_op(
             "gliner2_attention::deberta_attention",
             _launch_deberta_attention,
             mutates_args={},
         )
+        _deberta_attention_configured_op = torch.library.triton_op(
+            "gliner2_attention::deberta_attention_configured",
+            _launch_deberta_attention_configured,
+            mutates_args={},
+        )
     else:  # Older PyTorch still supports raw user-authored Triton calls.
         _deberta_attention_op = _launch_deberta_attention
+        _deberta_attention_configured_op = _launch_deberta_attention_configured
+
+    @cache
+    def _custom_autotune_operator(configs: tuple[KernelConfig, ...]) -> Any:
+        if configs == DEFAULT_KERNEL_CONFIGS:
+            return _deberta_attention_op
+        autotuned_kernel = _make_autotuned_kernel(configs)
+
+        def launch(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            c2p: torch.Tensor,
+            p2c: torch.Tensor,
+            delta_to_local: torch.Tensor,
+            attention_mask: torch.Tensor,
+            num_heads: int,
+            sequence_length: int,
+            active_slots: int,
+            score_scale_log2: float,
+            has_c2p: bool,
+            has_p2c: bool,
+            is_bf16: bool,
+            is_fp32: bool,
+            strict_fp32: bool,
+        ) -> torch.Tensor:
+            return _launch_autotuned_kernel(
+                autotuned_kernel,
+                query,
+                key,
+                value,
+                c2p,
+                p2c,
+                delta_to_local,
+                attention_mask,
+                num_heads,
+                sequence_length,
+                active_slots,
+                score_scale_log2,
+                has_c2p,
+                has_p2c,
+                is_bf16,
+                is_fp32,
+                strict_fp32,
+            )
+
+        # Custom candidate sets remain eager-only on older torch versions. On
+        # current torch, register a stable operator so torch.compile can trace it.
+        if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
+            suffix = abs(hash(configs))
+            return torch.library.triton_op(
+                f"gliner2_attention::deberta_attention_custom_{suffix}",
+                launch,
+                mutates_args={},
+            )
+        return launch
 
 
 def _require_2d_padding_mask(
@@ -490,6 +653,8 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         *,
         position_plan_cache: SharedPositionPlanCache | None = None,
         fp32_precision: str = "strict",
+        tuning: KernelTuningOptions | None = None,
+        profile_registry: ProfileRegistry | None = None,
     ) -> None:
         super().__init__(
             config,
@@ -498,14 +663,80 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
+        self.tuning = tuning or KernelTuningOptions()
+        self._profile_registry = (
+            profile_registry
+            if profile_registry is not None
+            else (
+                ProfileRegistry.from_options(self.tuning)
+                if self.tuning.mode in {"auto", "profile_only"}
+                else ProfileRegistry()
+            )
+        )
+        self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
+        if triton is not None:
+            candidates = self.tuning.candidates or DEFAULT_KERNEL_CONFIGS
+            self._autotune_operator = _custom_autotune_operator(candidates)
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
 
     def clear_inference_cache(self) -> None:
         super().clear_inference_cache()
+        if hasattr(self, "_resolved_kernel_configs"):
+            self._resolved_kernel_configs.clear()
         if hasattr(self, "_triton_position_projection_cache"):
             self._triton_position_projection_cache.clear()
+
+    def _resolve_kernel_config(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        active_slots: int,
+        has_c2p: bool,
+        has_p2c: bool,
+    ) -> KernelConfig | None:
+        """Return a direct-launch config, or ``None`` for runtime autotuning."""
+
+        if self.tuning.mode == "autotune":
+            return None
+        if self.tuning.mode == "fixed":
+            return self.tuning.fixed_config
+        if torch.compiler.is_compiling():
+            if self.tuning.mode == "profile_only":
+                raise RuntimeError(
+                    "profile_only tuning cannot resolve a dynamic workload inside "
+                    "torch.compile; select the profile's configuration with fixed mode"
+                )
+            # Triton's own key-based autotuner supports symbolic/dynamic batch
+            # sizes without introducing Python profile lookups into the graph.
+            return None
+        device_index = hidden_states.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        workload = WorkloadKey(
+            sequence_length=hidden_states.size(1),
+            head_dim=self.attention_head_size,
+            batch_heads=hidden_states.size(0) * self.num_attention_heads,
+            active_slots=active_slots,
+            dtype=str(hidden_states.dtype).removeprefix("torch."),
+            has_c2p=has_c2p,
+            has_p2c=has_p2c,
+            fp32_precision=self.fp32_precision,
+        )
+        cache_key = device_index, workload
+        if cache_key not in self._resolved_kernel_configs:
+            hardware = HardwareSpec.current(device_index)
+            self._resolved_kernel_configs[cache_key] = self._profile_registry.resolve(
+                hardware, workload
+            )
+        config = self._resolved_kernel_configs[cache_key]
+        if config is None and self.tuning.mode == "profile_only":
+            raise RuntimeError(
+                "no validated kernel tuning profile matches "
+                f"{HardwareSpec.current(device_index).name} and workload {workload}"
+            )
+        return config
 
     @torch.no_grad()
     def prepare_shape(
@@ -593,7 +824,14 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
 
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale_log2 = self._scale(scale_factor) ** -1 * 1.4426950408889634
-        output = _deberta_attention_op(
+        selected_config = self._resolve_kernel_config(
+            hidden_states,
+            active_slots=active_slot_count,
+            has_c2p=has_c2p,
+            has_p2c=has_p2c,
+        )
+        operation = self._autotune_operator
+        operation_args = (
             query_layer,
             key_layer,
             value_layer,
@@ -611,6 +849,16 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
             hidden_states.dtype == torch.float32,
             self.fp32_precision == "strict",
         )
+        if selected_config is None:
+            output = operation(*operation_args)
+        else:
+            output = _deberta_attention_configured_op(
+                *operation_args,
+                selected_config.block_m,
+                selected_config.block_n,
+                selected_config.num_warps,
+                selected_config.num_stages,
+            )
 
         return output, None
 

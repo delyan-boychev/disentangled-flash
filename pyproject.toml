@@ -31,6 +31,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"disentangled_flash.profiles" = ["*.json"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]

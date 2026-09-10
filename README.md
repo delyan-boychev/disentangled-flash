@@ -94,6 +94,65 @@ python -m benchmarks.benchmark_cuda \
   --output encoder_attention_cuda_results.json
 ```
 
+### Kernel tuning profiles
+
+The Triton backend uses a validated saved configuration when one exactly
+matches the GPU and workload. Otherwise it safely falls back to Triton
+autotuning on first use. You can override that policy explicitly:
+
+```python
+from disentangled_flash import KernelConfig, KernelTuningOptions, optimize_deberta
+
+# Always retune, even when a bundled or personal profile matches.
+optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))
+
+# Use a personal profile before the bundled profiles.
+optimize_deberta(
+    model,
+    tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
+)
+
+# Advanced: bypass profiles and autotuning with one explicit configuration.
+optimize_deberta(
+    model,
+    tuning=KernelTuningOptions(
+        mode="fixed",
+        fixed_config=KernelConfig(64, 64, 4),
+    ),
+)
+```
+
+Personal profiles placed in
+`$XDG_CACHE_HOME/disentangled_flash/profiles` (or
+`~/.cache/disentangled_flash/profiles`) are discovered automatically. Set
+`DISENTANGLED_FLASH_PROFILE_DIR` to use another directory. Explicit profile
+paths take precedence, followed by the user directory and bundled profiles.
+Installed package files are never modified.
+
+For dynamic `torch.compile` graphs, `auto` uses Triton's keyed autotuner because
+the runtime batch occupancy is symbolic while the graph is being created. Use
+`fixed` with a known profile configuration when compilation must also skip
+autotuning; `profile_only` reports an error instead of silently changing policy.
+
+Dynamic `torch.compile` graphs continue to use Triton's runtime-keyed autotuner,
+because batch occupancy can be symbolic while tracing. To force a known saved
+configuration in a compiled graph, pass it with `mode="fixed"`.
+
+Generate a resumable profile on a CUDA machine with:
+
+```bash
+python -m disentangled_flash.tune \
+  --preset standard \
+  --output rtx-6000-ada.json
+```
+
+`quick` checks one representative workload, `standard` covers common production
+shapes, and `exhaustive` adds tile boundaries, occupancy levels, and all relative
+attention modes. Use `--help` for custom dimensions and candidate files. Every
+accepted result is checked against a PyTorch reference with multiple padding
+patterns, and the output is saved after each workload so an interrupted run can
+resume.
+
 The original backend remains unfused and acts as the reference baseline. The
 PyTorch and Triton backends always use one packed QKV projection.
 

@@ -71,16 +71,39 @@ ruff format .
 
 ---
 
-## How to Add a GPU Configuration
+## How to Add a GPU Tuning Profile
 
-Triton kernel autotuning options are defined in [kernel.py](file:///Users/delyan-boychev/disentangled-flash/src/disentangled_flash/kernel.py).
+Run the resumable tuner on the target GPU:
 
-To tune kernel performance or add a new GPU configuration:
-1. **Define Tuning Candidates**: Add or modify block size and warp combinations in `_AUTOTUNE_CONFIGS` at the top of [kernel.py](file:///Users/delyan-boychev/disentangled-flash/src/disentangled_flash/kernel.py):
-   ```python
-   triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=1)
-   ```
-2. **Adjust Configuration Pruning**: Modify the `_prune_autotune_configs` helper. This function filters configurations to ensure they are resource-safe (e.g. preventing shared-memory allocation failures or heavy register pressure) based on head dimension, sequence length, and data precision (such as FP32).
+```bash
+python -m disentangled_flash.tune \
+  --preset standard \
+  --output my-gpu-profile.json
+```
+
+Use `quick` for a smoke test and `exhaustive` for broad calibration. The tuner
+rejects configurations that fail to compile, produce non-finite values, or do
+not match the reference implementation across several padding patterns.
+
+To test additional schedules, pass a JSON file containing a list of configuration
+objects:
+
+```json
+[
+  {"block_m": 64, "block_n": 64, "num_warps": 4, "num_stages": 1}
+]
+```
+
+```bash
+python -m disentangled_flash.tune \
+  --preset standard \
+  --candidates candidates.json \
+  --output my-gpu-profile.json
+```
+
+Before contributing a profile, run the CUDA tests and validation suite, retain
+the generated environment metadata, and place the reviewed JSON file in
+`src/disentangled_flash/profiles/`.
 
 ---
 

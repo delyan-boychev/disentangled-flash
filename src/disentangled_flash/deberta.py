@@ -24,6 +24,7 @@ from .kernel import (
     TritonPreparedPositionPlan,
 )
 from .position import SharedPositionPlanCache
+from .tuning import KernelTuningOptions, ProfileRegistry
 
 PositionPlan = TorchPositionPlan | TritonPreparedPositionPlan
 
@@ -55,6 +56,7 @@ class DebertaV2InferenceEncoder(nn.Module):
         *,
         backend: str = "triton",
         fp32_precision: str = "strict",
+        tuning: KernelTuningOptions | None = None,
     ) -> None:
         super().__init__()
         if backend not in {"torch", "triton"}:
@@ -64,6 +66,7 @@ class DebertaV2InferenceEncoder(nn.Module):
 
         self.backend = backend
         self.fp32_precision = fp32_precision
+        self.tuning = tuning or KernelTuningOptions()
         self.relative_attention = getattr(source_encoder, "relative_attention", False)
         self.max_relative_positions = getattr(
             source_encoder,
@@ -104,6 +107,11 @@ class DebertaV2InferenceEncoder(nn.Module):
         else:
             attention_class = TorchInferenceDisentangledSelfAttention
 
+        profile_registry = (
+            ProfileRegistry.from_options(self.tuning)
+            if backend == "triton" and self.tuning.mode in {"auto", "profile_only"}
+            else None
+        )
         for layer in self.layer:
             original_attention = layer.attention.self
             kwargs: dict[str, Any] = {
@@ -111,6 +119,8 @@ class DebertaV2InferenceEncoder(nn.Module):
             }
             if backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
+                kwargs["tuning"] = self.tuning
+                kwargs["profile_registry"] = profile_registry
             replacement = attention_class(config, **kwargs)
             replacement.load_state_dict(original_attention.state_dict(), strict=True)
             replacement.to(
@@ -316,6 +326,7 @@ def enable_deberta_inference(
     backend: str = "triton",
     sequence_lengths: Iterable[int] | int | None = None,
     fp32_precision: str = "strict",
+    tuning: KernelTuningOptions | None = None,
 ) -> nn.Module:
     """Replace a HF DeBERTa-v2/v3 encoder without changing checkpoint keys.
 
@@ -339,6 +350,7 @@ def enable_deberta_inference(
         model.config,
         backend=backend,
         fp32_precision=fp32_precision,
+        tuning=tuning,
     )
     model.train(was_training)
     if sequence_lengths is not None:
@@ -432,6 +444,7 @@ def optimize_deberta(
     *,
     sequence_lengths: Iterable[int] | int | None = None,
     fp32_precision: str = "strict",
+    tuning: KernelTuningOptions | None = None,
 ) -> nn.Module:
     """Enable the DisentangledFlash Triton backend on a Hugging Face DeBERTa backbone."""
 
@@ -440,6 +453,7 @@ def optimize_deberta(
         backend="triton",
         sequence_lengths=sequence_lengths,
         fp32_precision=fp32_precision,
+        tuning=tuning,
     )
 
 
