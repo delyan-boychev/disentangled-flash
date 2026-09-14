@@ -19,6 +19,7 @@ from .tuning import (
     KernelConfig,
     KernelProfile,
     ProfileEntry,
+    TUNING_SEQUENCE_LENGTHS,
     WorkloadKey,
     load_profile,
     merge_profile_entry,
@@ -46,14 +47,14 @@ PRESETS = {
         "relative_modes": ("both",),
     },
     "standard": {
-        "lengths": (16, 32, 64, 128, 256, 512),
+        "lengths": TUNING_SEQUENCE_LENGTHS,
         "head_dims": (32, 64, 128),
         "batch_heads": (1, 8, 32),
         "dtypes": ("float16", "bfloat16", "float32"),
         "relative_modes": ("both",),
     },
     "exhaustive": {
-        "lengths": (16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 256, 512),
+        "lengths": TUNING_SEQUENCE_LENGTHS,
         "head_dims": (32, 64, 128),
         "batch_heads": (1, 4, 8, 16, 32),
         "dtypes": ("float16", "bfloat16", "float32"),
@@ -112,6 +113,10 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
     unsupported_head_dims = set(head_dims) - {32, 64, 128}
     if unsupported_head_dims:
         raise ValueError(f"unsupported head dimensions: {sorted(unsupported_head_dims)}")
+    if max(lengths) > TUNING_SEQUENCE_LENGTHS[-1]:
+        raise ValueError(
+            f"tuning lengths must not exceed {TUNING_SEQUENCE_LENGTHS[-1]}"
+        )
     for length in lengths:
         for head_dim in head_dims:
             for occupancy in batch_heads:

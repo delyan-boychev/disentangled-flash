@@ -17,6 +17,23 @@ import torch
 PROFILE_FORMAT_VERSION = 1
 KERNEL_PROFILE_VERSION = "deberta-attention-forward-v1"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
+TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024)
+
+
+def tuning_sequence_length(sequence_length: int) -> int:
+    """Map an exact runtime length to the finite profiled kernel family."""
+
+    if isinstance(sequence_length, bool) or not isinstance(sequence_length, int):
+        raise TypeError("sequence_length must be an integer")
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    for representative in TUNING_SEQUENCE_LENGTHS:
+        if sequence_length <= representative:
+            return representative
+    # Keep the profile family bounded. The 1024 schedule remains a valid
+    # conservative dispatch choice for longer inputs, even though the kernel
+    # still receives and masks the exact runtime length.
+    return TUNING_SEQUENCE_LENGTHS[-1]
 
 
 def _require_exact_keys(
@@ -92,7 +109,7 @@ DEFAULT_KERNEL_CONFIGS = (
 
 @dataclass(frozen=True, order=True)
 class WorkloadKey:
-    """Exact workload dimensions that can affect the winning schedule."""
+    """Finite workload family used to select a saved kernel schedule."""
 
     sequence_length: int
     head_dim: int
@@ -110,10 +127,17 @@ class WorkloadKey:
                 raise TypeError(f"{name} must be an integer")
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
+        object.__setattr__(self, "sequence_length", tuning_sequence_length(self.sequence_length))
         if isinstance(self.active_slots, bool) or not isinstance(self.active_slots, int):
             raise TypeError("active_slots must be an integer")
         if self.active_slots < 0:
             raise ValueError("active_slots must be non-negative")
+        if self.active_slots:
+            object.__setattr__(
+                self,
+                "active_slots",
+                tuning_sequence_length(self.active_slots),
+            )
         if not isinstance(self.has_c2p, bool) or not isinstance(self.has_p2c, bool):
             raise TypeError("has_c2p and has_p2c must be booleans")
         if self.dtype not in {"float16", "bfloat16", "float32"}:
@@ -484,6 +508,7 @@ __all__ = [
     "DEFAULT_KERNEL_CONFIGS",
     "KERNEL_PROFILE_VERSION",
     "PROFILE_FORMAT_VERSION",
+    "TUNING_SEQUENCE_LENGTHS",
     "HardwareSpec",
     "KernelConfig",
     "KernelProfile",
@@ -496,4 +521,5 @@ __all__ = [
     "load_profile",
     "merge_profile_entry",
     "save_profile",
+    "tuning_sequence_length",
 ]

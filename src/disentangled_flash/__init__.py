@@ -9,6 +9,7 @@ from .deberta import (
     optimize_deberta_training,
 )
 from .kernel import DisentangledFlashAttention
+from .packed import PackedSequenceInfo, pack_padded, unpack_packed, validate_cu_seqlens
 from .training import TritonTrainingDisentangledSelfAttention
 from .tuning import KernelConfig, KernelTuningOptions
 
@@ -19,10 +20,14 @@ __all__ = [
     "DisentangledFlashAttention",
     "KernelConfig",
     "KernelTuningOptions",
+    "PackedSequenceInfo",
     "TritonTrainingDisentangledSelfAttention",
     "compile_deberta_buckets",
     "enable_deberta_inference",
     "enable_deberta_training",
     "optimize_deberta",
     "optimize_deberta_training",
+    "pack_padded",
+    "unpack_packed",
+    "validate_cu_seqlens",
 ]
