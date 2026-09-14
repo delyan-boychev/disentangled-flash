@@ -25,6 +25,7 @@ from .position import (
     SharedPositionPlanCache,
     canonical_device,
 )
+from .packed import validate_cu_seqlens
 
 
 class TorchPositionPlan(NamedTuple):
@@ -510,6 +511,55 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             .view(batch_size, sequence_length, self.all_head_size)
         )
         return context_layer, None
+
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+        *,
+        rel_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Run an unpadded ``[total_tokens, D]`` batch described by boundaries.
+
+        The public layout matches FlashAttention's variable-length convention.
+        Sequences are dispatched independently to the existing exact attention
+        kernel, so tokens never attend across a boundary and no padded
+        ``[B, L, D]`` allocation is introduced.
+        """
+
+        self._validate_inference_call()
+        if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
+            raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
+        if cu_seqlens.device != hidden_states.device:
+            raise ValueError("cu_seqlens must be on the hidden_states device")
+        info = validate_cu_seqlens(cu_seqlens, hidden_states.size(0), max_seqlen)
+
+        needs_positions = self.relative_attention and bool(
+            {"c2p", "p2c"}.intersection(self.pos_att_type)
+        )
+        if self._cached_qkv_weight is None or (
+            needs_positions
+            and self._cached_pos_key is None
+            and self._cached_pos_query is None
+            and any(
+                self._get_cached_shape_plan(length, hidden_states.device) is None
+                for length in set(info.lengths)
+            )
+        ):
+            self.prepare_for_inference(rel_embeddings)
+
+        plans = {
+            length: self.prepare_shape(length, hidden_states.device)
+            for length in set(info.lengths)
+        }
+        outputs = []
+        for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
+            sequence = hidden_states[start:end].unsqueeze(0)
+            mask = torch.ones((1, length), dtype=torch.bool, device=hidden_states.device)
+            output, _ = self.forward_prepared(sequence, mask, plans[length])
+            outputs.append(output.squeeze(0))
+        return torch.cat(outputs, dim=0), None
 
     def forward(
         self,

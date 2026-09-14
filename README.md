@@ -146,6 +146,12 @@ python -m disentangled_flash.tune \
   --output rtx-6000-ada.json
 ```
 
+Saved profiles use six bounded sequence-length families: `64`, `128`, `384`,
+`512`, `768`, and `1024`. Runtime lengths select the next family (for example,
+383 uses the 384 profile); lengths above 1024 reuse the 1024 family. The exact
+length is still passed to the kernel for its launch grid and partial-tile masks.
+Custom tuning sweeps are capped at 1024.
+
 `quick` checks one representative workload, `standard` covers common production
 shapes, and `exhaustive` adds tile boundaries, occupancy levels, and all relative
 attention modes. Use `--help` for custom dimensions and candidate files. Every
@@ -155,6 +161,20 @@ resume.
 
 The original backend remains unfused and acts as the reference baseline. The
 PyTorch and Triton backends always use one packed QKV projection.
+
+### Packed unpadded inference
+
+Attention modules and optimized encoders accept a FlashAttention-style packed
+token layout through `forward_packed(hidden_states, cu_seqlens, max_seqlen)`.
+`hidden_states` has shape `[total_tokens, hidden_size]`; `cu_seqlens` is a
+contiguous int32/int64 tensor containing cumulative sequence boundaries. No
+dense padded batch or cross-sequence attention matrix is constructed. The
+current implementation dispatches each segment through the existing exact
+kernel, which keeps the API and semantics ready for a future single-launch
+variable-length Triton kernel.
+
+Use `pack_padded` and `unpack_packed` to convert right-padded tensors at an API
+boundary. Empty sequences and non-right-padded masks are rejected explicitly.
 
 ## Pretrained task parity + speed
 

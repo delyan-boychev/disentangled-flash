@@ -23,6 +23,7 @@ from .kernel import (
     TritonInferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
 )
+from .packed import validate_cu_seqlens
 from .position import SharedPositionPlanCache
 from .tuning import KernelTuningOptions, ProfileRegistry
 
@@ -316,6 +317,70 @@ class DebertaV2InferenceEncoder(nn.Module):
             return tuple(value for value in values if value is not None)
         return BaseModelOutput(
             last_hidden_state=output_states,
+            hidden_states=all_hidden_states,
+            attentions=None,
+        )
+
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+        *,
+        output_hidden_states: bool = True,
+        return_dict: bool = True,
+    ) -> Any:
+        """Execute an unpadded encoder batch using cumulative boundaries.
+
+        ``hidden_states`` is ``[total_tokens, hidden_size]`` and
+        ``cu_seqlens`` follows FlashAttention's ``[B + 1]`` convention.  The
+        path is inference-only and never constructs a batch padded to
+        ``max_seqlen``.
+        """
+
+        if self.training:
+            raise RuntimeError("forward_packed() requires encoder.eval()")
+        if torch.is_grad_enabled():
+            raise RuntimeError("forward_packed() requires no_grad() or inference_mode()")
+        if hidden_states.ndim != 2:
+            raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
+        if cu_seqlens.device != hidden_states.device:
+            raise ValueError("cu_seqlens must be on the hidden_states device")
+        info = validate_cu_seqlens(cu_seqlens, hidden_states.size(0), max_seqlen)
+
+        rel_embeddings = self.get_rel_embedding()
+        all_hidden_states = (hidden_states,) if output_hidden_states else None
+        next_kv = hidden_states
+        for index, layer in enumerate(self.layer):
+            self_output, _ = layer.attention.self.forward_packed(
+                next_kv,
+                cu_seqlens,
+                info.max_seqlen,
+                rel_embeddings=rel_embeddings,
+            )
+            attention_output = layer.attention.output(self_output, next_kv)
+            intermediate_output = layer.intermediate(attention_output)
+            output_states = layer.output(intermediate_output, attention_output)
+
+            if index == 0 and self.conv is not None:
+                segments = []
+                for start, end, length in zip(
+                    info.offsets, info.offsets[1:], info.lengths
+                ):
+                    source = hidden_states[start:end].unsqueeze(0)
+                    output = output_states[start:end].unsqueeze(0)
+                    mask = torch.ones((1, length), dtype=torch.bool, device=hidden_states.device)
+                    segments.append(self.conv(source, output, mask).squeeze(0))
+                output_states = torch.cat(segments, dim=0)
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (output_states,)
+            next_kv = output_states
+
+        if not return_dict:
+            values = (next_kv, all_hidden_states, None)
+            return tuple(value for value in values if value is not None)
+        return BaseModelOutput(
+            last_hidden_state=next_kv,
             hidden_states=all_hidden_states,
             attentions=None,
         )

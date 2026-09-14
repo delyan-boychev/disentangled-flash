@@ -15,6 +15,7 @@ from disentangled_flash.tuning import (
     load_profile,
     merge_profile_entry,
     save_profile,
+    tuning_sequence_length,
 )
 
 
@@ -65,6 +66,26 @@ def test_registry_uses_explicit_order_and_normalized_gpu_name():
 
     assert registry.resolve(hardware, make_workload()) == KernelConfig(32, 64, 4)
     assert registry.resolve(hardware, make_workload(256)) is None
+
+
+@pytest.mark.parametrize(
+    ("length", "representative"),
+    [(1, 64), (64, 64), (65, 128), (383, 384), (384, 384), (513, 768), (2048, 1024)],
+)
+def test_tuning_sequence_lengths_use_bounded_families(length, representative):
+    assert tuning_sequence_length(length) == representative
+
+
+def test_profile_for_384_resolves_runtime_length_383():
+    entry = ProfileEntry(
+        workload=make_workload(384),
+        config=KernelConfig(64, 64, 4),
+        latency_ms=0.125,
+    )
+    profile = KernelProfile(hardware=make_hardware(), entries=(entry,))
+    registry = ProfileRegistry((profile,))
+
+    assert registry.resolve(make_hardware(), make_workload(383)) == KernelConfig(64, 64, 4)
 
 
 def test_registry_ignores_unvalidated_entries():
@@ -164,6 +185,6 @@ def test_tuning_reference_covers_relative_scores_and_fully_masked_rows():
 
     output = _reference(masked_arguments)
 
-    assert workload.active_slots == 15
+    assert workload.active_slots == 64
     assert output.shape == (1, 8, 64)
     assert torch.isfinite(output).all()
