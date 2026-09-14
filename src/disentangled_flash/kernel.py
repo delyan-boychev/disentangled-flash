@@ -24,6 +24,7 @@ from .tuning import (
     KernelTuningOptions,
     ProfileRegistry,
     WorkloadKey,
+    tuning_sequence_length,
 )
 
 try:
@@ -32,6 +33,20 @@ try:
 except ImportError:  # Triton is intentionally optional on CPU and macOS.
     triton = None
     tl = None
+
+
+AUTOTUNE_SPECIALIZATION_KEY = (
+    "LENGTH_REGIME",
+    "HEAD_DIM",
+    "HAS_C2P",
+    "HAS_P2C",
+    "USE_PADDING_MASK",
+    "IS_BF16",
+    "IS_FP32",
+    "STRICT_FP32",
+    "STORE_LSE",
+    "PHYSICAL_PAIRS",
+)
 
 
 if triton is not None:
@@ -64,8 +79,8 @@ if triton is not None:
         """Keep only resource-safe candidates useful for the current shape."""
 
         sequence_length_value = kwargs.get(
-            "SEQUENCE_LENGTH",
-            named_args.get("SEQUENCE_LENGTH"),
+            "LENGTH_REGIME",
+            named_args.get("LENGTH_REGIME"),
         )
         head_dim_value = kwargs.get(
             "HEAD_DIM",
@@ -137,7 +152,14 @@ if triton is not None:
         # non-tiny sequence class.
         return kept or configs[:1]
 
-    @triton.jit
+    @triton.jit(
+        do_not_specialize=[
+            "ACTIVE_SLOTS",
+            "NUM_HEADS",
+            "SEQUENCE_LENGTH",
+            "POSITION_OFFSET",
+        ]
+    )
     def _deberta_attention_forward_kernel(
         query,
         key,
@@ -160,12 +182,13 @@ if triton is not None:
         stride_vh,
         stride_vl,
         stride_vd,
-        ACTIVE_SLOTS: tl.constexpr,
-        BATCH_SIZE: tl.constexpr,
-        NUM_HEADS: tl.constexpr,
-        SEQUENCE_LENGTH: tl.constexpr,
+        ACTIVE_SLOTS,
+        NUM_HEADS,
+        SEQUENCE_LENGTH,
+        POSITION_OFFSET,
         HEAD_DIM: tl.constexpr,
-        SCORE_SCALE_LOG2: tl.constexpr,
+        SCORE_SCALE_LOG2,
+        LENGTH_REGIME: tl.constexpr,
         HAS_C2P: tl.constexpr,
         HAS_P2C: tl.constexpr,
         USE_PADDING_MASK: tl.constexpr,
@@ -258,9 +281,11 @@ if triton is not None:
 
             pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
             if PHYSICAL_PAIRS:
-                delta_index = (batch * SEQUENCE_LENGTH + query_offsets[:, None]) * SEQUENCE_LENGTH + key_offsets[None, :]
+                delta_index = (
+                    batch * SEQUENCE_LENGTH + query_offsets[:, None]
+                ) * SEQUENCE_LENGTH + key_offsets[None, :]
             else:
-                delta_index = query_offsets[:, None] - key_offsets[None, :] + SEQUENCE_LENGTH - 1
+                delta_index = query_offsets[:, None] - key_offsets[None, :] + POSITION_OFFSET
             local_slot = tl.load(
                 delta_to_local_slot + delta_index,
                 mask=pair_in_bounds,
@@ -316,10 +341,10 @@ if triton is not None:
                 other=0.0,
             )
 
-            # When the complete K/V sequence fits in one tile, avoid the online
-            # softmax recurrence. Both values are constexpr, so Triton removes
-            # the unused branch at compile time.
-            if SEQUENCE_LENGTH <= BLOCK_N:
+            # Every runtime length in this regime fits when its representative
+            # fits in one tile. Both regime and tile size are constexpr, so
+            # Triton removes the unused branch at compile time.
+            if LENGTH_REGIME <= BLOCK_N:
                 new_row_max = tl.max(scores, axis=1)
                 probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = tl.sum(probabilities, axis=1)
@@ -412,21 +437,7 @@ if triton is not None:
             lse = row_max + tl.log(row_sum) * 1.4426950408889634
             tl.store(lse_base + query_offsets, lse, mask=query_in_bounds)
 
-    _AUTOTUNE_KEY = [
-        "BATCH_SIZE",
-        "NUM_HEADS",
-        "SEQUENCE_LENGTH",
-        "HEAD_DIM",
-        "ACTIVE_SLOTS",
-        "HAS_C2P",
-        "HAS_P2C",
-        "USE_PADDING_MASK",
-        "IS_BF16",
-        "IS_FP32",
-        "STRICT_FP32",
-        "STORE_LSE",
-        "PHYSICAL_PAIRS",
-    ]
+    _AUTOTUNE_KEY = list(AUTOTUNE_SPECIALIZATION_KEY)
 
     def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
         autotune_kwargs: dict[str, Any] = {
@@ -451,7 +462,9 @@ if triton is not None:
         attention_mask: torch.Tensor,
         num_heads: int,
         sequence_length: int,
+        length_regime: int,
         active_slots: int,
+        position_offset: int,
         score_scale_log2: float,
         use_padding_mask: bool,
         has_c2p: bool,
@@ -481,11 +494,12 @@ if triton is not None:
 
         kernel_kwargs = {
             "ACTIVE_SLOTS": active_slots,
-            "BATCH_SIZE": batch_size,
             "NUM_HEADS": num_heads,
             "SEQUENCE_LENGTH": sequence_length,
+            "POSITION_OFFSET": position_offset,
             "HEAD_DIM": query.size(-1),
             "SCORE_SCALE_LOG2": score_scale_log2,
+            "LENGTH_REGIME": length_regime,
             "HAS_C2P": has_c2p,
             "HAS_P2C": has_p2c,
             "USE_PADDING_MASK": use_padding_mask,
@@ -531,8 +545,11 @@ if triton is not None:
         attention_mask: torch.Tensor,
         num_heads: int,
         sequence_length: int,
+        length_regime: int,
         active_slots: int,
+        position_offset: int,
         score_scale_log2: float,
+        has_padding: bool,
         has_c2p: bool,
         has_p2c: bool,
         is_bf16: bool,
@@ -550,8 +567,11 @@ if triton is not None:
             attention_mask,
             num_heads,
             sequence_length,
+            length_regime,
             active_slots,
+            position_offset,
             score_scale_log2,
+            has_padding,
             has_c2p,
             has_p2c,
             is_bf16,
@@ -569,8 +589,11 @@ if triton is not None:
         attention_mask: torch.Tensor,
         num_heads: int,
         sequence_length: int,
+        length_regime: int,
         active_slots: int,
+        position_offset: int,
         score_scale_log2: float,
+        has_padding: bool,
         has_c2p: bool,
         has_p2c: bool,
         is_bf16: bool,
@@ -598,17 +621,34 @@ if triton is not None:
             delta_to_local,
             attention_mask,
             output,
+            output,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            query.stride(3),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            key.stride(3),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            value.stride(3),
             ACTIVE_SLOTS=active_slots,
-            BATCH_SIZE=batch_size,
             NUM_HEADS=num_heads,
             SEQUENCE_LENGTH=sequence_length,
+            POSITION_OFFSET=position_offset,
             HEAD_DIM=head_dim,
             SCORE_SCALE_LOG2=score_scale_log2,
+            LENGTH_REGIME=length_regime,
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
+            USE_PADDING_MASK=has_padding,
             IS_BF16=is_bf16,
             IS_FP32=is_fp32,
             STRICT_FP32=strict_fp32,
+            STORE_LSE=False,
+            PHYSICAL_PAIRS=False,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=num_warps,
@@ -647,8 +687,11 @@ if triton is not None:
             attention_mask: torch.Tensor,
             num_heads: int,
             sequence_length: int,
+            length_regime: int,
             active_slots: int,
+            position_offset: int,
             score_scale_log2: float,
+            has_padding: bool,
             has_c2p: bool,
             has_p2c: bool,
             is_bf16: bool,
@@ -666,8 +709,11 @@ if triton is not None:
                 attention_mask,
                 num_heads,
                 sequence_length,
+                length_regime,
                 active_slots,
+                position_offset,
                 score_scale_log2,
+                has_padding,
                 has_c2p,
                 has_p2c,
                 is_bf16,
@@ -732,6 +778,7 @@ class TritonPreparedPositionPlan(NamedTuple):
     sequence_length: int
     active_slots: torch.Tensor
     delta_to_local: torch.Tensor
+    position_offset: int
     pos_key: torch.Tensor | None
     pos_query: torch.Tensor | None
 
@@ -875,17 +922,29 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         resolved_device = canonical_device(device, resident_device)
         if resolved_device.type != "cuda":
             raise ValueError("Triton shape plans must be prepared on CUDA")
+        if sequence_length > 1024:
+            raise ValueError(
+                "the bounded Triton kernel family supports sequence lengths up to 1024"
+            )
         cache_key = sequence_length, str(resolved_device)
         cached = self._triton_position_projection_cache.get(cache_key)
         if cached is not None:
             return cached
 
-        indices = self.position_plan_cache.compact(sequence_length, resolved_device)
-        pos_key, pos_query = self._project_active_positions(indices.active_slots)
+        representative = tuning_sequence_length(sequence_length)
+        indices = self.position_plan_cache.compact(representative, resolved_device)
+        representative_plan = self._triton_position_projection_cache.get(
+            (representative, str(resolved_device))
+        )
+        if representative_plan is None:
+            pos_key, pos_query = self._project_active_positions(indices.active_slots)
+        else:
+            pos_key, pos_query = representative_plan.pos_key, representative_plan.pos_query
         plan = TritonPreparedPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
             delta_to_local=indices.delta_to_local.to(dtype=torch.int32).contiguous(),
+            position_offset=representative - 1,
             pos_key=pos_key,
             pos_query=pos_query,
         )
@@ -999,7 +1058,9 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             base_mask,
             self.num_attention_heads,
             sequence_length,
+            tuning_sequence_length(plan.sequence_length),
             active_slot_count,
+            plan.position_offset,
             score_scale_log2,
             not self.assume_unpadded,
             has_c2p,
@@ -1088,6 +1149,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
 DisentangledFlashAttention = InferenceDisentangledSelfAttention
 
 __all__ = [
+    "AUTOTUNE_SPECIALIZATION_KEY",
     "DisentangledFlashAttention",
     "InferenceDisentangledSelfAttention",
     "TritonPreparedPositionPlan",

@@ -14,10 +14,11 @@ from typing import Any, Literal
 
 import torch
 
-PROFILE_FORMAT_VERSION = 1
-KERNEL_PROFILE_VERSION = "deberta-attention-forward-v1"
+PROFILE_FORMAT_VERSION = 2
+KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v2"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
 TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024)
+TUNING_BATCH_HEADS = (8, 32)
 
 
 def tuning_sequence_length(sequence_length: int) -> int:
@@ -34,6 +35,19 @@ def tuning_sequence_length(sequence_length: int) -> int:
     # conservative dispatch choice for longer inputs, even though the kernel
     # still receives and masks the exact runtime length.
     return TUNING_SEQUENCE_LENGTHS[-1]
+
+
+def tuning_batch_heads(batch_heads: int) -> int:
+    """Map exact batch/head occupancy to a small launch-occupancy family."""
+
+    if isinstance(batch_heads, bool) or not isinstance(batch_heads, int):
+        raise TypeError("batch_heads must be an integer")
+    if batch_heads <= 0:
+        raise ValueError("batch_heads must be positive")
+    for representative in TUNING_BATCH_HEADS:
+        if batch_heads <= representative:
+            return representative
+    return TUNING_BATCH_HEADS[-1]
 
 
 def _require_exact_keys(
@@ -128,6 +142,7 @@ class WorkloadKey:
             if value <= 0:
                 raise ValueError(f"{name} must be positive")
         object.__setattr__(self, "sequence_length", tuning_sequence_length(self.sequence_length))
+        object.__setattr__(self, "batch_heads", tuning_batch_heads(self.batch_heads))
         if isinstance(self.active_slots, bool) or not isinstance(self.active_slots, int):
             raise TypeError("active_slots must be an integer")
         if self.active_slots < 0:
@@ -147,10 +162,10 @@ class WorkloadKey:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "sequence_length": self.sequence_length,
+            "length_regime": self.sequence_length,
             "head_dim": self.head_dim,
-            "batch_heads": self.batch_heads,
-            "active_slots": self.active_slots,
+            "occupancy_regime": self.batch_heads,
+            "slot_regime": self.active_slots,
             "dtype": self.dtype,
             "has_c2p": self.has_c2p,
             "has_p2c": self.has_p2c,
@@ -160,17 +175,17 @@ class WorkloadKey:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> WorkloadKey:
         fields = {
-            "sequence_length",
+            "length_regime",
             "head_dim",
-            "batch_heads",
-            "active_slots",
+            "occupancy_regime",
+            "slot_regime",
             "dtype",
             "has_c2p",
             "has_p2c",
             "fp32_precision",
         }
         _require_exact_keys(data, fields, set(), "workload key")
-        integer_fields = {"sequence_length", "head_dim", "batch_heads", "active_slots"}
+        integer_fields = {"length_regime", "head_dim", "occupancy_regime", "slot_regime"}
         if any(
             isinstance(data[name], bool) or not isinstance(data[name], int)
             for name in integer_fields
@@ -180,7 +195,16 @@ class WorkloadKey:
             raise TypeError("workload attention-mode fields must be booleans")
         if not isinstance(data["dtype"], str) or not isinstance(data["fp32_precision"], str):
             raise TypeError("workload dtype and fp32_precision must be strings")
-        return cls(**data)
+        return cls(
+            sequence_length=data["length_regime"],
+            head_dim=data["head_dim"],
+            batch_heads=data["occupancy_regime"],
+            active_slots=data["slot_regime"],
+            dtype=data["dtype"],
+            has_c2p=data["has_c2p"],
+            has_p2c=data["has_p2c"],
+            fp32_precision=data["fp32_precision"],
+        )
 
 
 @dataclass(frozen=True)
@@ -491,7 +515,7 @@ def merge_profile_entry(
     entry: ProfileEntry,
     environment: Mapping[str, str],
 ) -> KernelProfile:
-    """Insert or replace one exact workload while preserving other results."""
+    """Insert or replace one finite workload family while preserving others."""
 
     if profile is not None and not profile.hardware.matches(hardware):
         raise ValueError("cannot merge tuning results for different GPU models")
@@ -508,6 +532,7 @@ __all__ = [
     "DEFAULT_KERNEL_CONFIGS",
     "KERNEL_PROFILE_VERSION",
     "PROFILE_FORMAT_VERSION",
+    "TUNING_BATCH_HEADS",
     "TUNING_SEQUENCE_LENGTHS",
     "HardwareSpec",
     "KernelConfig",
@@ -521,5 +546,6 @@ __all__ = [
     "load_profile",
     "merge_profile_entry",
     "save_profile",
+    "tuning_batch_heads",
     "tuning_sequence_length",
 ]

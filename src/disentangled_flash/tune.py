@@ -19,6 +19,7 @@ from .tuning import (
     KernelConfig,
     KernelProfile,
     ProfileEntry,
+    TUNING_BATCH_HEADS,
     TUNING_SEQUENCE_LENGTHS,
     WorkloadKey,
     load_profile,
@@ -49,14 +50,14 @@ PRESETS = {
     "standard": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
         "head_dims": (32, 64, 128),
-        "batch_heads": (1, 8, 32),
+        "batch_heads": TUNING_BATCH_HEADS,
         "dtypes": ("float16", "bfloat16", "float32"),
         "relative_modes": ("both",),
     },
     "exhaustive": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
         "head_dims": (32, 64, 128),
-        "batch_heads": (1, 4, 8, 16, 32),
+        "batch_heads": TUNING_BATCH_HEADS,
         "dtypes": ("float16", "bfloat16", "float32"),
         "relative_modes": ("none", "c2p", "p2c", "both"),
     },
@@ -192,8 +193,11 @@ def _make_inputs(
         attention_mask,
         num_heads,
         length,
+        length,
         active_slots,
+        length - 1,
         score_scale * 1.4426950408889634,
+        True,
         case.has_c2p,
         case.has_p2c,
         dtype == torch.bfloat16,
@@ -224,8 +228,11 @@ def _reference(arguments: tuple[object, ...]) -> torch.Tensor:
         attention_mask,
         num_heads,
         sequence_length,
+        _length_regime,
         _active_slots,
+        position_offset,
         score_scale_log2,
+        use_padding_mask,
         has_c2p,
         has_p2c,
         _is_bf16,
@@ -235,7 +242,7 @@ def _reference(arguments: tuple[object, ...]) -> torch.Tensor:
     score_scale = float(score_scale_log2) / 1.4426950408889634
     scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
     positions = torch.arange(sequence_length, device=query.device)
-    local = delta_to_local[positions[:, None] - positions[None, :] + sequence_length - 1].long()
+    local = delta_to_local[positions[:, None] - positions[None, :] + position_offset].long()
     if has_c2p:
         scores += torch.gather(
             c2p.float(),
@@ -250,10 +257,11 @@ def _reference(arguments: tuple[object, ...]) -> torch.Tensor:
             local[None, None, :, :, None].expand(query.size(0), num_heads, -1, -1, -1),
         ).squeeze(-1)
     scores *= score_scale
-    pair_mask = attention_mask[:, None, :, None] & attention_mask[:, None, None, :]
-    scores = scores.masked_fill(~pair_mask, float("-inf"))
-    padded_queries = ~attention_mask[:, None, :, None]
-    scores = torch.where(padded_queries, torch.zeros_like(scores), scores)
+    if use_padding_mask:
+        pair_mask = attention_mask[:, None, :, None] & attention_mask[:, None, None, :]
+        scores = scores.masked_fill(~pair_mask, float("-inf"))
+        padded_queries = ~attention_mask[:, None, :, None]
+        scores = torch.where(padded_queries, torch.zeros_like(scores), scores)
     output = torch.matmul(torch.softmax(scores, dim=-1), value.float()).to(query.dtype)
     return output.transpose(1, 2).reshape(query.size(0), sequence_length, -1)
 
@@ -322,7 +330,7 @@ def _validate_mask_patterns(arguments: tuple[object, ...], config: KernelConfig)
         expected = _reference(masked_arguments)
         actual = kernel._deberta_attention_configured_op(*(masked_arguments + config_values))
         torch.cuda.synchronize()
-        _validate_output(actual, expected, strict_fp32=bool(arguments[15]))
+        _validate_output(actual, expected, strict_fp32=bool(arguments[18]))
 
 
 def _environment(seed: int) -> dict[str, str]:
@@ -379,7 +387,7 @@ def run(args: argparse.Namespace) -> None:
                     warmup=args.warmup,
                     repetitions=args.repetitions,
                 )
-                _validate_output(actual, expected, strict_fp32=bool(arguments[15]))
+                _validate_output(actual, expected, strict_fp32=bool(arguments[18]))
                 _validate_mask_patterns(arguments, config)
                 winners.append((latency, config))
             # Backends report compile/resource failures through several exception

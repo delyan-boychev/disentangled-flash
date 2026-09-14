@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from ..tuning import tuning_sequence_length
+
 try:
     import triton
     import triton.language as tl
@@ -595,11 +597,12 @@ if (
             value.stride(2),
             value.stride(3),
             ACTIVE_SLOTS=active_slots,
-            BATCH_SIZE=batch_size,
             NUM_HEADS=num_heads,
             SEQUENCE_LENGTH=sequence_length,
+            POSITION_OFFSET=sequence_length - 1,
             HEAD_DIM=head_dim,
             SCORE_SCALE_LOG2=score_scale * _LOG2E,
+            LENGTH_REGIME=tuning_sequence_length(sequence_length),
             HAS_C2P=has_c2p,
             HAS_P2C=has_p2c,
             USE_PADDING_MASK=has_padding,

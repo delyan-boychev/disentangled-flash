@@ -53,3 +53,22 @@ def test_active_position_slots_are_contiguous_ranges():
         )
 
         assert torch.equal(active, expected)
+
+
+def test_family_position_plan_covers_shorter_runtime_length():
+    cache = SharedPositionPlanCache(
+        position_buckets=256,
+        max_relative_positions=512,
+        position_embedding_size=256,
+        uses_position_bias=True,
+    )
+    runtime = cache.compact(383, torch.device("cpu"))
+    family = cache.compact(384, torch.device("cpu"))
+    positions = torch.arange(383)
+    runtime_indices = positions[:, None] - positions[None, :] + 382
+    family_indices = positions[:, None] - positions[None, :] + 383
+
+    runtime_slots = runtime.active_slots[runtime.delta_to_local[runtime_indices].long()]
+    family_slots = family.active_slots[family.delta_to_local[family_indices].long()]
+
+    assert torch.equal(family_slots, runtime_slots)
