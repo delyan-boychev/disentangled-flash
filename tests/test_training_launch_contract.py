@@ -29,8 +29,28 @@ def test_training_forward_matches_shared_kernel_signature():
     keywords = {keyword.arg for keyword in calls[0].keywords}
     assert "USE_PADDING_MASK" in signature
     assert "USE_PADDING_MASK" in keywords
+    assert {"POSITION_OFFSET", "LENGTH_REGIME"} <= signature
+    assert {"POSITION_OFFSET", "LENGTH_REGIME"} <= keywords
     assert "HAS_PADDING" not in keywords
     assert keywords <= signature
+
+
+def test_training_forward_specializations_remain_in_autotune_family_key():
+    path = Path(__file__).parents[1] / "src" / "disentangled_flash" / "kernel.py"
+    module = ast.parse(path.read_text())
+    assignment = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "AUTOTUNE_SPECIALIZATION_KEY"
+            for target in node.targets
+        )
+    )
+    values = {element.value for element in assignment.value.elts}
+
+    assert {"STORE_LSE", "PHYSICAL_PAIRS", "USE_PADDING_MASK"} <= values
+    assert not {"SEQUENCE_LENGTH", "BATCH_SIZE", "NUM_HEADS", "ACTIVE_SLOTS"} & values
 
 
 def test_backward_kernels_keep_their_own_padding_argument():
