@@ -3,6 +3,7 @@ import json
 import pytest
 import torch
 
+from disentangled_flash.kernel import AUTOTUNE_SPECIALIZATION_KEY
 from disentangled_flash.tune import TuningCase, _make_inputs, _reference
 from disentangled_flash.tuning import (
     HardwareSpec,
@@ -55,7 +56,10 @@ def test_profile_json_round_trip(tmp_path):
 
     assert save_profile(expected, destination) == destination.resolve()
     assert load_profile(destination) == expected
-    assert json.loads(destination.read_text())["format_version"] == 1
+    payload = json.loads(destination.read_text())
+    assert payload["format_version"] == 2
+    assert payload["entries"][0]["workload"]["length_regime"] == 128
+    assert "sequence_length" not in payload["entries"][0]["workload"]
 
 
 def test_registry_uses_explicit_order_and_normalized_gpu_name():
@@ -86,6 +90,16 @@ def test_profile_for_384_resolves_runtime_length_383():
     registry = ProfileRegistry((profile,))
 
     assert registry.resolve(make_hardware(), make_workload(383)) == KernelConfig(64, 64, 4)
+
+
+def test_autotune_key_excludes_exact_runtime_dimensions():
+    assert "LENGTH_REGIME" in AUTOTUNE_SPECIALIZATION_KEY
+    assert not {
+        "SEQUENCE_LENGTH",
+        "BATCH_SIZE",
+        "NUM_HEADS",
+        "ACTIVE_SLOTS",
+    }.intersection(AUTOTUNE_SPECIALIZATION_KEY)
 
 
 def test_registry_ignores_unvalidated_entries():
