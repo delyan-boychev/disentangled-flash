@@ -62,4 +62,3 @@ def test_packed_attention_matches_independent_unpadded_sequences():
 def test_cu_seqlens_validation_rejects_bad_boundaries():
     with pytest.raises(ValueError, match="strictly increasing"):
         validate_cu_seqlens(torch.tensor([0, 2, 2, 4], dtype=torch.int32), 4)
-

@@ -21,11 +21,11 @@ from ._reference import (
     _prepare_attention_mask,
     build_rpos,
 )
+from .packed import validate_cu_seqlens
 from .position import (
     SharedPositionPlanCache,
     canonical_device,
 )
-from .packed import validate_cu_seqlens
 
 
 class TorchPositionPlan(NamedTuple):
@@ -60,8 +60,10 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         config: DebertaAttentionConfig | Any,
         *,
         position_plan_cache: SharedPositionPlanCache | None = None,
+        assume_unpadded: bool = False,
     ) -> None:
         super().__init__(config)
+        self.assume_unpadded = assume_unpadded
         if isinstance(self.pos_att_type, str):
             self.pos_att_type = tuple(
                 part.strip().lower() for part in self.pos_att_type.split("|") if part.strip()
@@ -494,15 +496,16 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 ),
             )
 
-        mask = _prepare_attention_mask(
-            attention_mask,
-            sequence_length,
-            sequence_length,
-        ).bool()
-        attention_scores = attention_scores.masked_fill(
-            ~mask,
-            torch.finfo(query_layer.dtype).min,
-        )
+        if not self.assume_unpadded:
+            mask = _prepare_attention_mask(
+                attention_mask,
+                sequence_length,
+                sequence_length,
+            ).bool()
+            attention_scores = attention_scores.masked_fill(
+                ~mask,
+                torch.finfo(query_layer.dtype).min,
+            )
         attention_probs = torch.softmax(attention_scores, dim=-1)
         context_layer = torch.matmul(attention_probs, value_layer)
         context_layer = (
@@ -550,8 +553,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             self.prepare_for_inference(rel_embeddings)
 
         plans = {
-            length: self.prepare_shape(length, hidden_states.device)
-            for length in set(info.lengths)
+            length: self.prepare_shape(length, hidden_states.device) for length in set(info.lengths)
         }
         outputs = []
         for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):

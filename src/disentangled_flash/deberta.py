@@ -364,9 +364,7 @@ class DebertaV2InferenceEncoder(nn.Module):
 
             if index == 0 and self.conv is not None:
                 segments = []
-                for start, end, length in zip(
-                    info.offsets, info.offsets[1:], info.lengths
-                ):
+                for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
                     source = hidden_states[start:end].unsqueeze(0)
                     output = output_states[start:end].unsqueeze(0)
                     mask = torch.ones((1, length), dtype=torch.bool, device=hidden_states.device)

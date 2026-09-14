@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
 from typing import NamedTuple
 
 import torch
@@ -36,14 +37,13 @@ def validate_cu_seqlens(
     offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
     if offsets[0] != 0 or offsets[-1] != total_tokens:
         raise ValueError("cu_seqlens must start at 0 and end at the packed token count")
-    lengths = tuple(end - start for start, end in zip(offsets, offsets[1:]))
+    lengths = tuple(end - start for start, end in pairwise(offsets))
     if any(length <= 0 for length in lengths):
         raise ValueError("cu_seqlens must be strictly increasing; empty sequences are unsupported")
     actual_max = max(lengths)
     if max_seqlen is not None and max_seqlen != actual_max:
         raise ValueError(
-            f"max_seqlen={max_seqlen} does not match the longest packed sequence "
-            f"({actual_max})"
+            f"max_seqlen={max_seqlen} does not match the longest packed sequence ({actual_max})"
         )
     return PackedSequenceInfo(offsets, lengths, actual_max)
 
@@ -85,9 +85,7 @@ def unpack_packed(
     if sequence_length < info.max_seqlen:
         raise ValueError("sequence_length is smaller than the longest packed sequence")
     output = packed.new_zeros((len(info.lengths), sequence_length, *packed.shape[1:]))
-    mask = torch.zeros(
-        (len(info.lengths), sequence_length), dtype=torch.bool, device=packed.device
-    )
+    mask = torch.zeros((len(info.lengths), sequence_length), dtype=torch.bool, device=packed.device)
     for batch, (start, end) in enumerate(zip(info.offsets, info.offsets[1:])):
         length = end - start
         output[batch, :length] = packed[start:end]
