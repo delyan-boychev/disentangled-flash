@@ -367,7 +367,9 @@ class DebertaV2InferenceEncoder(nn.Module):
                 for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
                     source = hidden_states[start:end].unsqueeze(0)
                     output = output_states[start:end].unsqueeze(0)
-                    mask = torch.ones((1, length), dtype=torch.bool, device=hidden_states.device)
+                    # Hugging Face's DeBERTa convolution computes ``1 - input_mask``.
+                    # Preserve its tokenizer-style integer mask contract here.
+                    mask = torch.ones((1, length), dtype=torch.long, device=hidden_states.device)
                     segments.append(self.conv(source, output, mask).squeeze(0))
                 output_states = torch.cat(segments, dim=0)
             if output_hidden_states:
