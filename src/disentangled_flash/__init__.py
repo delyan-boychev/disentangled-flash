@@ -13,7 +13,7 @@ from .packed import PackedSequenceInfo, pack_padded, unpack_packed, validate_cu_
 from .training import TritonTrainingDisentangledSelfAttention
 from .tuning import KernelConfig, KernelTuningOptions
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 __all__ = [
     "DebertaV2OptimizedEncoder",

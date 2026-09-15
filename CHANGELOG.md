@@ -2,13 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.2] - 2026-09-01
+## [0.1.3] - 2026-09-15
 
-## [0.1.1] - 2026-09-01
+### Documentation
+
+- Align README with runtime tuning families ([0a8fe31](https://github.com/delyan-boychev/disentangled-flash/commit/0a8fe311e7a9ca58d6120d9919bcbce711b3b3b5))
+
+## [0.1.2] - 2026-09-01
 
 ### Bug Fixes
 
 - Standardize torch backend name ([cfbcde5](https://github.com/delyan-boychev/disentangled-flash/commit/cfbcde5a7f92fbe267f0f9ff2abb1f4ed178be28))
+
+## [0.1.1] - 2026-09-01
 
 ### Documentation
 
