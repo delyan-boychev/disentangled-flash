@@ -196,6 +196,10 @@ Defaults are batch size 8 and 500 measured iterations:
 python -m benchmarks.parity_pretrained_mnli
 ```
 
+The Triton candidate uses packed `cu_seqlens` inference by default while the
+untouched Hugging Face reference remains padded. Pass `--layout padded` to
+benchmark the regular padded candidate path instead.
+
 ## Hostile CUDA validation
 
 ```bash

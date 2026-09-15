@@ -30,6 +30,7 @@ import statistics
 import torch
 
 from disentangled_flash.deberta import enable_deberta_inference
+from disentangled_flash.packed import pack_padded, unpack_packed
 
 EXAMPLES = [
     (
@@ -50,7 +51,7 @@ EXAMPLES = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
@@ -64,6 +65,12 @@ def parse_args() -> argparse.Namespace:
         help="Candidate implementation compared against untouched Hugging Face.",
     )
     parser.add_argument(
+        "--layout",
+        choices=("padded", "packed"),
+        default="packed",
+        help="Use the regular padded model path or explicit cu_seqlens packed inference.",
+    )
+    parser.add_argument(
         "--dtype",
         choices=("fp16", "fp32"),
         default="fp16",
@@ -72,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--bucket",
         type=int,
         default=64,
-        help="Fixed padded sequence length / prepared encoder bucket.",
+        help="Tokenizer maximum length; the reference remains padded to this length.",
     )
     parser.add_argument(
         "--fp32-precision",
@@ -82,7 +89,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=500)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def percentile(values: list[float], q: float) -> float:
@@ -103,29 +110,82 @@ def enable_backend(
     backend: str,
     bucket: int,
     fp32_precision: str,
+    layout: str,
 ) -> None:
     """Enable one prepared DisentangledFlash inference backend."""
     enable_deberta_inference(
         backbone,
         backend=backend,
-        sequence_lengths=[bucket],
+        sequence_lengths=None if layout == "packed" else [bucket],
         fp32_precision=fp32_precision,
     )
+
+
+def forward_model(
+    model: torch.nn.Module,
+    inputs: dict[str, torch.Tensor],
+    *,
+    layout: str,
+    output_hidden_states: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Execute the full classifier through either padded or packed encoder input."""
+
+    if layout == "padded":
+        output = model(
+            **inputs,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        hidden = output.hidden_states[-1] if output_hidden_states else None
+        return output.logits, hidden
+
+    backbone = getattr(model, model.base_model_prefix)
+    attention_mask = inputs["attention_mask"]
+    token_type_ids = inputs.get("token_type_ids")
+    embedding_output = backbone.embeddings(
+        input_ids=inputs["input_ids"],
+        token_type_ids=token_type_ids,
+        mask=attention_mask,
+    )
+    packed_embeddings, cu_seqlens, max_seqlen = pack_padded(
+        embedding_output,
+        attention_mask,
+    )
+    encoder_output = backbone.encoder.forward_packed(
+        packed_embeddings,
+        cu_seqlens,
+        max_seqlen,
+        output_hidden_states=output_hidden_states,
+        return_dict=True,
+    )
+    sequence_output, _ = unpack_packed(
+        encoder_output.last_hidden_state,
+        cu_seqlens,
+        attention_mask.size(1),
+    )
+    pooled_output = model.pooler(sequence_output)
+    logits = model.classifier(model.dropout(pooled_output))
+    return logits, sequence_output if output_hidden_states else None
 
 
 @torch.inference_mode()
 def run_model(
     model: torch.nn.Module,
     inputs: dict[str, torch.Tensor],
+    *,
+    layout: str = "padded",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    output = model(
-        **inputs,
+    logits, hidden = forward_model(
+        model,
+        inputs,
+        layout=layout,
         output_hidden_states=True,
-        return_dict=True,
     )
+    if hidden is None:
+        raise RuntimeError("output_hidden_states=True did not produce the final hidden state")
     return (
-        output.logits.detach().float().cpu(),
-        output.hidden_states[-1].detach().float().cpu(),
+        logits.detach().float().cpu(),
+        hidden.detach().float().cpu(),
     )
 
 
@@ -136,14 +196,16 @@ def benchmark_model(
     *,
     warmup: int,
     iterations: int,
+    layout: str = "padded",
 ) -> tuple[float, float, float]:
     """Return p50_ms, p90_ms, mean_ms for full model forward."""
 
     def forward_once() -> None:
-        model(
-            **inputs,
+        forward_model(
+            model,
+            inputs,
+            layout=layout,
             output_hidden_states=False,
-            return_dict=True,
         )
 
     for _ in range(warmup):
@@ -193,6 +255,7 @@ def load_candidate_model(
     backend: str,
     bucket: int,
     fp32_precision: str,
+    layout: str,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
@@ -223,6 +286,7 @@ def load_candidate_model(
         backend=backend,
         bucket=bucket,
         fp32_precision=fp32_precision,
+        layout=layout,
     )
     return model
 
@@ -241,6 +305,10 @@ def main() -> None:
         raise ValueError("--batch-size must be >= 1")
     if args.bucket < 1:
         raise ValueError("--bucket must be >= 1")
+    if args.backend == "flashdeberta" and args.layout == "packed":
+        raise ValueError(
+            "flashdeberta does not expose this benchmark's packed encoder API; use --layout padded"
+        )
 
     device = torch.device("cuda")
     dtype = {
@@ -250,6 +318,7 @@ def main() -> None:
 
     print(f"model:      {args.model}")
     print(f"backend:    {args.backend}")
+    print(f"layout:     {args.layout}")
     print(f"dtype:      {dtype}")
     print(f"gpu:        {torch.cuda.get_device_name(device)}")
     print(f"bucket:     {args.bucket}")
@@ -306,22 +375,28 @@ def main() -> None:
         backend=args.backend,
         bucket=args.bucket,
         fp32_precision=args.fp32_precision,
+        layout=args.layout,
         device=device,
         dtype=dtype,
     )
 
-    candidate_logits, candidate_hidden = run_model(candidate, inputs)
+    candidate_logits, candidate_hidden = run_model(candidate, inputs, layout=args.layout)
     candidate_p50, candidate_p90, candidate_mean = benchmark_model(
         candidate,
         inputs,
         warmup=args.warmup,
         iterations=args.iterations,
+        layout=args.layout,
     )
     candidate_probs = candidate_logits.softmax(dim=-1)
 
     logit_error = (reference_logits - candidate_logits).abs()
     prob_error = (reference_probs - candidate_probs).abs()
     hidden_error = (reference_hidden - candidate_hidden).abs()
+    if args.layout == "packed":
+        # Packed inference intentionally does not compute representations for
+        # padding positions, so parity is defined over real tokens only.
+        hidden_error = hidden_error[inputs["attention_mask"].bool().cpu()]
 
     reference_prediction = reference_logits.argmax(dim=-1)
     candidate_prediction = candidate_logits.argmax(dim=-1)
