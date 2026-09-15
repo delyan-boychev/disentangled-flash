@@ -15,12 +15,12 @@ from . import kernel
 from .position import SharedPositionPlanCache
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
+    TUNING_BATCH_HEADS,
+    TUNING_SEQUENCE_LENGTHS,
     HardwareSpec,
     KernelConfig,
     KernelProfile,
     ProfileEntry,
-    TUNING_BATCH_HEADS,
-    TUNING_SEQUENCE_LENGTHS,
     WorkloadKey,
     load_profile,
     merge_profile_entry,
@@ -115,9 +115,7 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
     if unsupported_head_dims:
         raise ValueError(f"unsupported head dimensions: {sorted(unsupported_head_dims)}")
     if max(lengths) > TUNING_SEQUENCE_LENGTHS[-1]:
-        raise ValueError(
-            f"tuning lengths must not exceed {TUNING_SEQUENCE_LENGTHS[-1]}"
-        )
+        raise ValueError(f"tuning lengths must not exceed {TUNING_SEQUENCE_LENGTHS[-1]}")
     for length in lengths:
         for head_dim in head_dims:
             for occupancy in batch_heads:

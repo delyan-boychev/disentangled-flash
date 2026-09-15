@@ -216,7 +216,9 @@ if triton is not None:
 
             pair_in_bounds = row_mask[:, None] & col_mask[None, :]
             if PHYSICAL_PAIRS:
-                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[None, :]
+                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[
+                    None, :
+                ]
             else:
                 delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(
@@ -425,7 +427,9 @@ if triton is not None:
 
             pair_in_bounds = row_mask[:, None] & col_mask[None, :]
             if PHYSICAL_PAIRS:
-                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[None, :]
+                delta_index = (batch * SEQUENCE_LENGTH + rows[:, None]) * SEQUENCE_LENGTH + cols[
+                    None, :
+                ]
             else:
                 delta_index = rows[:, None] - cols[None, :] + SEQUENCE_LENGTH - 1
             local_slot = tl.load(

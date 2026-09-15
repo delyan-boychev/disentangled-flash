@@ -23,11 +23,11 @@ from ._reference import (
     _prepare_attention_mask,
     build_rpos,
 )
+from .packed import validate_cu_seqlens
 from .position import (
     SharedPositionPlanCache,
     canonical_device,
 )
-from .packed import validate_cu_seqlens
 
 
 class TorchPositionPlan(NamedTuple):
@@ -586,8 +586,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             self.prepare_for_inference(rel_embeddings)
 
         plans = {
-            length: self.prepare_shape(length, hidden_states.device)
-            for length in set(info.lengths)
+            length: self.prepare_shape(length, hidden_states.device) for length in set(info.lengths)
         }
         outputs = []
         for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
