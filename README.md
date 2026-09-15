@@ -22,7 +22,8 @@ The PyTorch-optimized (`torch`) backend is constructed by optimizing operations,
 - FP16, BF16, strict FP32, and optional fast FP32/TF32 mode
 - head dimensions 32, 64, and 128
 - factorized 2-D padding masks
-- prepared fixed-length buckets with dynamic batch size
+- runtime sequence lengths through six bounded kernel families up to 1024
+- FlashAttention-style packed, unpadded inference with `cu_seqlens`
 - **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
 Training/backward is not implemented. CPU/MPS use the PyTorch backend
@@ -173,9 +174,10 @@ token layout through `forward_packed(hidden_states, cu_seqlens, max_seqlen)`.
 `hidden_states` has shape `[total_tokens, hidden_size]`; `cu_seqlens` is a
 contiguous int32/int64 tensor containing cumulative sequence boundaries. No
 dense padded batch or cross-sequence attention matrix is constructed. The
-current implementation dispatches each segment through the existing exact
-kernel, which keeps the API and semantics ready for a future single-launch
-variable-length Triton kernel.
+current implementation dispatches each segment through the runtime-length
+kernel family selected by that segment's length. This avoids padding and exact-
+length retuning, while keeping the API and semantics ready for a future single-
+launch variable-length Triton kernel.
 
 Use `pack_padded` and `unpack_packed` to convert right-padded tensors at an API
 boundary. Empty sequences and non-right-padded masks are rejected explicitly.
@@ -203,11 +205,17 @@ The validation matrix covers FP16/BF16/FP32, boundary sequence lengths, several
 padding patterns, and C2P/P2C position modes while reporting raw max/mean errors.
 
 > [!NOTE]
-> **Test Coverage**: The current test suite is basic and incomplete. Expanding testing to cover more edge cases, parameters, and configurations is actively planned and is work to be done.
+> **Test Coverage**: CPU tests cover the public inference API, packed conversion,
+> bounded tuning/profile dispatch, and launch contracts. CUDA correctness and
+> performance should still be validated on every supported GPU family before
+> publishing a bundled tuning profile.
 
-## Autotuning
+## GPU calibration
 
-The autotuning is to be optimized in the future as it is currently greedy (evaluating too many configuration candidates). The next step is to run offline calibration sweeps per GPU family to determine and pre-select the fastest block configurations, significantly reducing runtime compilation and tuning overhead.
+The bounded families prevent retuning for every exact sequence length, but a
+missing hardware/workload family still evaluates the configured candidate set
+once. Offline calibration per GPU family can pre-select those configurations and
+remove that first-use benchmarking cost.
 
 Do not treat the current candidate table as a universal final table for every GPU.
 
