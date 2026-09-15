@@ -1389,7 +1389,15 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         *,
         rel_embeddings: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Run all unpadded sequences with one packed Triton attention launch."""
+        """Run packed attention with the selected inference backend."""
+
+        if self.backend == "torch":
+            return super().forward_packed(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                rel_embeddings=rel_embeddings,
+            )
 
         self._validate_triton_call(hidden_states)
         if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:

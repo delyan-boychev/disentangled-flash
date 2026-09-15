@@ -1,3 +1,5 @@
+import torch
+
 from disentangled_flash._reference import (
     DebertaAttentionConfig,
     DebertaV2Encoder,
@@ -67,3 +69,40 @@ def test_inference_uses_one_backend_dispatched_attention_class():
     attention = encoder.layer[0].attention.self
     assert isinstance(attention, InferenceDisentangledSelfAttention)
     assert attention.backend == "torch"
+
+
+def test_packed_encoder_preserves_convolution_mask_dtype():
+    config = DebertaAttentionConfig(
+        hidden_size=32,
+        num_attention_heads=1,
+        attention_head_size=32,
+        num_hidden_layers=1,
+        intermediate_size=64,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        relative_attention=True,
+        max_relative_positions=16,
+        max_position_embeddings=16,
+        position_buckets=-1,
+        share_att_key=True,
+        pos_att_type=("c2p", "p2c"),
+        conv_kernel_size=3,
+    )
+    encoder = DebertaV2OptimizedEncoder(
+        DebertaV2Encoder(config),
+        config,
+        backend="torch",
+        inference=True,
+    ).eval()
+    hidden_states = torch.randn(5, 32)
+    cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+
+    with torch.inference_mode():
+        output = encoder.forward_packed(
+            hidden_states,
+            cu_seqlens,
+            max_seqlen=3,
+            output_hidden_states=False,
+        )
+
+    assert output.last_hidden_state.shape == hidden_states.shape
