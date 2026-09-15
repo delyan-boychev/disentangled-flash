@@ -15,6 +15,7 @@ import torch
 
 from ._reference import DebertaAttentionConfig
 from ._torch import TorchInferenceDisentangledSelfAttention
+from .packed import validate_cu_seqlens
 from .position import SharedPositionPlanCache, canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
@@ -413,6 +414,218 @@ if triton is not None:
             mask=query_in_bounds[:, None],
         )
 
+    @triton.jit(
+        do_not_specialize=[
+            "ACTIVE_SLOTS",
+            "MAX_SEQLEN",
+            "NUM_HEADS",
+            "POSITION_OFFSET",
+            "TOTAL_TOKENS",
+        ]
+    )
+    def _deberta_attention_packed_forward_kernel(
+        query,
+        key,
+        value,
+        c2p,
+        p2c,
+        delta_to_local_slot,
+        cu_seqlens,
+        output,
+        stride_qh,
+        stride_ql,
+        stride_qd,
+        stride_kh,
+        stride_kl,
+        stride_kd,
+        stride_vh,
+        stride_vl,
+        stride_vd,
+        ACTIVE_SLOTS,
+        MAX_SEQLEN,
+        NUM_HEADS,
+        POSITION_OFFSET,
+        TOTAL_TOKENS,
+        HEAD_DIM: tl.constexpr,
+        SCORE_SCALE_LOG2,
+        LENGTH_REGIME: tl.constexpr,
+        HAS_C2P: tl.constexpr,
+        HAS_P2C: tl.constexpr,
+        HAS_PADDING: tl.constexpr,
+        IS_BF16: tl.constexpr,
+        IS_FP32: tl.constexpr,
+        STRICT_FP32: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        query_block = tl.program_id(0)
+        sequence_head = tl.program_id(1)
+        sequence = sequence_head // NUM_HEADS
+        head = sequence_head - sequence * NUM_HEADS
+
+        sequence_start = tl.load(cu_seqlens + sequence).to(tl.int64)
+        sequence_end = tl.load(cu_seqlens + sequence + 1).to(tl.int64)
+        sequence_length = sequence_end - sequence_start
+
+        query_offsets = query_block * BLOCK_M + tl.arange(0, BLOCK_M)
+        query_in_bounds = query_offsets < sequence_length
+        query_tokens = sequence_start + query_offsets
+        dimension_offsets = tl.arange(0, HEAD_DIM)
+
+        query_base = query + head * stride_qh
+        key_base = key + head * stride_kh
+        value_base = value + head * stride_vh
+
+        query_values = tl.load(
+            query_base + query_tokens[:, None] * stride_ql + dimension_offsets[None, :] * stride_qd,
+            mask=query_in_bounds[:, None],
+            other=0.0,
+        )
+        row_max = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+        row_sum = tl.zeros([BLOCK_M], dtype=tl.float32)
+        accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
+
+        if HAS_C2P:
+            c2p_base = c2p + head * TOTAL_TOKENS * ACTIVE_SLOTS
+        if HAS_P2C:
+            p2c_base = p2c + head * TOTAL_TOKENS * ACTIVE_SLOTS
+
+        for key_start in tl.range(0, sequence_length, BLOCK_N):
+            key_start = tl.multiple_of(key_start, BLOCK_N)
+            key_offsets = key_start + tl.arange(0, BLOCK_N)
+            key_in_bounds = key_offsets < sequence_length
+            key_tokens = sequence_start + key_offsets
+
+            key_values = tl.load(
+                key_base + key_tokens[:, None] * stride_kl + dimension_offsets[None, :] * stride_kd,
+                mask=key_in_bounds[:, None],
+                other=0.0,
+            )
+            if IS_FP32:
+                if STRICT_FP32:
+                    scores = tl.dot(
+                        query_values,
+                        tl.trans(key_values),
+                        input_precision="ieee",
+                    )
+                else:
+                    scores = tl.dot(
+                        query_values,
+                        tl.trans(key_values),
+                        input_precision="tf32",
+                    )
+            else:
+                scores = tl.dot(query_values, tl.trans(key_values))
+
+            pair_in_bounds = query_in_bounds[:, None] & key_in_bounds[None, :]
+            delta_index = query_offsets[:, None] - key_offsets[None, :] + POSITION_OFFSET
+            local_slot = tl.load(
+                delta_to_local_slot + delta_index,
+                mask=pair_in_bounds,
+                other=0,
+            ).to(tl.int32)
+
+            if HAS_C2P:
+                scores += tl.load(
+                    c2p_base + query_tokens[:, None] * ACTIVE_SLOTS + local_slot,
+                    mask=pair_in_bounds,
+                    other=0.0,
+                )
+            if HAS_P2C:
+                scores += tl.load(
+                    p2c_base + key_tokens[None, :] * ACTIVE_SLOTS + local_slot,
+                    mask=pair_in_bounds,
+                    other=0.0,
+                )
+
+            scores *= SCORE_SCALE_LOG2
+            scores = tl.where(pair_in_bounds, scores, -float("inf"))
+            scores = tl.where(
+                ~query_in_bounds[:, None] & (key_offsets[None, :] == 0),
+                0.0,
+                scores,
+            )
+
+            value_values = tl.load(
+                value_base
+                + key_tokens[:, None] * stride_vl
+                + dimension_offsets[None, :] * stride_vd,
+                mask=key_in_bounds[:, None],
+                other=0.0,
+            )
+            if LENGTH_REGIME <= BLOCK_N:
+                new_row_max = tl.max(scores, axis=1)
+                probabilities = tl.math.exp2(scores - new_row_max[:, None])
+                new_row_sum = tl.sum(probabilities, axis=1)
+                if IS_FP32:
+                    if STRICT_FP32:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            input_precision="ieee",
+                        )
+                    else:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            input_precision="tf32",
+                        )
+                elif IS_BF16:
+                    accumulator = tl.dot(probabilities.to(tl.bfloat16), value_values)
+                else:
+                    accumulator = tl.dot(probabilities.to(tl.float16), value_values)
+            else:
+                new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
+                row_has_scores = new_row_max != -float("inf")
+                normalization_center = tl.where(row_has_scores, new_row_max, 0.0)
+                correction = tl.where(
+                    row_has_scores,
+                    tl.math.exp2(row_max - normalization_center),
+                    1.0,
+                )
+                probabilities = tl.math.exp2(scores - normalization_center[:, None])
+                new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
+                accumulator *= correction[:, None]
+                if IS_FP32:
+                    if STRICT_FP32:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            accumulator,
+                            input_precision="ieee",
+                        )
+                    else:
+                        accumulator = tl.dot(
+                            probabilities,
+                            value_values,
+                            accumulator,
+                            input_precision="tf32",
+                        )
+                elif IS_BF16:
+                    accumulator = tl.dot(
+                        probabilities.to(tl.bfloat16),
+                        value_values,
+                        accumulator,
+                    )
+                else:
+                    accumulator = tl.dot(
+                        probabilities.to(tl.float16),
+                        value_values,
+                        accumulator,
+                    )
+            row_max = new_row_max
+            row_sum = new_row_sum
+
+        accumulator /= row_sum[:, None]
+        tl.store(
+            output
+            + query_tokens[:, None] * (NUM_HEADS * HEAD_DIM)
+            + head * HEAD_DIM
+            + dimension_offsets[None, :],
+            accumulator,
+            mask=query_in_bounds[:, None],
+        )
+
     _AUTOTUNE_KEY = list(AUTOTUNE_SPECIALIZATION_KEY)
 
     def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
@@ -426,6 +639,20 @@ if triton is not None:
         return triton.autotune(**autotune_kwargs)(_deberta_attention_forward_kernel)
 
     _deberta_attention_autotuned_kernel = _make_autotuned_kernel(DEFAULT_KERNEL_CONFIGS)
+
+    def _make_packed_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
+        autotune_kwargs: dict[str, Any] = {
+            "configs": [_as_triton_config(config) for config in configs],
+            "key": _AUTOTUNE_KEY,
+            "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
+        }
+        if "cache_results" in inspect.signature(triton.autotune).parameters:
+            autotune_kwargs["cache_results"] = True
+        return triton.autotune(**autotune_kwargs)(_deberta_attention_packed_forward_kernel)
+
+    _deberta_attention_packed_autotuned_kernel = _make_packed_autotuned_kernel(
+        DEFAULT_KERNEL_CONFIGS
+    )
 
     def _launch_autotuned_kernel(
         autotuned_kernel: Any,
@@ -626,6 +853,182 @@ if triton is not None:
         )
         return output
 
+    def _launch_packed_autotuned_kernel(
+        autotuned_kernel: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        c2p: torch.Tensor,
+        p2c: torch.Tensor,
+        delta_to_local: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        length_regime: int,
+        active_slots: int,
+        position_offset: int,
+        score_scale_log2: float,
+        has_c2p: bool,
+        has_p2c: bool,
+        is_bf16: bool,
+        is_fp32: bool,
+        strict_fp32: bool,
+    ) -> torch.Tensor:
+        num_heads, total_tokens, head_dim = query.shape
+        batch_size = cu_seqlens.numel() - 1
+        output = torch.empty(
+            (total_tokens, num_heads * head_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+
+        def grid(meta: dict[str, Any]) -> tuple[int, int]:
+            return triton.cdiv(max_seqlen, meta["BLOCK_M"]), batch_size * num_heads
+
+        torch.library.wrap_triton(autotuned_kernel)[grid](
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            cu_seqlens,
+            output,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            ACTIVE_SLOTS=active_slots,
+            MAX_SEQLEN=max_seqlen,
+            NUM_HEADS=num_heads,
+            POSITION_OFFSET=position_offset,
+            TOTAL_TOKENS=total_tokens,
+            HEAD_DIM=head_dim,
+            SCORE_SCALE_LOG2=score_scale_log2,
+            LENGTH_REGIME=length_regime,
+            HAS_C2P=has_c2p,
+            HAS_P2C=has_p2c,
+            HAS_PADDING=False,
+            IS_BF16=is_bf16,
+            IS_FP32=is_fp32,
+            STRICT_FP32=strict_fp32,
+        )
+        return output
+
+    def _launch_deberta_attention_packed(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        c2p: torch.Tensor,
+        p2c: torch.Tensor,
+        delta_to_local: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        length_regime: int,
+        active_slots: int,
+        position_offset: int,
+        score_scale_log2: float,
+        has_c2p: bool,
+        has_p2c: bool,
+        is_bf16: bool,
+        is_fp32: bool,
+        strict_fp32: bool,
+    ) -> torch.Tensor:
+        return _launch_packed_autotuned_kernel(
+            _deberta_attention_packed_autotuned_kernel,
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            cu_seqlens,
+            max_seqlen,
+            length_regime,
+            active_slots,
+            position_offset,
+            score_scale_log2,
+            has_c2p,
+            has_p2c,
+            is_bf16,
+            is_fp32,
+            strict_fp32,
+        )
+
+    def _launch_deberta_attention_packed_configured(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        c2p: torch.Tensor,
+        p2c: torch.Tensor,
+        delta_to_local: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        length_regime: int,
+        active_slots: int,
+        position_offset: int,
+        score_scale_log2: float,
+        has_c2p: bool,
+        has_p2c: bool,
+        is_bf16: bool,
+        is_fp32: bool,
+        strict_fp32: bool,
+        block_m: int,
+        block_n: int,
+        num_warps: int,
+        num_stages: int,
+    ) -> torch.Tensor:
+        num_heads, total_tokens, head_dim = query.shape
+        batch_size = cu_seqlens.numel() - 1
+        output = torch.empty(
+            (total_tokens, num_heads * head_dim),
+            device=query.device,
+            dtype=query.dtype,
+        )
+        grid = (triton.cdiv(max_seqlen, block_m), batch_size * num_heads)
+        torch.library.wrap_triton(_deberta_attention_packed_forward_kernel)[grid](
+            query,
+            key,
+            value,
+            c2p,
+            p2c,
+            delta_to_local,
+            cu_seqlens,
+            output,
+            query.stride(0),
+            query.stride(1),
+            query.stride(2),
+            key.stride(0),
+            key.stride(1),
+            key.stride(2),
+            value.stride(0),
+            value.stride(1),
+            value.stride(2),
+            ACTIVE_SLOTS=active_slots,
+            MAX_SEQLEN=max_seqlen,
+            NUM_HEADS=num_heads,
+            POSITION_OFFSET=position_offset,
+            TOTAL_TOKENS=total_tokens,
+            HEAD_DIM=head_dim,
+            SCORE_SCALE_LOG2=score_scale_log2,
+            LENGTH_REGIME=length_regime,
+            HAS_C2P=has_c2p,
+            HAS_P2C=has_p2c,
+            HAS_PADDING=False,
+            IS_BF16=is_bf16,
+            IS_FP32=is_fp32,
+            STRICT_FP32=strict_fp32,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        return output
+
     if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
         _deberta_attention_op = torch.library.triton_op(
             "gliner2_attention::deberta_attention",
@@ -637,9 +1040,21 @@ if triton is not None:
             _launch_deberta_attention_configured,
             mutates_args={},
         )
+        _deberta_attention_packed_op = torch.library.triton_op(
+            "gliner2_attention::deberta_attention_packed",
+            _launch_deberta_attention_packed,
+            mutates_args={},
+        )
+        _deberta_attention_packed_configured_op = torch.library.triton_op(
+            "gliner2_attention::deberta_attention_packed_configured",
+            _launch_deberta_attention_packed_configured,
+            mutates_args={},
+        )
     else:  # Older PyTorch still supports raw user-authored Triton calls.
         _deberta_attention_op = _launch_deberta_attention
         _deberta_attention_configured_op = _launch_deberta_attention_configured
+        _deberta_attention_packed_op = _launch_deberta_attention_packed
+        _deberta_attention_packed_configured_op = _launch_deberta_attention_packed_configured
 
     @cache
     def _custom_autotune_operator(configs: tuple[KernelConfig, ...]) -> Any:
@@ -697,6 +1112,61 @@ if triton is not None:
             suffix = abs(hash(configs))
             return torch.library.triton_op(
                 f"gliner2_attention::deberta_attention_custom_{suffix}",
+                launch,
+                mutates_args={},
+            )
+        return launch
+
+    @cache
+    def _custom_packed_autotune_operator(configs: tuple[KernelConfig, ...]) -> Any:
+        if configs == DEFAULT_KERNEL_CONFIGS:
+            return _deberta_attention_packed_op
+        autotuned_kernel = _make_packed_autotuned_kernel(configs)
+
+        def launch(
+            query: torch.Tensor,
+            key: torch.Tensor,
+            value: torch.Tensor,
+            c2p: torch.Tensor,
+            p2c: torch.Tensor,
+            delta_to_local: torch.Tensor,
+            cu_seqlens: torch.Tensor,
+            max_seqlen: int,
+            length_regime: int,
+            active_slots: int,
+            position_offset: int,
+            score_scale_log2: float,
+            has_c2p: bool,
+            has_p2c: bool,
+            is_bf16: bool,
+            is_fp32: bool,
+            strict_fp32: bool,
+        ) -> torch.Tensor:
+            return _launch_packed_autotuned_kernel(
+                autotuned_kernel,
+                query,
+                key,
+                value,
+                c2p,
+                p2c,
+                delta_to_local,
+                cu_seqlens,
+                max_seqlen,
+                length_regime,
+                active_slots,
+                position_offset,
+                score_scale_log2,
+                has_c2p,
+                has_p2c,
+                is_bf16,
+                is_fp32,
+                strict_fp32,
+            )
+
+        if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
+            suffix = abs(hash(configs))
+            return torch.library.triton_op(
+                f"gliner2_attention::deberta_attention_packed_custom_{suffix}",
                 launch,
                 mutates_args={},
             )
@@ -795,6 +1265,7 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         if triton is not None:
             candidates = self.tuning.candidates or DEFAULT_KERNEL_CONFIGS
             self._autotune_operator = _custom_autotune_operator(candidates)
+            self._packed_autotune_operator = _custom_packed_autotune_operator(candidates)
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
@@ -827,6 +1298,8 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         active_slots: int,
         has_c2p: bool,
         has_p2c: bool,
+        batch_size: int | None = None,
+        sequence_length: int | None = None,
     ) -> KernelConfig | None:
         """Return a direct-launch config, or ``None`` for runtime autotuning."""
 
@@ -847,9 +1320,10 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
         if device_index is None:
             device_index = torch.cuda.current_device()
         workload = WorkloadKey(
-            sequence_length=hidden_states.size(1),
+            sequence_length=(hidden_states.size(1) if sequence_length is None else sequence_length),
             head_dim=self.attention_head_size,
-            batch_heads=hidden_states.size(0) * self.num_attention_heads,
+            batch_heads=(hidden_states.size(0) if batch_size is None else batch_size)
+            * self.num_attention_heads,
             active_slots=active_slots,
             dtype=str(hidden_states.dtype).removeprefix("torch."),
             has_c2p=has_c2p,
@@ -869,6 +1343,105 @@ class TritonInferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAtt
                 f"{HardwareSpec.current(device_index).name} and workload {workload}"
             )
         return config
+
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+        *,
+        rel_embeddings: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Run all unpadded sequences with one packed Triton attention launch."""
+
+        self._validate_triton_call(hidden_states)
+        if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
+            raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
+        if cu_seqlens.device != hidden_states.device:
+            raise ValueError("cu_seqlens must be on the hidden_states device")
+        info = validate_cu_seqlens(cu_seqlens, hidden_states.size(0), max_seqlen)
+
+        needs_positions = self.relative_attention and bool(
+            {"c2p", "p2c"}.intersection(self.pos_att_type)
+        )
+        if self._cached_qkv_weight is None or (
+            needs_positions
+            and self._cached_pos_key is None
+            and self._cached_pos_query is None
+            and self._get_cached_shape_plan(info.max_seqlen, hidden_states.device) is None
+        ):
+            self.prepare_for_inference(rel_embeddings)
+        plan = self.prepare_shape(info.max_seqlen, hidden_states.device)
+
+        total_tokens = hidden_states.size(0)
+        query, key, value = self._project_qkv(hidden_states)
+
+        def packed_heads(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.view(
+                total_tokens,
+                self.num_attention_heads,
+                self.attention_head_size,
+            ).permute(1, 0, 2)
+
+        query_layer = packed_heads(query)
+        key_layer = packed_heads(key)
+        value_layer = packed_heads(value)
+        has_c2p = self.relative_attention and "c2p" in self.pos_att_type
+        has_p2c = self.relative_attention and "p2c" in self.pos_att_type
+        active_slot_count = plan.active_slots.numel()
+        if has_c2p:
+            if plan.pos_key is None:
+                raise ValueError("prepared Triton plan has no content-to-position keys")
+            c2p = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2))
+        else:
+            c2p = query_layer
+        if has_p2c:
+            if plan.pos_query is None:
+                raise ValueError("prepared Triton plan has no position-to-content queries")
+            p2c = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2))
+        else:
+            p2c = key_layer
+
+        scale_factor = 1 + int(has_c2p) + int(has_p2c)
+        score_scale_log2 = self._scale(scale_factor) ** -1 * 1.4426950408889634
+        selected_config = self._resolve_kernel_config(
+            hidden_states,
+            active_slots=active_slot_count,
+            has_c2p=has_c2p,
+            has_p2c=has_p2c,
+            batch_size=len(info.lengths),
+            sequence_length=info.max_seqlen,
+        )
+        operation_args = (
+            query_layer,
+            key_layer,
+            value_layer,
+            c2p,
+            p2c,
+            plan.delta_to_local,
+            cu_seqlens,
+            info.max_seqlen,
+            tuning_sequence_length(info.max_seqlen),
+            active_slot_count,
+            plan.position_offset,
+            score_scale_log2,
+            has_c2p,
+            has_p2c,
+            hidden_states.dtype == torch.bfloat16,
+            hidden_states.dtype == torch.float32,
+            self.fp32_precision == "strict",
+        )
+        if selected_config is None:
+            output = self._packed_autotune_operator(*operation_args)
+        else:
+            output = _deberta_attention_packed_configured_op(
+                *operation_args,
+                selected_config.block_m,
+                selected_config.block_n,
+                selected_config.num_warps,
+                selected_config.num_stages,
+            )
+        return output, None
 
     @torch.no_grad()
     def prepare_shape(
