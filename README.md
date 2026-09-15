@@ -174,10 +174,11 @@ token layout through `forward_packed(hidden_states, cu_seqlens, max_seqlen)`.
 `hidden_states` has shape `[total_tokens, hidden_size]`; `cu_seqlens` is a
 contiguous int32/int64 tensor containing cumulative sequence boundaries. No
 dense padded batch or cross-sequence attention matrix is constructed. The
-current implementation dispatches each segment through the runtime-length
-kernel family selected by that segment's length. This avoids padding and exact-
-length retuning, while keeping the API and semantics ready for a future single-
-launch variable-length Triton kernel.
+Triton projects QKV once for the complete token buffer and dispatches one
+attention grid across every sequence/head tile. Each program reads its runtime
+boundaries from `cu_seqlens`, so tokens cannot attend across sequences and no
+dense padded batch is created. The PyTorch backend retains a segmented reference
+implementation for portability and validation.
 
 Use `pack_padded` and `unpack_packed` to convert right-padded tensors at an API
 boundary. Empty sequences and non-right-padded masks are rejected explicitly.
