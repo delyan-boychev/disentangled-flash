@@ -1503,9 +1503,9 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         resolved_device = canonical_device(device, resident_device)
         if resolved_device.type != "cuda":
             raise ValueError("Triton shape plans must be prepared on CUDA")
-        if sequence_length > 1024:
+        if sequence_length > 8192:
             raise ValueError(
-                "the bounded Triton kernel family supports sequence lengths up to 1024"
+                "the bounded Triton kernel family supports sequence lengths up to 8192"
             )
         cache_key = sequence_length, str(resolved_device)
         cached = self._triton_position_projection_cache.get(cache_key)

@@ -177,6 +177,8 @@ def main() -> None:
             513,
             1024,
             2048,
+            4096,
+            8192,
         ],
     )
     parser.add_argument("--position-modes", type=parse_csv, default=["both"])
