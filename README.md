@@ -1,6 +1,6 @@
 # DisentangledFlash
 
-[![PyPI Version](https://img.shields.io/pypi/v/disentangled-flash.svg)](https://pypi.org/project/disentangled-flash/)
+[![PyPI Version](https://img.shields.io/pypi/v/disentangled-flash.svg?cacheSeconds=300)](https://pypi.org/project/disentangled-flash/)
 [![CI](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml/badge.svg)](https://github.com/delyan-boychev/disentangled-flash/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
@@ -409,7 +409,7 @@ If you use DisentangledFlash in your research or project, please cite it as foll
   author = {Boychev, Delyan},
   title = {DisentangledFlash: Fast exact DeBERTa-style disentangled attention in Triton},
   url = {https://github.com/delyan-boychev/disentangled-flash},
-  version = {0.1.3},
+  version = {0.1.4},
   year = {2026}
 }
 ```
