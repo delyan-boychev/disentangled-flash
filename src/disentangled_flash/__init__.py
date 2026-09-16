@@ -10,7 +10,7 @@ from .kernel import DisentangledFlashAttention
 from .packed import PackedSequenceInfo, pack_padded, unpack_packed, validate_cu_seqlens
 from .tuning import KernelConfig, KernelTuningOptions
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "DebertaV2InferenceEncoder",

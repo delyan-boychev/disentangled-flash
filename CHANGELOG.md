@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-09-15
+
+### Bug Fixes
+
+- Pass strides to configured Triton launcher ([3e7fd11](https://github.com/delyan-boychev/disentangled-flash/commit/3e7fd113fcf02aabf6b32c9d007f4ec0f143f477))
+- Use integer mask for packed convolution ([73ec060](https://github.com/delyan-boychev/disentangled-flash/commit/73ec060339a4b047b0f72f6716c11ad38ca42052))
+
+### Features
+
+- Add single-launch packed Triton attention ([b62c2ff](https://github.com/delyan-boychev/disentangled-flash/commit/b62c2fffc261b445563288dc0314acc654070ecc))
+
+### Bench
+
+- Default MNLI parity to packed inference ([5507648](https://github.com/delyan-boychev/disentangled-flash/commit/5507648f36de4b095674f6781ec34ff4bf534835))
+
 ## [0.1.3] - 2026-09-15
 
 ### Documentation
