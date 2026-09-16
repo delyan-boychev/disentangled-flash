@@ -52,13 +52,6 @@ PRESETS = {
         "head_dims": (32, 64, 128),
         "batch_heads": TUNING_BATCH_HEADS,
         "dtypes": ("float16", "bfloat16", "float32"),
-        "relative_modes": ("both",),
-    },
-    "exhaustive": {
-        "lengths": TUNING_SEQUENCE_LENGTHS,
-        "head_dims": (32, 64, 128),
-        "batch_heads": TUNING_BATCH_HEADS,
-        "dtypes": ("float16", "bfloat16", "float32"),
         "relative_modes": ("none", "c2p", "p2c", "both"),
     },
 }
@@ -215,7 +208,7 @@ def _make_inputs(
     return args, workload
 
 
-def _reference(arguments: tuple[object, ...]) -> torch.Tensor:
+def _reference(arguments: tuple[object, ...], *, query_chunk_size: int = 32) -> torch.Tensor:
     (
         query,
         key,
@@ -238,29 +231,38 @@ def _reference(arguments: tuple[object, ...]) -> torch.Tensor:
         _strict_fp32,
     ) = arguments
     score_scale = float(score_scale_log2) / 1.4426950408889634
-    scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
+    if query_chunk_size < 1:
+        raise ValueError("query_chunk_size must be positive")
     positions = torch.arange(sequence_length, device=query.device)
-    local = delta_to_local[positions[:, None] - positions[None, :] + position_offset].long()
-    if has_c2p:
-        scores += torch.gather(
-            c2p.float(),
-            -1,
-            local.expand(query.size(0), num_heads, -1, -1),
-        )
-    if has_p2c:
-        p2c_by_key = p2c.float().unsqueeze(-3).expand(-1, -1, sequence_length, -1, -1)
-        scores += torch.gather(
-            p2c_by_key,
-            -1,
-            local[None, None, :, :, None].expand(query.size(0), num_heads, -1, -1, -1),
-        ).squeeze(-1)
-    scores *= score_scale
-    if use_padding_mask:
-        pair_mask = attention_mask[:, None, :, None] & attention_mask[:, None, None, :]
-        scores = scores.masked_fill(~pair_mask, float("-inf"))
-        padded_queries = ~attention_mask[:, None, :, None]
-        scores = torch.where(padded_queries, torch.zeros_like(scores), scores)
-    output = torch.matmul(torch.softmax(scores, dim=-1), value.float()).to(query.dtype)
+    key_positions = positions[None, :]
+    key_transposed = key.float().transpose(-1, -2)
+    value_float = value.float()
+    p2c_float = p2c.float() if has_p2c else None
+    outputs = []
+    for start in range(0, sequence_length, query_chunk_size):
+        end = min(start + query_chunk_size, sequence_length)
+        query_positions = positions[start:end, None]
+        local = delta_to_local[query_positions - key_positions + position_offset].long()
+        scores = torch.matmul(query[:, :, start:end].float(), key_transposed)
+        gather_indices = local.expand(query.size(0), num_heads, -1, -1)
+        if has_c2p:
+            scores += torch.gather(c2p[:, :, start:end].float(), -1, gather_indices)
+        if has_p2c:
+            assert p2c_float is not None
+            p2c_by_key = p2c_float.unsqueeze(-3).expand(-1, -1, end - start, -1, -1)
+            scores += torch.gather(
+                p2c_by_key,
+                -1,
+                local[None, None, :, :, None].expand(query.size(0), num_heads, -1, -1, -1),
+            ).squeeze(-1)
+        scores *= score_scale
+        if use_padding_mask:
+            pair_mask = attention_mask[:, None, start:end, None] & attention_mask[:, None, None, :]
+            scores = scores.masked_fill(~pair_mask, float("-inf"))
+            padded_queries = ~attention_mask[:, None, start:end, None]
+            scores = torch.where(padded_queries, torch.zeros_like(scores), scores)
+        outputs.append(torch.matmul(torch.softmax(scores, dim=-1), value_float))
+    output = torch.cat(outputs, dim=2).to(query.dtype)
     return output.transpose(1, 2).reshape(query.size(0), sequence_length, -1)
 
 

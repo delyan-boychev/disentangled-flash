@@ -17,7 +17,7 @@ import torch
 PROFILE_FORMAT_VERSION = 2
 KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v2"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
-TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024)
+TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024, 2048, 4096, 8192)
 TUNING_BATCH_HEADS = (8, 32)
 
 
@@ -31,7 +31,7 @@ def tuning_sequence_length(sequence_length: int) -> int:
     for representative in TUNING_SEQUENCE_LENGTHS:
         if sequence_length <= representative:
             return representative
-    # Keep the profile family bounded. The 1024 schedule remains a valid
+    # Keep the profile family bounded. The 8192 schedule remains a valid
     # conservative dispatch choice for longer inputs, even though the kernel
     # still receives and masks the exact runtime length.
     return TUNING_SEQUENCE_LENGTHS[-1]

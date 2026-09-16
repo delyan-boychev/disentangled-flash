@@ -81,7 +81,7 @@ python -m disentangled_flash.tune \
   --output my-gpu-profile.json
 ```
 
-Use `quick` for a smoke test and `exhaustive` for broad calibration. The tuner
+Use `quick` for a smoke test. The default `standard` preset performs broad calibration. The tuner
 rejects configurations that fail to compile, produce non-finite values, or do
 not match the reference implementation across several padding patterns.
 

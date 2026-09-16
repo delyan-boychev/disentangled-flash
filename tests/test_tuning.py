@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from disentangled_flash.kernel import AUTOTUNE_SPECIALIZATION_KEY
-from disentangled_flash.tune import TuningCase, _make_inputs, _reference
+from disentangled_flash.tune import PRESETS, TuningCase, _make_inputs, _reference, build_parser
 from disentangled_flash.tuning import (
     HardwareSpec,
     KernelConfig,
@@ -74,10 +74,28 @@ def test_registry_uses_explicit_order_and_normalized_gpu_name():
 
 @pytest.mark.parametrize(
     ("length", "representative"),
-    [(1, 64), (64, 64), (65, 128), (383, 384), (384, 384), (513, 768), (2048, 1024)],
+    [
+        (1, 64),
+        (64, 64),
+        (65, 128),
+        (383, 384),
+        (384, 384),
+        (513, 768),
+        (1025, 2048),
+        (2049, 4096),
+        (4097, 8192),
+        (16384, 8192),
+    ],
 )
 def test_tuning_sequence_lengths_use_bounded_families(length, representative):
     assert tuning_sequence_length(length) == representative
+
+
+def test_standard_is_the_broadest_supported_preset():
+    assert set(PRESETS) == {"quick", "standard"}
+    assert PRESETS["standard"]["relative_modes"] == ("none", "c2p", "p2c", "both")
+    assert PRESETS["standard"]["lengths"][-1] == 8192
+    assert build_parser().parse_args(["--output", "profile.json"]).preset == "standard"
 
 
 def test_profile_for_384_resolves_runtime_length_383():
@@ -202,3 +220,13 @@ def test_tuning_reference_covers_relative_scores_and_fully_masked_rows():
     assert workload.active_slots == 64
     assert output.shape == (1, 8, 64)
     assert torch.isfinite(output).all()
+
+
+def test_tuning_reference_query_chunking_preserves_results():
+    case = TuningCase(8, 32, 2, "float32", True, True, "strict")
+    arguments, _workload = _make_inputs(case, torch.device("cpu"))
+
+    one_chunk = _reference(arguments, query_chunk_size=8)
+    small_chunks = _reference(arguments, query_chunk_size=3)
+
+    torch.testing.assert_close(small_chunks, one_chunk)
