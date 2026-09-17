@@ -9,7 +9,7 @@ import statistics
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from itertools import pairwise
 from pathlib import Path
 
@@ -573,7 +573,7 @@ def _profile_provenance(
         "repetitions": str(args.repetitions),
         "tie_margin": str(args.tie_margin),
         "candidate_sha256": hashlib.sha256(candidate_payload).hexdigest(),
-        "generated_at": datetime.now(UTC).isoformat(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
