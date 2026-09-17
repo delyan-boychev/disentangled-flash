@@ -20,6 +20,7 @@ from .packed import validate_cu_seqlens
 from .position import canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
+    CompilerSpec,
     HardwareSpec,
     KernelConfig,
     KernelTuningOptions,
@@ -1299,6 +1300,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             )
         )
         self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
+        self._failed_profile_workloads: set[WorkloadKey] = set()
         if triton is not None:
             candidates = self.tuning.candidates or DEFAULT_KERNEL_CONFIGS
             self._autotune_operator = _custom_autotune_operator(candidates)
@@ -1325,6 +1327,8 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         super().clear_inference_cache()
         if hasattr(self, "_resolved_kernel_configs"):
             self._resolved_kernel_configs.clear()
+        if hasattr(self, "_failed_profile_workloads"):
+            self._failed_profile_workloads.clear()
         if hasattr(self, "_triton_position_projection_cache"):
             self._triton_position_projection_cache.clear()
 
@@ -1337,25 +1341,11 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         has_p2c: bool,
         batch_size: int | None = None,
         sequence_length: int | None = None,
-    ) -> KernelConfig | None:
-        """Return a direct-launch config, or ``None`` for runtime autotuning."""
+        layout: str = "padded",
+        uses_padding_mask: bool = True,
+    ) -> tuple[KernelConfig | None, WorkloadKey]:
+        """Return a direct-launch config plus its finite workload identity."""
 
-        if self.tuning.mode == "autotune":
-            return None
-        if self.tuning.mode == "fixed":
-            return self.tuning.fixed_config
-        if torch.compiler.is_compiling():
-            if self.tuning.mode == "profile_only":
-                raise RuntimeError(
-                    "profile_only tuning cannot resolve a dynamic workload inside "
-                    "torch.compile; select the profile's configuration with fixed mode"
-                )
-            # Triton's own key-based autotuner supports symbolic/dynamic batch
-            # sizes without introducing Python profile lookups into the graph.
-            return None
-        device_index = hidden_states.device.index
-        if device_index is None:
-            device_index = torch.cuda.current_device()
         workload = WorkloadKey(
             sequence_length=(hidden_states.size(1) if sequence_length is None else sequence_length),
             head_dim=self.attention_head_size,
@@ -1366,20 +1356,45 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             has_c2p=has_c2p,
             has_p2c=has_p2c,
             fp32_precision=self.fp32_precision,
+            layout=layout,
+            uses_padding_mask=uses_padding_mask,
         )
+        if self.tuning.mode == "autotune":
+            return None, workload
+        if self.tuning.mode == "fixed":
+            return self.tuning.fixed_config, workload
+        if torch.compiler.is_compiling():
+            if self.tuning.mode == "profile_only":
+                raise RuntimeError(
+                    "profile_only tuning cannot resolve a dynamic workload inside "
+                    "torch.compile; select the profile's configuration with fixed mode"
+                )
+            # Triton's own key-based autotuner supports symbolic/dynamic batch
+            # sizes without introducing Python profile lookups into the graph.
+            return None, workload
+        device_index = hidden_states.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
         cache_key = device_index, workload
         if cache_key not in self._resolved_kernel_configs:
             hardware = HardwareSpec.current(device_index)
+            compiler = CompilerSpec.current()
             self._resolved_kernel_configs[cache_key] = self._profile_registry.resolve(
-                hardware, workload
+                hardware, compiler, workload
             )
         config = self._resolved_kernel_configs[cache_key]
+        if workload in self._failed_profile_workloads:
+            config = None
         if config is None and self.tuning.mode == "profile_only":
+            hardware = HardwareSpec.current(device_index)
             raise RuntimeError(
-                "no validated kernel tuning profile matches "
-                f"{HardwareSpec.current(device_index).name} and workload {workload}"
+                self._profile_registry.explain_miss(
+                    hardware,
+                    CompilerSpec.current(),
+                    workload,
+                )
             )
-        return config
+        return config, workload
 
     def forward_packed(
         self,
@@ -1449,13 +1464,15 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
 
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale_log2 = self._scale(scale_factor) ** -1 * 1.4426950408889634
-        selected_config = self._resolve_kernel_config(
+        selected_config, workload = self._resolve_kernel_config(
             hidden_states,
             active_slots=active_slot_count,
             has_c2p=has_c2p,
             has_p2c=has_p2c,
             batch_size=len(info.lengths),
             sequence_length=info.max_seqlen,
+            layout="packed",
+            uses_padding_mask=False,
         )
         operation_args = (
             query_layer,
@@ -1479,13 +1496,21 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         if selected_config is None:
             output = self._packed_autotune_operator(*operation_args)
         else:
-            output = _deberta_attention_packed_configured_op(
-                *operation_args,
-                selected_config.block_m,
-                selected_config.block_n,
-                selected_config.num_warps,
-                selected_config.num_stages,
-            )
+            try:
+                output = _deberta_attention_packed_configured_op(
+                    *operation_args,
+                    selected_config.block_m,
+                    selected_config.block_n,
+                    selected_config.num_warps,
+                    selected_config.num_stages,
+                )
+            except Exception as error:
+                if self.tuning.mode == "profile_only":
+                    raise RuntimeError(
+                        f"saved packed kernel configuration failed to launch: {selected_config}"
+                    ) from error
+                self._failed_profile_workloads.add(workload)
+                output = self._packed_autotune_operator(*operation_args)
         return output, None
 
     @torch.no_grad()
@@ -1622,11 +1647,13 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
 
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale_log2 = self._scale(scale_factor) ** -1 * 1.4426950408889634
-        selected_config = self._resolve_kernel_config(
+        selected_config, workload = self._resolve_kernel_config(
             hidden_states,
             active_slots=active_slot_count,
             has_c2p=has_c2p,
             has_p2c=has_p2c,
+            layout="padded",
+            uses_padding_mask=not self.assume_unpadded,
         )
         operation = self._autotune_operator
         operation_args = (
@@ -1653,13 +1680,21 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         if selected_config is None:
             output = operation(*operation_args)
         else:
-            output = _deberta_attention_configured_op(
-                *operation_args,
-                selected_config.block_m,
-                selected_config.block_n,
-                selected_config.num_warps,
-                selected_config.num_stages,
-            )
+            try:
+                output = _deberta_attention_configured_op(
+                    *operation_args,
+                    selected_config.block_m,
+                    selected_config.block_n,
+                    selected_config.num_warps,
+                    selected_config.num_stages,
+                )
+            except Exception as error:
+                if self.tuning.mode == "profile_only":
+                    raise RuntimeError(
+                        f"saved padded kernel configuration failed to launch: {selected_config}"
+                    ) from error
+                self._failed_profile_workloads.add(workload)
+                output = operation(*operation_args)
 
         return output, None
 
