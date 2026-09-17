@@ -6,8 +6,9 @@
 
 ***Fast exact DeBERTa-style disentangled attention in Triton.***
 
-DisentangledFlash is an inference-oriented implementation of bidirectional
-DeBERTa-v2/v3 disentangled self-attention. 
+DisentangledFlash is an optimized implementation of bidirectional DeBERTa-v2/v3
+disentangled self-attention with separate inference and differentiable training
+paths.
 
 The Triton kernel is inspired by [FlashAttention](https://github.com/Dao-AILab/flash-attention)'s tiling, IO-aware computations, and online softmax without memory materialization, while its relative position encoding implementation is inspired by [FlexAttention](https://pytorch.org/blog/flexattention/). It fuses QK, relative-score lookup, factorized padding-mask application, online softmax, and PV without materializing a `[B, H, L, L]` attention tensor. C2P/P2C projection score GEMMs remain regular PyTorch GEMMs over the pruned active relative-position slots.
 
@@ -17,7 +18,7 @@ The PyTorch-optimized (`torch`) backend is constructed by optimizing operations,
 ## Status
 
 - NVIDIA CUDA + Triton
-- inference only
+- inference plus experimental differentiable training/backward
 - DeBERTa-v2/v3-style C2P/P2C disentangled attention
 - FP16, BF16, strict FP32, and optional fast FP32/TF32 mode
 - head dimensions 32, 64, and 128
@@ -26,8 +27,10 @@ The PyTorch-optimized (`torch`) backend is constructed by optimizing operations,
 - FlashAttention-style packed, unpadded inference with `cu_seqlens`
 - **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
-Training/backward is not implemented. CPU/MPS use the PyTorch backend
-for development/benchmarking, not the Triton kernel.
+The training Triton path currently requires self-attention, head dimensions 32,
+64, or 128, and `attention_probs_dropout_prob=0`. It does not yet support
+`output_attentions=True`, custom pairwise relative-position tensors, or packed
+training. CPU/MPS use the differentiable PyTorch backend rather than Triton.
 
 While currently tailored to DeBERTa-v2/v3, the kernel and caching abstractions are designed to be extensible to other architectures requiring factorized relative-position or disentangled attention schemes in the future.
 
@@ -76,6 +79,19 @@ parameter names are preserved.
 
 For lower-level experiments, `enable_deberta_inference(..., backend="torch")`
 selects the PyTorch backend instead of Triton.
+
+For training, enable the differentiable path before constructing the optimizer:
+
+```python
+from disentangled_flash import optimize_deberta_training
+
+optimize_deberta_training(model.deberta, backend="triton")
+```
+
+This preserves the original parameter identities and keeps Q/K/V and relative
+position projections in the autograd graph. Inference tuning profiles apply to
+the inference forward kernels; the current training backward kernels use their
+own conservative schedules.
 
 ## CUDA benchmark
 
