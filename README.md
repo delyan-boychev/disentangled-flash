@@ -317,11 +317,14 @@ and packed Triton paths, and FlashDeBERTa's internal packed path.
 python -m benchmarks.evaluate_mnli
 ```
 
-The default is one complete measured dataset pass with no warmup. Every dataset
-row is processed exactly once; the final partial batch is not filled by
-repeating examples. Dataset download, batched tokenization, model loading, and
-the single host-to-device transfer are completed before timing. The first model
-forward and any first-use compilation are therefore included.
+The default is one complete measured dataset pass at batch size 8 with no
+warmup. A throttled progress bar reports completed batches for each
+implementation and run. Every dataset row is processed exactly once; the final
+partial batch is not filled by repeating examples. Dataset download, batched
+tokenization, model loading, and the single host-to-device transfer are
+completed before timing. The first model forward and any first-use compilation
+are therefore included. Use `--batch-size 16` when the model and GPU memory
+permit it.
 
 The report includes accuracy, full-dataset logit and probability errors, and
 the exact number of post-argmax classification mismatches against the Hugging
