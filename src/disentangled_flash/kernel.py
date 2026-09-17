@@ -16,7 +16,7 @@ from typing import Any, NamedTuple
 import torch
 
 from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
-from .packed import validate_cu_seqlens
+from .packed import PackedSequenceInfo, resolve_packed_info
 from .position import canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
@@ -1403,6 +1403,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         max_seqlen: int | None = None,
         *,
         rel_embeddings: torch.Tensor | None = None,
+        packed_info: PackedSequenceInfo | None = None,
     ) -> tuple[torch.Tensor, None]:
         """Run packed attention with the selected inference backend."""
 
@@ -1412,6 +1413,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
                 cu_seqlens,
                 max_seqlen,
                 rel_embeddings=rel_embeddings,
+                packed_info=packed_info,
             )
 
         self._validate_triton_call(hidden_states)
@@ -1419,7 +1421,12 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
         if cu_seqlens.device != hidden_states.device:
             raise ValueError("cu_seqlens must be on the hidden_states device")
-        info = validate_cu_seqlens(cu_seqlens, hidden_states.size(0), max_seqlen)
+        info = resolve_packed_info(
+            cu_seqlens,
+            hidden_states.size(0),
+            max_seqlen,
+            packed_info,
+        )
 
         needs_positions = self.relative_attention and bool(
             {"c2p", "p2c"}.intersection(self.pos_att_type)

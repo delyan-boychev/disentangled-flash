@@ -9,5 +9,6 @@ venv/
 .pytest_cache/
 .ruff_cache/
 *.json
+benchmarks/results/*
 !benchmarks/results/.gitkeep
 .DS_Store
