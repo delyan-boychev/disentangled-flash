@@ -31,6 +31,7 @@ import torch
 
 from disentangled_flash.deberta import enable_deberta_inference
 from disentangled_flash.packed import pack_padded_with_info, unpack_packed
+from disentangled_flash.tuning import KernelTuningOptions
 
 EXAMPLES = [
     (
@@ -86,6 +87,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=("strict", "fast"),
         default="strict",
     )
+    parser.add_argument(
+        "--tuning-mode",
+        choices=("auto", "autotune", "profile_only"),
+        default="auto",
+        help="Triton tuning policy; profile_only fails instead of autotuning on a miss.",
+    )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        help="Explicit tuning profile path; may be supplied more than once.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--iterations", type=int, default=500)
@@ -111,6 +124,8 @@ def enable_backend(
     bucket: int,
     fp32_precision: str,
     layout: str,
+    tuning_mode: str,
+    profile_paths: tuple[str, ...],
 ) -> None:
     """Enable one prepared inference backend; QKV fusion is unconditional."""
 
@@ -119,6 +134,10 @@ def enable_backend(
         backend=backend,
         sequence_lengths=None if layout == "packed" else [bucket],
         fp32_precision=fp32_precision,
+        tuning=KernelTuningOptions(
+            mode=tuning_mode,
+            profile_paths=profile_paths,
+        ),
     )
 
 
@@ -277,6 +296,8 @@ def load_candidate_model(
     bucket: int,
     fp32_precision: str,
     layout: str,
+    tuning_mode: str,
+    profile_paths: tuple[str, ...],
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.nn.Module:
@@ -303,6 +324,8 @@ def load_candidate_model(
         bucket=bucket,
         fp32_precision=fp32_precision,
         layout=layout,
+        tuning_mode=tuning_mode,
+        profile_paths=profile_paths,
     )
     return model
 
@@ -333,6 +356,7 @@ def main() -> None:
     print(f"model:      {args.model}")
     print(f"backend:    {args.backend}")
     print(f"layout:     {args.layout}")
+    print(f"tuning:     {args.tuning_mode}")
     print(f"dtype:      {dtype}")
     print(f"gpu:        {torch.cuda.get_device_name(device)}")
     print(f"bucket:     {args.bucket}")
@@ -398,6 +422,8 @@ def main() -> None:
         bucket=args.bucket,
         fp32_precision=args.fp32_precision,
         layout=args.layout,
+        tuning_mode=args.tuning_mode,
+        profile_paths=tuple(args.profile),
         device=device,
         dtype=dtype,
     )
