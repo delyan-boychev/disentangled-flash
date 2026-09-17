@@ -45,7 +45,7 @@ from disentangled_flash._reference import (
 from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 from disentangled_flash.deberta import DebertaV2InferenceEncoder
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
-from disentangled_flash.packed import pack_padded, unpack_packed
+from disentangled_flash.packed import pack_padded_with_info, unpack_packed
 
 IMPLEMENTATIONS = {
     "base": OriginalDisentangledSelfAttention,
@@ -625,15 +625,24 @@ def make_callable(
                 hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
             ) -> torch.Tensor:
-                packed, cu_seqlens, max_seqlen = pack_padded(hidden_states, attention_mask)
+                packed, cu_seqlens, packed_info = pack_padded_with_info(
+                    hidden_states,
+                    attention_mask,
+                )
                 output = target.forward_packed(
                     packed,
                     cu_seqlens,
-                    max_seqlen,
+                    packed_info.max_seqlen,
                     output_hidden_states=False,
                     return_dict=True,
+                    packed_info=packed_info,
                 ).last_hidden_state
-                padded, _ = unpack_packed(output, cu_seqlens, hidden_states.size(1))
+                padded, _ = unpack_packed(
+                    output,
+                    cu_seqlens,
+                    hidden_states.size(1),
+                    packed_info=packed_info,
+                )
                 return padded
 
             return call_packed

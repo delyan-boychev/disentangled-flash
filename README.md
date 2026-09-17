@@ -137,6 +137,22 @@ The JSON report includes a reproducibility snapshot with:
 - the full command, requested model matrix, and a safe allowlist of relevant
   CUDA/Triton/tuning environment variables
 
+Generate report-ready latency and memory figures from the JSON output with:
+
+```bash
+python -m benchmarks.plot_cuda_results \
+  deberta_v3_base_encoder_cuda_results.json \
+  --output-dir benchmarks/results/deberta_v3_base_encoder
+```
+
+This writes four latency figures and four peak-allocated-memory figures, one for
+each measured batch size. Every figure has separate FP16, BF16, and FP32 panels
+and shows padded and packed curves together. Latency uses the recorded sample
+mean (`mean_ms`); memory is the total peak CUDA allocation in GiB. Expected OOM
+points are annotated and omitted from the curves, while unsupported backend and
+layout combinations are not presented as measurements. PNG and vector PDF are
+produced by default.
+
 Attention-only experiments remain available explicitly (FlashDeBERTa is an
 encoder implementation):
 
@@ -263,6 +279,28 @@ implementation for portability and validation.
 
 Use `pack_padded` and `unpack_packed` to convert right-padded tensors at an API
 boundary. Empty sequences and non-right-padded masks are rejected explicitly.
+When both conversion directions are needed, `pack_padded_with_info` returns a
+validated `PackedSequenceInfo` that can be passed as `packed_info` to
+`forward_packed` and `unpack_packed`. The encoder reuses this host metadata in
+every layer, avoiding repeated device synchronization:
+
+```python
+from disentangled_flash import pack_padded_with_info, unpack_packed
+
+tokens, cu_seqlens, info = pack_padded_with_info(hidden_states, attention_mask)
+packed_output = encoder.forward_packed(
+    tokens,
+    cu_seqlens,
+    info.max_seqlen,
+    packed_info=info,
+).last_hidden_state
+output, _ = unpack_packed(
+    packed_output,
+    cu_seqlens,
+    hidden_states.size(1),
+    packed_info=info,
+)
+```
 
 ## Pretrained task parity + speed
 

@@ -7,7 +7,13 @@ from .deberta import (
     optimize_deberta,
 )
 from .kernel import DisentangledFlashAttention
-from .packed import PackedSequenceInfo, pack_padded, unpack_packed, validate_cu_seqlens
+from .packed import (
+    PackedSequenceInfo,
+    pack_padded,
+    pack_padded_with_info,
+    unpack_packed,
+    validate_cu_seqlens,
+)
 from .tuning import KernelConfig, KernelTuningOptions
 
 __version__ = "0.1.4"
@@ -22,6 +28,7 @@ __all__ = [
     "enable_deberta_inference",
     "optimize_deberta",
     "pack_padded",
+    "pack_padded_with_info",
     "unpack_packed",
     "validate_cu_seqlens",
 ]

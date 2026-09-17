@@ -29,7 +29,7 @@ import statistics
 import torch
 
 from disentangled_flash.deberta import enable_deberta_inference
-from disentangled_flash.packed import pack_padded, unpack_packed
+from disentangled_flash.packed import pack_padded_with_info, unpack_packed
 
 EXAMPLES = [
     (
@@ -146,21 +146,23 @@ def forward_model(
         token_type_ids=token_type_ids,
         mask=attention_mask,
     )
-    packed_embeddings, cu_seqlens, max_seqlen = pack_padded(
+    packed_embeddings, cu_seqlens, packed_info = pack_padded_with_info(
         embedding_output,
         attention_mask,
     )
     encoder_output = backbone.encoder.forward_packed(
         packed_embeddings,
         cu_seqlens,
-        max_seqlen,
+        packed_info.max_seqlen,
         output_hidden_states=output_hidden_states,
         return_dict=True,
+        packed_info=packed_info,
     )
     sequence_output, _ = unpack_packed(
         encoder_output.last_hidden_state,
         cu_seqlens,
         attention_mask.size(1),
+        packed_info=packed_info,
     )
     pooled_output = model.pooler(sequence_output)
     logits = model.classifier(model.dropout(pooled_output))

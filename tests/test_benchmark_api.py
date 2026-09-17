@@ -173,11 +173,13 @@ def test_mnli_packed_path_runs_classifier_without_padding_attention():
             *,
             output_hidden_states,
             return_dict,
+            packed_info,
         ):
             assert cu_seqlens.tolist() == [0, 2, 3]
             assert max_seqlen == 2
             assert output_hidden_states is True
             assert return_dict is True
+            assert packed_info.offsets == (0, 2, 3)
             return SimpleNamespace(last_hidden_state=hidden_states + 1)
 
     class Model(nn.Module):

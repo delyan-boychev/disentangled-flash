@@ -5,7 +5,12 @@ from disentangled_flash import kernel
 from disentangled_flash._reference import DebertaAttentionConfig
 from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
-from disentangled_flash.packed import pack_padded, unpack_packed, validate_cu_seqlens
+from disentangled_flash.packed import (
+    pack_padded,
+    pack_padded_with_info,
+    unpack_packed,
+    validate_cu_seqlens,
+)
 from disentangled_flash.tuning import KernelConfig, KernelTuningOptions
 
 
@@ -18,6 +23,32 @@ def test_pack_and_unpack_right_padded_batch():
 
     assert cu_seqlens.tolist() == [0, 3, 4]
     assert max_seqlen == 3
+    assert torch.equal(restored_mask, mask)
+    assert torch.equal(restored[mask], hidden[mask])
+
+
+def test_packed_info_can_be_reused_for_vectorized_unpack():
+    hidden = torch.arange(3 * 5 * 2).view(3, 5, 2)
+    mask = torch.tensor(
+        [
+            [1, 1, 1, 1, 1],
+            [1, 1, 1, 0, 0],
+            [1, 0, 0, 0, 0],
+        ],
+        dtype=torch.bool,
+    )
+
+    packed, cu_seqlens, info = pack_padded_with_info(hidden, mask)
+    restored, restored_mask = unpack_packed(
+        packed,
+        cu_seqlens,
+        hidden.size(1),
+        packed_info=info,
+    )
+
+    assert info.offsets == (0, 5, 8, 9)
+    assert info.lengths == (5, 3, 1)
+    assert info.max_seqlen == 5
     assert torch.equal(restored_mask, mask)
     assert torch.equal(restored[mask], hidden[mask])
 

@@ -23,7 +23,7 @@ from .kernel import (
     TritonInferenceDisentangledSelfAttention,
     TritonPreparedPositionPlan,
 )
-from .packed import validate_cu_seqlens
+from .packed import PackedSequenceInfo, resolve_packed_info
 from .position import SharedPositionPlanCache
 from .tuning import KernelTuningOptions, ProfileRegistry
 
@@ -329,6 +329,7 @@ class DebertaV2InferenceEncoder(nn.Module):
         *,
         output_hidden_states: bool = True,
         return_dict: bool = True,
+        packed_info: PackedSequenceInfo | None = None,
     ) -> Any:
         """Execute an unpadded encoder batch using cumulative boundaries.
 
@@ -346,7 +347,12 @@ class DebertaV2InferenceEncoder(nn.Module):
             raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
         if cu_seqlens.device != hidden_states.device:
             raise ValueError("cu_seqlens must be on the hidden_states device")
-        info = validate_cu_seqlens(cu_seqlens, hidden_states.size(0), max_seqlen)
+        info = resolve_packed_info(
+            cu_seqlens,
+            hidden_states.size(0),
+            max_seqlen,
+            packed_info,
+        )
 
         rel_embeddings = self.get_rel_embedding()
         all_hidden_states = (hidden_states,) if output_hidden_states else None
@@ -357,21 +363,19 @@ class DebertaV2InferenceEncoder(nn.Module):
                 cu_seqlens,
                 info.max_seqlen,
                 rel_embeddings=rel_embeddings,
+                packed_info=info,
             )
             attention_output = layer.attention.output(self_output, next_kv)
             intermediate_output = layer.intermediate(attention_output)
             output_states = layer.output(intermediate_output, attention_output)
 
             if index == 0 and self.conv is not None:
-                segments = []
-                for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
-                    source = hidden_states[start:end].unsqueeze(0)
-                    output = output_states[start:end].unsqueeze(0)
-                    # Hugging Face's DeBERTa convolution computes ``1 - input_mask``.
-                    # Preserve its tokenizer-style integer mask contract here.
-                    mask = torch.ones((1, length), dtype=torch.long, device=hidden_states.device)
-                    segments.append(self.conv(source, output, mask).squeeze(0))
-                output_states = torch.cat(segments, dim=0)
+                output_states = self._forward_packed_convolution(
+                    hidden_states,
+                    output_states,
+                    cu_seqlens,
+                    info,
+                )
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (output_states,)
             next_kv = output_states
@@ -384,6 +388,60 @@ class DebertaV2InferenceEncoder(nn.Module):
             hidden_states=all_hidden_states,
             attentions=None,
         )
+
+    def _forward_packed_convolution(
+        self,
+        hidden_states: torch.Tensor,
+        residual_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        info: PackedSequenceInfo,
+    ) -> torch.Tensor:
+        """Run the first-layer convolution once without crossing boundaries."""
+
+        if self.conv is None:
+            return residual_states
+        convolution = self.conv.conv
+        separator = int(convolution.kernel_size[0]) - 1
+        batch_size = len(info.lengths)
+        total_tokens = hidden_states.size(0)
+        if batch_size == 1 or separator == 0:
+            mask = torch.ones(
+                (1, total_tokens),
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+            return self.conv(
+                hidden_states.unsqueeze(0),
+                residual_states.unsqueeze(0),
+                mask,
+            ).squeeze(0)
+
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        sequence_ids = torch.repeat_interleave(
+            torch.arange(batch_size, device=hidden_states.device),
+            lengths,
+            output_size=total_tokens,
+        )
+        packed_positions = torch.arange(total_tokens, device=hidden_states.device)
+        expanded_positions = packed_positions + sequence_ids * separator
+        expanded_length = total_tokens + (batch_size - 1) * separator
+        expanded_shape = (expanded_length, hidden_states.size(1))
+        expanded_hidden = hidden_states.new_zeros(expanded_shape)
+        expanded_residual = residual_states.new_zeros(expanded_shape)
+        expanded_mask = torch.zeros(
+            expanded_length,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+        expanded_hidden[expanded_positions] = hidden_states
+        expanded_residual[expanded_positions] = residual_states
+        expanded_mask[expanded_positions] = 1
+        expanded_output = self.conv(
+            expanded_hidden.unsqueeze(0),
+            expanded_residual.unsqueeze(0),
+            expanded_mask.unsqueeze(0),
+        ).squeeze(0)
+        return expanded_output[expanded_positions]
 
     def forward(
         self,

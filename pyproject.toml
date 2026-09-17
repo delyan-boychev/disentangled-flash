@@ -23,6 +23,9 @@ hf = [
 benchmark = [
     "transformers>=4.57",
     "flashdeberta>=0.0.7",
+    "matplotlib>=3.9",
+    "pandas>=2.2",
+    "seaborn>=0.13",
 ]
 dev = [
     "pytest>=8",
