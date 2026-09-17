@@ -493,9 +493,29 @@ diagnostic metadata and does not control compatibility.
 Task-level parity is additionally tested with the pretrained
 `microsoft/deberta-v2-xlarge-mnli` checkpoint. The original Hugging Face model
 and the same checkpoint with its encoder replaced by DisentangledFlash achieve
-matching predictions while the test also checks classification logits,
-probabilities, final hidden states, and the complete sequence-classification
-path.
+matching predictions across the complete GLUE/MNLI matched validation split.
+
+The following H200 result uses FP16, batch size 16, a padded length of 512, one
+measured pass, and no warmup. First-use model execution and compilation are
+included in the timing. The 9,815 examples contain 370,857 valid tokens out of
+5,025,280 padded positions, so **92.62% of the dense input is padding**. Every
+reported implementation reaches **91.7371% accuracy** and full decision parity:
+**0 of 9,815 classification decisions differ** from the Hugging Face reference.
+
+| Implementation | Time | Throughput | Speedup vs. HF | Decision mismatches | Logit abs. error max / mean | Probability abs. error max / mean |
+|---|---:|---:|---:|---:|---:|---:|
+| Hugging Face padded | 55,963.399 ms | 175.38 examples/s | 1.00× | 0 / 9,815 | 0 / 0 | 0 / 0 |
+| DF PyTorch padded | 53,484.569 ms | 183.51 examples/s | 1.05× | 0 / 9,815 | 0.109375 / 0.00126508 | 0.0100614 / 0.00008926 |
+| DF Triton padded | 31,329.634 ms | 313.28 examples/s | 1.79× | 0 / 9,815 | 0.0742188 / 0.00114972 | 0.00796831 / 0.00008365 |
+| **DF Triton packed** | **5,419.671 ms** | **1,811.00 examples/s** | **10.33×** | **0 / 9,815** | 0.0507812 / 0.00113259 | 0.00853068 / 0.00008150 |
+| FlashDeBERTa packed | 22,058.000 ms | 444.96 examples/s | 2.54× | 0 / 9,815 | 0.0800781 / 0.00115263 | 0.00675502 / 0.00008179 |
+
+Packed Triton is **4.07× faster than packed FlashDeBERTa** on this highly padded
+task-level workload. DF PyTorch packed is intentionally omitted from this
+summary table. Because the benchmark contains a single measured pass, the first
+and mean times are identical and no run-to-run standard deviation is available;
+the error columns instead report full-dataset maximum and mean absolute error.
+Small logit differences do not change any predicted class.
 
 
 ## Attribution
