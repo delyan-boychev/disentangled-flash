@@ -372,48 +372,41 @@ Do not treat the current candidate table as a universal final table for every GP
 
 ## Results: H200 DeBERTa-v3-base encoder
 
-The current benchmark covers the complete 12-layer
-`microsoft/deberta-v3-base` encoder, not an isolated attention operator. It
-compares the original Hugging Face encoder, DisentangledFlash's fused-QKV
-PyTorch implementation, DisentangledFlash Triton, and FlashDeBERTa. The plots
-and tables below intentionally report only batch sizes 1 and 16.
+![H200 DeBERTa-v3-base latency at batch 1](benchmarks/results/h200_deberta_v3_base/latency_batch_1.png)
+
+![H200 DeBERTa-v3-base latency at batch 16](benchmarks/results/h200_deberta_v3_base/latency_batch_16.png)
+
+![H200 DeBERTa-v3-base peak memory at batch 1](benchmarks/results/h200_deberta_v3_base/memory_batch_1.png)
+
+![H200 DeBERTa-v3-base peak memory at batch 16](benchmarks/results/h200_deberta_v3_base/memory_batch_16.png)
+
+These H200 results cover the complete 12-layer DeBERTa-v3-base encoder and
+report batch sizes 1 and 16.
 
 ### Benchmark configuration
 
 | Parameter | Value |
 |---|---|
 | Model | `microsoft/deberta-v3-base` architecture |
-| Hidden size / heads / head dimension | 768 / 12 / 64 |
-| Encoder layers / FFN size / convolution | 12 / 3072 / 3 |
 | Reported batch sizes | 1, 16 |
 | Sequence lengths | 64, 128, 256, 512, 1024, 2048, 4096, 8192 |
 | Precisions | FP16, BF16, strict FP32 |
-| Execution | Eager inference |
-| Measurements | 3 warmups, 10 fresh measured inputs per point |
+| Execution / measurements | Eager; 3 warmups and 10 fresh inputs per point |
 | Packed-length distribution | Uniform from 60% through 100% of the padded length |
 | GPU | NVIDIA H200, SM 9.0, 143771 MiB VRAM |
 | Driver / power limit | 595.91.07 / 700 W |
 | Software | Python 3.12.14, PyTorch 2.14.0+cu130, Triton 3.8.0, cuDNN 9.2.4 |
 | Comparisons | Transformers 5.17.0, FlashDeBERTa 0.0.7 |
 | Host allocation | 16 CPU threads and 128 GiB RAM under Slurm |
-| Host node | Intel Xeon Platinum 8568Y+, 96 physical cores, 2.16 TB RAM |
-| OS | Linux 6.18.51-1-insait, x86-64, glibc 2.41 |
+| Host / OS | Xeon Platinum 8568Y+; Linux 6.18.51-1-insait, x86-64, glibc 2.41 |
 
-Each iteration uses a newly generated tensor and the same deterministic sample
-for corresponding implementations. Latency is the sample mean and excludes
-model preparation, compilation, and offline tuning. Peak memory is total CUDA
-memory allocated, so it includes the model and persistent prepared-plan caches,
-not only temporary attention workspace. OOM points are capacity observations,
-not failed benchmark runs.
+Latency is the sample mean and excludes preparation, compilation, and offline
+tuning. Peak memory is total CUDA allocation. Corresponding implementations use
+the same deterministic samples; OOM points are capacity results.
 
 ### Latency
 
-![H200 DeBERTa-v3-base latency at batch 1](benchmarks/results/h200_deberta_v3_base/latency_batch_1.png)
-
-![H200 DeBERTa-v3-base latency at batch 16](benchmarks/results/h200_deberta_v3_base/latency_batch_16.png)
-
-Geometric-mean end-to-end speedups for packed Triton over the eight sequence
-lengths are:
+Geometric-mean packed-Triton speedups across the eight sequence lengths:
 
 | Batch | Precision | vs. Hugging Face padded | vs. DF PyTorch packed | vs. FlashDeBERTa packed |
 |---:|---:|---:|---:|---:|
@@ -424,13 +417,8 @@ lengths are:
 | 16 | BF16 | **2.29×** | **5.62×** | **1.38×** |
 | 16 | FP32 | **1.51×** | **2.33×** | **1.18×** |
 
-For batch 16, comparisons against Hugging Face and packed DF PyTorch cover the
-seven mutually successful lengths through 4096 because those implementations
-OOM at 8192. Comparisons against FlashDeBERTa cover all eight lengths. Batch 1
-comparisons cover all eight lengths.
-
-At the longest sequence, where all packed Triton and FlashDeBERTa points
-succeeded:
+Batch-16 Hugging Face and DF PyTorch comparisons stop at 4096 because both OOM
+at 8192. The following table compares successful length-8192 points:
 
 | Batch | Precision | DF Triton packed | FlashDeBERTa packed | Speedup | DF Triton peak | FlashDeBERTa peak | Memory reduction |
 |---:|---:|---:|---:|---:|---:|---:|---:|
@@ -441,66 +429,30 @@ succeeded:
 | 16 | BF16 | **708.29 ms** | 1034.98 ms | **1.46×** | **5.13 GiB** | 17.39 GiB | **70.5%** |
 | 16 | FP32 | **2921.89 ms** | 3116.86 ms | **1.07×** | **10.24 GiB** | 26.22 GiB | **60.9%** |
 
-Packed execution is not automatically faster for every small workload. This
-benchmark starts with padded model inputs and includes mask analysis, gathering
-into a packed tensor, `cu_seqlens` construction, packed boundary bookkeeping,
-and scattering back to a dense encoder output. At batch 1, that fixed cost is
-not amortized until long sequences; for batch 16 FP16/BF16, packed Triton
-overtakes padded Triton at length 512. Applications that keep data packed across
-the surrounding pipeline avoid part of this API-boundary cost.
+Packing conversion has a fixed cost; at batch 16 FP16/BF16, packed Triton
+overtakes padded Triton at length 512.
 
 ### Peak allocated GPU memory
 
-![H200 DeBERTa-v3-base peak memory at batch 1](benchmarks/results/h200_deberta_v3_base/memory_batch_1.png)
-
-![H200 DeBERTa-v3-base peak memory at batch 16](benchmarks/results/h200_deberta_v3_base/memory_batch_16.png)
-
-At short lengths, total peak memory can make packed Triton look slightly larger
-than FlashDeBERTa because DisentangledFlash retains prepared relative-position
-plans and projections. For example, batch-16 FP16 at length 64 peaks at 0.664
-GiB for packed Triton and 0.599 GiB for FlashDeBERTa, but the incremental
-allocation above each backend's baseline is lower for Triton: 0.028 GiB versus
-0.045 GiB. Once attention workspace dominates, the streaming Triton path's
-lower incremental allocation also produces a substantially lower total peak,
-as the length-8192 table shows.
-
-At batch 16 and length 8192, the Hugging Face encoder OOMs in every precision;
-packed DF PyTorch also OOMs in every precision, and padded DF PyTorch OOMs in
-FP32. Packed and padded Triton and packed FlashDeBERTa complete all three
-precisions.
+At batch 16 and length 8192, Hugging Face and packed DF PyTorch OOM in every
+precision; padded DF PyTorch OOMs in FP32. Both Triton layouts and FlashDeBERTa
+complete all three precisions.
 
 ### Bundled H200 tuning profile
 
-The package includes the reviewed
+The package automatically discovers the reviewed
 [`h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json`](src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json)
-profile. Installed wheels discover it automatically; no environment variable or
-explicit profile path is required.
-
-The profile contains 108 validated winners for the DeBERTa-v3-base workload:
-head dimension 64, C2P+P2C, FP16/BF16/FP32, padded masked, padded unmasked, and
-packed layouts across the nine bounded length families through 8192. It was
-generated on an H200 with 10 tuning warmups and 50 repetitions per candidate.
-It is intentionally a model-workload profile, not a universal H200 profile.
-
-Profile acceptance remains strict. The bundled entries match NVIDIA H200 SM
-9.0, PyTorch 2.14.0+cu130, CUDA runtime 13.0, and the recorded Triton 3.8.0
-compiler fingerprint. On another compiler stack the profile is ignored in
-`auto` mode and safe bounded autotuning is used instead; the NVIDIA driver is
-diagnostic metadata and does not control compatibility.
+profile. Its 108 winners cover the DeBERTa-v3-base layouts, precisions, and
+bounded lengths through 8192. They require H200 SM 9.0, PyTorch 2.14.0+cu130,
+CUDA 13.0, and the recorded Triton 3.8.0 compiler fingerprint; otherwise `auto`
+mode uses bounded autotuning.
 
 ### Pretrained-model parity
 
-Task-level parity is additionally tested with the pretrained
-`microsoft/deberta-v2-xlarge-mnli` checkpoint. The original Hugging Face model
-and the same checkpoint with its encoder replaced by DisentangledFlash achieve
-matching predictions across the complete GLUE/MNLI matched validation split.
-
-The following H200 result uses FP16, batch size 16, a padded length of 512, one
-measured pass, and no warmup. First-use model execution and compilation are
-included in the timing. The 9,815 examples contain 370,857 valid tokens out of
-5,025,280 padded positions, so **92.62% of the dense input is padding**. Every
-reported implementation reaches **91.7371% accuracy** and full decision parity:
-**0 of 9,815 classification decisions differ** from the Hugging Face reference.
+The H200 task-level test uses `microsoft/deberta-v2-xlarge-mnli`, FP16, batch 16,
+length 512, and one cold pass over all 9,815 matched-validation examples. The
+dense input is **92.62% padding**. Every implementation reaches **91.7371%
+accuracy** with full decision parity (**0/9,815 mismatches**).
 
 | Implementation | Time | Throughput | Speedup vs. HF | Decision mismatches | Logit abs. error max / mean | Probability abs. error max / mean |
 |---|---:|---:|---:|---:|---:|---:|
@@ -510,12 +462,9 @@ reported implementation reaches **91.7371% accuracy** and full decision parity:
 | **DF Triton packed** | **5,419.671 ms** | **1,811.00 examples/s** | **10.33×** | **0 / 9,815** | 0.0507812 / 0.00113259 | 0.00853068 / 0.00008150 |
 | FlashDeBERTa packed | 22,058.000 ms | 444.96 examples/s | 2.54× | 0 / 9,815 | 0.0800781 / 0.00115263 | 0.00675502 / 0.00008179 |
 
-Packed Triton is **4.07× faster than packed FlashDeBERTa** on this highly padded
-task-level workload. DF PyTorch packed is intentionally omitted from this
-summary table. Because the benchmark contains a single measured pass, the first
-and mean times are identical and no run-to-run standard deviation is available;
-the error columns instead report full-dataset maximum and mean absolute error.
-Small logit differences do not change any predicted class.
+Packed Triton is **4.07× faster than FlashDeBERTa** here. Error columns report
+full-dataset maximum and mean absolute error; one pass provides no run-to-run
+standard deviation.
 
 
 ## Attribution
