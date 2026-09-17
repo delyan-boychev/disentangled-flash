@@ -466,7 +466,9 @@ def make_inputs(
         token_ids.masked_fill_(~mask_cpu, 0)
 
         token_ids = token_ids.to(device=embedding_table.device)
-        mask = mask_cpu.to(device=embedding_table.device)
+        # Match tokenizer output. DeBERTa's convolution computes
+        # ``1 - input_mask`` and therefore requires an integer mask.
+        mask = mask_cpu.to(device=embedding_table.device, dtype=torch.long)
         hidden_states = embedding_table[token_ids].contiguous()
         batches.append((hidden_states, mask))
     return batches
@@ -1091,6 +1093,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                     )
 
                     stage = "parity"
+                    parity_batch_size = min(batch_size, args.parity_batch_size)
                     try:
                         max_error, mean_error = compare_generated_outputs(
                             args.scope,
@@ -1098,9 +1101,9 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                             call,
                             rel_embeddings,
                             embedding_table,
-                            batch_size,
+                            parity_batch_size,
                             sequence_length,
-                            args.samples,
+                            args.parity_samples,
                             shape_seed + 10_000,
                             args.minimum_length_fraction,
                             args.layout,
@@ -1128,6 +1131,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
                         "valid_tokens_per_second": sum(valid_tokens) / total_seconds,
                         "mean_valid_tokens_per_batch": statistics.mean(valid_tokens),
                         "parity_status": parity_status,
+                        "parity_batch_size": parity_batch_size,
+                        "parity_samples": args.parity_samples,
                         "parity_error": parity_error,
                         "max_abs_error": max_error,
                         "mean_abs_error": mean_error,
@@ -1286,6 +1291,8 @@ def run_parent(args: argparse.Namespace) -> None:
             "lengths": args.lengths,
             "warmup": args.warmup,
             "samples": args.samples,
+            "parity_samples": args.parity_samples,
+            "parity_batch_size": args.parity_batch_size,
             "compile_mode": args.compile_mode,
             "fullgraph": args.fullgraph,
             "dynamic": args.dynamic,
@@ -1344,6 +1351,10 @@ def run_parent(args: argparse.Namespace) -> None:
                             str(args.warmup),
                             "--samples",
                             str(args.samples),
+                            "--parity-samples",
+                            str(args.parity_samples),
+                            "--parity-batch-size",
+                            str(args.parity_batch_size),
                             "--compile-mode",
                             args.compile_mode,
                             "--vocab-size",
@@ -1432,6 +1443,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=10)
+    parser.add_argument(
+        "--parity-samples",
+        type=int,
+        default=1,
+        help="Fresh samples used for numerical parity outside timed measurements.",
+    )
+    parser.add_argument(
+        "--parity-batch-size",
+        type=int,
+        default=1,
+        help="Maximum parity batch size; performance still uses each requested batch size.",
+    )
     parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
     parser.add_argument("--hidden-size", type=int, default=768)
     parser.add_argument("--num-attention-heads", type=int, default=12)

@@ -55,6 +55,8 @@ def test_cuda_benchmark_defaults_to_deberta_v3_base_matrix():
     assert args.num_hidden_layers == 12
     assert args.intermediate_size == 3072
     assert args.vocab_size == 128100
+    assert args.parity_samples == 1
+    assert args.parity_batch_size == 1
 
 
 def test_cuda_benchmark_reports_only_real_layouts():
@@ -79,6 +81,7 @@ def test_cuda_benchmark_uses_distinct_reproducible_input_batches():
     assert all(torch.equal(a[0], b[0]) for a, b in zip(first, repeated))
     assert any(not torch.equal(first[index][0], first[index + 1][0]) for index in range(2))
     assert all(not torch.equal(a[0], b[0]) for a, b in zip(first, measured))
+    assert all(mask.dtype == torch.long for _, mask in first)
 
 
 def test_system_details_are_json_serializable_and_safe():

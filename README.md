@@ -110,6 +110,11 @@ Warmup and measurement inputs never reuse tensor objects. Every iteration gets
 new deterministically generated token IDs, hidden states, sequence lengths, and
 masks; warmup and measurement use separate seed ranges. The same seeded samples
 are shared across implementations and layouts so comparisons remain fair.
+Masks use the integer dtype produced by Hugging Face tokenizers, including for
+FlashDeBERTa's convolution path. Numerical parity is run outside timing with one
+fresh sample at batch size 1 by default, avoiding a quadratic dense-reference
+allocation proportional to a large performance batch. Both values are recorded
+and can be changed with `--parity-samples` and `--parity-batch-size`.
 
 CUDA out-of-memory conditions are capacity results, not benchmark failures. An
 OOM row records the implementation, dtype, execution mode, layout, batch size,
