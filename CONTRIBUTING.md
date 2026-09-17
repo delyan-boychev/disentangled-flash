@@ -81,9 +81,10 @@ python -m disentangled_flash.tune \
   --output my-gpu-profile.json
 ```
 
-Use `quick` for a smoke test. The default `standard` preset performs broad calibration. The tuner
-rejects configurations that fail to compile, produce non-finite values, or do
-not match the reference implementation across several padding patterns.
+Use `quick` for a smoke test. The default `standard` preset performs broad
+calibration for padded, no-mask dense, and packed kernels. The tuner rejects
+configurations that fail to compile, produce non-finite values, or do not match
+the reference implementation across several mask and packed-boundary patterns.
 
 To test additional schedules, pass a JSON file containing a list of configuration
 objects:
@@ -102,7 +103,8 @@ python -m disentangled_flash.tune \
 ```
 
 Before contributing a profile, run the CUDA tests and validation suite, retain
-the generated environment metadata, and place the reviewed JSON file in
+the generated compiler fingerprint and provenance, verify compatibility with
+`python -m disentangled_flash.tune inspect my-gpu-profile.json`, and place the reviewed JSON file in
 `src/disentangled_flash/profiles/`.
 
 ---

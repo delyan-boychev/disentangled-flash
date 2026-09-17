@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
 import tempfile
+import warnings
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from importlib import resources
@@ -14,9 +16,10 @@ from typing import Any, Literal
 
 import torch
 
-PROFILE_FORMAT_VERSION = 2
-KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v2"
+PROFILE_FORMAT_VERSION = 3
+KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v3"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
+KernelLayout = Literal["padded", "packed"]
 TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024, 2048, 4096, 8192)
 TUNING_BATCH_HEADS = (8, 32)
 
@@ -133,6 +136,8 @@ class WorkloadKey:
     has_c2p: bool
     has_p2c: bool
     fp32_precision: str
+    layout: KernelLayout = "padded"
+    uses_padding_mask: bool = True
 
     def __post_init__(self) -> None:
         for name in ("sequence_length", "head_dim", "batch_heads"):
@@ -159,6 +164,12 @@ class WorkloadKey:
             raise ValueError("dtype must be float16, bfloat16, or float32")
         if self.fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be strict or fast")
+        if self.layout not in {"padded", "packed"}:
+            raise ValueError("layout must be padded or packed")
+        if not isinstance(self.uses_padding_mask, bool):
+            raise TypeError("uses_padding_mask must be a boolean")
+        if self.layout == "packed" and self.uses_padding_mask:
+            raise ValueError("packed workloads cannot use a padding mask")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +181,8 @@ class WorkloadKey:
             "has_c2p": self.has_c2p,
             "has_p2c": self.has_p2c,
             "fp32_precision": self.fp32_precision,
+            "layout": self.layout,
+            "uses_padding_mask": self.uses_padding_mask,
         }
 
     @classmethod
@@ -183,6 +196,8 @@ class WorkloadKey:
             "has_c2p",
             "has_p2c",
             "fp32_precision",
+            "layout",
+            "uses_padding_mask",
         }
         _require_exact_keys(data, fields, set(), "workload key")
         integer_fields = {"length_regime", "head_dim", "occupancy_regime", "slot_regime"}
@@ -195,6 +210,10 @@ class WorkloadKey:
             raise TypeError("workload attention-mode fields must be booleans")
         if not isinstance(data["dtype"], str) or not isinstance(data["fp32_precision"], str):
             raise TypeError("workload dtype and fp32_precision must be strings")
+        if not isinstance(data["layout"], str):
+            raise TypeError("workload layout must be a string")
+        if not isinstance(data["uses_padding_mask"], bool):
+            raise TypeError("workload uses_padding_mask must be a boolean")
         return cls(
             sequence_length=data["length_regime"],
             head_dim=data["head_dim"],
@@ -204,7 +223,87 @@ class WorkloadKey:
             has_c2p=data["has_c2p"],
             has_p2c=data["has_p2c"],
             fp32_precision=data["fp32_precision"],
+            layout=data["layout"],
+            uses_padding_mask=data["uses_padding_mask"],
         )
+
+
+def _current_triton_key() -> str:
+    """Return the compiler identity used by Inductor's own cache when available."""
+
+    try:
+        from torch._inductor.runtime.triton_compat import triton_key
+
+        key = triton_key()
+        if key:
+            return str(key)
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        import triton
+
+        return f"version:{triton.__version__}"
+    except ImportError:
+        return "unavailable"
+
+
+@dataclass(frozen=True)
+class CompilerSpec:
+    """Compiler identity that makes a measured launch configuration reusable."""
+
+    torch: str
+    triton_key: str
+    cuda_runtime: str
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) and value for value in self.to_dict().values()):
+            raise ValueError("compiler identity fields must be non-empty strings")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "torch": self.torch,
+            "triton_key": self.triton_key,
+            "cuda_runtime": self.cuda_runtime,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CompilerSpec:
+        _require_exact_keys(data, {"torch", "triton_key", "cuda_runtime"}, set(), "compiler")
+        if not all(isinstance(value, str) for value in data.values()):
+            raise TypeError("compiler identity fields must be strings")
+        return cls(**data)
+
+    @classmethod
+    def current(cls) -> CompilerSpec:
+        return cls(
+            torch=torch.__version__,
+            triton_key=_current_triton_key(),
+            cuda_runtime=str(torch.version.cuda),
+        )
+
+    def mismatches(self, other: CompilerSpec) -> tuple[str, ...]:
+        return tuple(
+            f"{name}: profile={getattr(self, name)!r}, current={getattr(other, name)!r}"
+            for name in ("torch", "triton_key", "cuda_runtime")
+            if getattr(self, name) != getattr(other, name)
+        )
+
+
+def current_provenance(seed: int | None = None) -> dict[str, str]:
+    """Return reproducibility metadata that does not control profile matching."""
+
+    provenance = {
+        "driver": (
+            str(torch.cuda.driver_version())
+            if torch.cuda.is_available() and hasattr(torch.cuda, "driver_version")
+            else "unknown"
+        ),
+        "python": platform.python_version(),
+        "platform": f"{platform.system()}-{platform.machine()}",
+    }
+    if seed is not None:
+        provenance["seed"] = str(seed)
+    return provenance
 
 
 @dataclass(frozen=True)
@@ -300,6 +399,7 @@ class ProfileEntry:
     config: KernelConfig
     latency_ms: float
     validated: bool = True
+    validation: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.latency_ms) or self.latency_ms <= 0:
@@ -311,18 +411,24 @@ class ProfileEntry:
             "config": self.config.to_dict(),
             "latency_ms": self.latency_ms,
             "validated": self.validated,
+            "validation": dict(self.validation),
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> ProfileEntry:
         _require_exact_keys(
             data,
-            {"workload", "config", "latency_ms", "validated"},
+            {"workload", "config", "latency_ms", "validated", "validation"},
             set(),
             "profile entry",
         )
         if not isinstance(data["validated"], bool):
             raise TypeError("profile entry validated must be a boolean")
+        if not isinstance(data["validation"], dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in data["validation"].items()
+        ):
+            raise ValueError("profile validation metadata must map strings to strings")
         latency = data["latency_ms"]
         if isinstance(latency, bool) or not isinstance(latency, (int, float)):
             raise TypeError("profile entry latency_ms must be numeric")
@@ -331,14 +437,16 @@ class ProfileEntry:
             config=KernelConfig.from_dict(data["config"]),
             latency_ms=float(latency),
             validated=data["validated"],
+            validation=data["validation"],
         )
 
 
 @dataclass(frozen=True)
 class KernelProfile:
     hardware: HardwareSpec
+    compiler: CompilerSpec
     entries: tuple[ProfileEntry, ...]
-    environment: Mapping[str, str] = field(default_factory=dict)
+    provenance: Mapping[str, str] = field(default_factory=dict)
     format_version: int = PROFILE_FORMAT_VERSION
     kernel_version: str = KERNEL_PROFILE_VERSION
 
@@ -356,7 +464,8 @@ class KernelProfile:
             "format_version": self.format_version,
             "kernel_version": self.kernel_version,
             "hardware": self.hardware.to_dict(),
-            "environment": dict(self.environment),
+            "compiler": self.compiler.to_dict(),
+            "provenance": dict(self.provenance),
             "entries": [
                 entry.to_dict() for entry in sorted(self.entries, key=lambda item: item.workload)
             ],
@@ -364,17 +473,32 @@ class KernelProfile:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> KernelProfile:
+        format_version = data.get("format_version") if isinstance(data, Mapping) else None
+        if format_version != PROFILE_FORMAT_VERSION:
+            if format_version == 2:
+                raise ValueError(
+                    "profile format 2 lacks compiler and kernel-layout compatibility; "
+                    "regenerate it with the current tuner"
+                )
+            raise ValueError(f"unsupported profile format version: {format_version}")
         _require_exact_keys(
             data,
-            {"format_version", "kernel_version", "hardware", "environment", "entries"},
+            {
+                "format_version",
+                "kernel_version",
+                "hardware",
+                "compiler",
+                "provenance",
+                "entries",
+            },
             set(),
             "profile",
         )
-        if not isinstance(data["environment"], dict) or not all(
+        if not isinstance(data["provenance"], dict) or not all(
             isinstance(key, str) and isinstance(value, str)
-            for key, value in data["environment"].items()
+            for key, value in data["provenance"].items()
         ):
-            raise ValueError("profile environment must map strings to strings")
+            raise ValueError("profile provenance must map strings to strings")
         if not isinstance(data["entries"], list):
             raise TypeError("profile entries must be a JSON array")
         if isinstance(data["format_version"], bool) or not isinstance(data["format_version"], int):
@@ -385,7 +509,8 @@ class KernelProfile:
             format_version=data["format_version"],
             kernel_version=data["kernel_version"],
             hardware=HardwareSpec.from_dict(data["hardware"]),
-            environment=data["environment"],
+            compiler=CompilerSpec.from_dict(data["compiler"]),
+            provenance=data["provenance"],
             entries=tuple(ProfileEntry.from_dict(entry) for entry in data["entries"]),
         )
 
@@ -440,7 +565,16 @@ def default_user_profile_directory() -> Path:
 def _load_profile_directory(path: Path) -> list[KernelProfile]:
     if not path.is_dir():
         return []
-    return [load_profile(profile_path) for profile_path in sorted(path.glob("*.json"))]
+    profiles = []
+    for profile_path in sorted(path.glob("*.json")):
+        try:
+            profiles.append(load_profile(profile_path))
+        except (TypeError, ValueError) as error:
+            warnings.warn(
+                f"ignoring incompatible tuning profile {profile_path}: {error}",
+                stacklevel=2,
+            )
+    return profiles
 
 
 def load_bundled_profiles() -> tuple[KernelProfile, ...]:
@@ -498,33 +632,62 @@ class ProfileRegistry:
             profiles.extend(load_bundled_profiles())
         return cls(profiles)
 
-    def resolve(self, hardware: HardwareSpec, workload: WorkloadKey) -> KernelConfig | None:
+    def resolve(
+        self,
+        hardware: HardwareSpec,
+        compiler: CompilerSpec,
+        workload: WorkloadKey,
+    ) -> KernelConfig | None:
         for profile in self.profiles:
-            if not profile.hardware.matches(hardware):
+            if not profile.hardware.matches(hardware) or profile.compiler != compiler:
                 continue
             for entry in profile.entries:
                 if entry.validated and entry.workload == workload:
                     return entry.config
         return None
 
+    def explain_miss(
+        self,
+        hardware: HardwareSpec,
+        compiler: CompilerSpec,
+        workload: WorkloadKey,
+    ) -> str:
+        if not self.profiles:
+            return "no tuning profiles are available"
+        hardware_matches = [
+            profile for profile in self.profiles if profile.hardware.matches(hardware)
+        ]
+        if not hardware_matches:
+            return f"no profile matches GPU {hardware.name!r} {hardware.compute_capability}"
+        compiler_matches = [profile for profile in hardware_matches if profile.compiler == compiler]
+        if not compiler_matches:
+            details = "; ".join(hardware_matches[0].compiler.mismatches(compiler))
+            return f"profile compiler is incompatible ({details})"
+        return f"no validated profile entry matches workload {workload}"
+
 
 def merge_profile_entry(
     profile: KernelProfile | None,
     *,
     hardware: HardwareSpec,
+    compiler: CompilerSpec,
     entry: ProfileEntry,
-    environment: Mapping[str, str],
+    provenance: Mapping[str, str],
 ) -> KernelProfile:
     """Insert or replace one finite workload family while preserving others."""
 
     if profile is not None and not profile.hardware.matches(hardware):
         raise ValueError("cannot merge tuning results for different GPU models")
+    if profile is not None and profile.compiler != compiler:
+        details = "; ".join(profile.compiler.mismatches(compiler))
+        raise ValueError(f"cannot merge tuning results from different compilers ({details})")
     existing = {} if profile is None else {item.workload: item for item in profile.entries}
     existing[entry.workload] = entry
     return KernelProfile(
         hardware=hardware,
+        compiler=compiler,
         entries=tuple(existing.values()),
-        environment=dict(environment),
+        provenance=dict(provenance),
     )
 
 
@@ -534,6 +697,7 @@ __all__ = [
     "PROFILE_FORMAT_VERSION",
     "TUNING_BATCH_HEADS",
     "TUNING_SEQUENCE_LENGTHS",
+    "CompilerSpec",
     "HardwareSpec",
     "KernelConfig",
     "KernelProfile",
@@ -541,6 +705,7 @@ __all__ = [
     "ProfileEntry",
     "ProfileRegistry",
     "WorkloadKey",
+    "current_provenance",
     "default_user_profile_directory",
     "load_bundled_profiles",
     "load_profile",
