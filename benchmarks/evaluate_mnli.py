@@ -305,21 +305,33 @@ def evaluate_runs(
     model: torch.nn.Module,
     batches: list[DatasetBatch],
     *,
+    description: str,
     layout: str,
     runs: int,
 ) -> EvaluationResult:
     """Measure full passes from their first forward, with no warmup."""
 
+    from tqdm.auto import tqdm
+
     run_times_ms: list[float] = []
     first_logits: torch.Tensor | None = None
     for run in range(runs):
         logits: list[torch.Tensor] = []
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        for batch in batches:
-            logits.append(forward_model(model, batch.inputs, layout=layout).detach())
-        torch.cuda.synchronize()
-        run_times_ms.append((time.perf_counter() - started) * 1000.0)
+        progress = tqdm(
+            batches,
+            desc=f"{description} run {run + 1}/{runs}",
+            unit="batch",
+            dynamic_ncols=True,
+            mininterval=1.0,
+            miniters=max(1, len(batches) // 100),
+        )
+        with progress:
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            for batch in progress:
+                logits.append(forward_model(model, batch.inputs, layout=layout).detach())
+            torch.cuda.synchronize()
+            run_times_ms.append((time.perf_counter() - started) * 1000.0)
         print(f"  run {run + 1:02d}/{runs:02d}: {run_times_ms[-1]:.3f} ms", flush=True)
         if first_logits is None:
             first_logits = torch.cat(logits).float().cpu()
@@ -411,6 +423,7 @@ def main() -> None:
         results[variant] = evaluate_runs(
             model,
             batches,
+            description=variant.name,
             layout=execution_layout(variant),
             runs=args.runs,
         )

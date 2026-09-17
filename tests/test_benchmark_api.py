@@ -153,6 +153,7 @@ def test_mnli_evaluation_defaults_to_full_single_pass_matrix():
     assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
     assert args.layouts == ["padded", "packed"]
     assert args.split == "validation_matched"
+    assert args.batch_size == 8
     assert args.limit == 0
     assert args.runs == 1
     assert evaluation.requested_variants(args.implementations, args.layouts) == (

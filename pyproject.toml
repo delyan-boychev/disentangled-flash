@@ -27,6 +27,7 @@ benchmark = [
     "matplotlib>=3.9",
     "pandas>=2.2",
     "seaborn>=0.13",
+    "tqdm>=4.66",
 ]
 dev = [
     "pytest>=8",
