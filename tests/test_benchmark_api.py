@@ -167,6 +167,22 @@ def test_mnli_benchmark_supports_flashdeberta_internal_packed_path():
         benchmark.candidate_execution_layout("flashdeberta", "padded")
 
 
+def test_mnli_benchmark_exposes_strict_profile_only_mode():
+    spec = importlib.util.spec_from_file_location(
+        "parity_pretrained_mnli_profile_only",
+        MNLI_BENCHMARK_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    benchmark = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(benchmark)
+
+    args = benchmark.parse_args(["--tuning-mode", "profile_only", "--profile", "h200.json"])
+
+    assert args.tuning_mode == "profile_only"
+    assert args.profile == ["h200.json"]
+
+
 def test_mnli_packed_path_runs_classifier_without_padding_attention():
     spec = importlib.util.spec_from_file_location(
         "parity_pretrained_mnli_packed",
