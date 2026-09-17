@@ -1448,7 +1448,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lengths",
         type=parse_csv_ints,
-        default=[64, 128, 256, 512, 1024, 2048, 4098, 8192],
+        default=[64, 128, 256, 512, 1024, 2048, 4096, 8192],
     )
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--samples", type=int, default=10)

@@ -49,7 +49,7 @@ def test_cuda_benchmark_defaults_to_deberta_v3_base_matrix():
     assert args.scope == "encoder"
     assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
     assert args.layouts == ["padded", "packed"]
-    assert args.lengths == [64, 128, 256, 512, 1024, 2048, 4098, 8192]
+    assert args.lengths == [64, 128, 256, 512, 1024, 2048, 4096, 8192]
     assert args.hidden_size == 768
     assert args.num_attention_heads == 12
     assert args.num_hidden_layers == 12

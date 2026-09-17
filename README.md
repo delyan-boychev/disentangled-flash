@@ -95,8 +95,7 @@ python -m benchmarks.benchmark_cuda \
 ```
 
 It evaluates padded and packed execution at sequence lengths `64`, `128`, `256`,
-`512`, `1024`, `2048`, `4098`, and `8192`. The deliberately non-power-of-two
-`4098` case exercises the masked tail of the `8192` kernel family. The base
+`512`, `1024`, `2048`, `4096`, and `8192`. The base
 encoder has no external `cu_seqlens` interface, so its packed rows are reported
 as `UNSUPPORTED`, not silently substituted with padded execution. FlashDeBERTa
 automatically uses its native mask-driven internal varlen path and has no switch
