@@ -328,9 +328,10 @@ permit it.
 
 The report includes accuracy, full-dataset logit and probability errors, and
 the exact number of post-argmax classification mismatches against the Hugging
-Face reference. `full_parity` requires both tolerance-level logit parity and
-zero decision mismatches. Use `--require-full-parity` to make any mismatch
-produce a nonzero exit status.
+Face reference. `full_parity` means that all classification decisions match,
+regardless of small numerical differences in the logits. `logits_close` remains
+a separate tolerance-based numerical diagnostic. Use `--require-full-parity`
+to make any decision mismatch produce a nonzero exit status.
 
 To require the bundled H200 configuration and prohibit Triton autotuning:
 
