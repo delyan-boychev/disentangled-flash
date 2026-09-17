@@ -176,14 +176,7 @@ def test_mnli_benchmark_supports_flashdeberta_internal_packed_path():
 
 
 def test_mnli_benchmark_exposes_strict_profile_only_mode():
-    spec = importlib.util.spec_from_file_location(
-        "parity_pretrained_mnli_profile_only",
-        MNLI_BENCHMARK_PATH,
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    benchmark = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(benchmark)
+    benchmark = load_parity_module()
 
     args = benchmark.parse_args(["--tuning-mode", "profile_only", "--profile", "h200.json"])
 
