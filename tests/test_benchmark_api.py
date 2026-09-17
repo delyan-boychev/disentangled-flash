@@ -57,6 +57,17 @@ def test_cuda_benchmark_defaults_to_deberta_v3_base_matrix():
     assert args.vocab_size == 128100
 
 
+def test_cuda_benchmark_reports_only_real_layouts():
+    benchmark = load_benchmark_module()
+
+    assert benchmark.unsupported_layout_reason("base", "packed") is not None
+    assert benchmark.unsupported_layout_reason("flashdeberta", "padded") is not None
+    assert benchmark.unsupported_layout_reason("torch", "padded") is None
+    assert benchmark.unsupported_layout_reason("torch", "packed") is None
+    assert benchmark.unsupported_layout_reason("triton", "padded") is None
+    assert benchmark.unsupported_layout_reason("triton", "packed") is None
+
+
 def test_cuda_benchmark_uses_distinct_reproducible_input_batches():
     benchmark = load_benchmark_module()
     embedding = torch.arange(256, dtype=torch.float32).view(64, 4)

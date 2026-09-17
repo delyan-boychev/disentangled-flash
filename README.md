@@ -98,9 +98,13 @@ It evaluates padded and packed execution at sequence lengths `64`, `128`, `256`,
 `512`, `1024`, `2048`, `4098`, and `8192`. The deliberately non-power-of-two
 `4098` case exercises the masked tail of the `8192` kernel family. The base
 encoder has no external `cu_seqlens` interface, so its packed rows are reported
-as `UNSUPPORTED`, not silently substituted with padded execution. FlashDeBERTa's
-packed rows use its native mask-driven internal varlen path. DisentangledFlash's
-PyTorch and Triton packed rows use the explicit `forward_packed` interface.
+as `UNSUPPORTED`, not silently substituted with padded execution. FlashDeBERTa
+automatically uses its native mask-driven internal varlen path and has no switch
+for a distinct dense-padded FlashDeBERTa kernel, so that implementation is
+reported under packed and its padded rows are `UNSUPPORTED`. DisentangledFlash's
+PyTorch and Triton implementations are measured in both modes; their packed rows
+use the explicit `forward_packed` interface. Packed speedups use the matching
+base padded result as the reference.
 
 Warmup and measurement inputs never reuse tensor objects. Every iteration gets
 new deterministically generated token IDs, hidden states, sequence lengths, and

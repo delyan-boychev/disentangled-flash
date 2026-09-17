@@ -339,6 +339,17 @@ def parse_csv_ints(value: str) -> list[int]:
     return [int(item) for item in parse_csv(value)]
 
 
+def unsupported_layout_reason(implementation: str, layout: str) -> str | None:
+    if layout == "packed" and implementation in {"base", "original"}:
+        return "the base encoder has no external cu_seqlens packed interface"
+    if layout == "padded" and implementation == "flashdeberta":
+        return (
+            "FlashDeBERTa automatically uses its mask-driven internal varlen path; "
+            "it has no switch for a distinct dense padded FlashDeBERTa path"
+        )
+    return None
+
+
 def percentile(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     position = (len(ordered) - 1) * quantile
@@ -826,7 +837,8 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError(f"unknown dtype: {args.dtype}")
     if args.hidden_size != args.num_attention_heads * args.attention_head_size:
         raise ValueError("hidden_size must equal num_attention_heads * attention_head_size")
-    if args.layout == "packed" and args.implementation in {"base", "original"}:
+    unsupported_reason = unsupported_layout_reason(args.implementation, args.layout)
+    if unsupported_reason is not None:
         metadata = {
             "status": "completed",
             "implementation": args.implementation,
@@ -837,7 +849,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "execution": args.execution,
             "system": collect_system_details(),
         }
-        error = NotImplementedError("the base encoder has no external cu_seqlens packed interface")
+        error = NotImplementedError(unsupported_reason)
         results = [
             exception_result(
                 status="unsupported",
@@ -906,7 +918,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
             "external_cu_seqlens"
             if args.layout == "packed" and args.implementation in {"torch", "triton"}
             else "internal_mask_varlen"
-            if args.layout == "packed" and args.implementation == "flashdeberta"
+            if args.implementation == "flashdeberta"
             else "dense_masked"
         ),
         "assume_unpadded": (args.assume_unpadded and args.implementation == "triton"),
