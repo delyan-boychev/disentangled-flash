@@ -3,10 +3,10 @@
 Runs an official DeBERTa-v2 model fine-tuned on MNLI as:
   1. untouched Hugging Face reference
   2. one candidate implementation:
-       - triton / torch: same HF checkpoint with only the encoder replaced
-         by DisentangledFlash
+       - triton / torch: same checkpoint with only the encoder replaced by
+         DisentangledFlash
        - flashdeberta: FlashDeBERTa's sequence-classification class loaded from
-         the exact same pretrained checkpoint
+         the same pretrained checkpoint
 
 It compares:
   * task predictions
@@ -17,9 +17,9 @@ It compares:
 Tokenization and model loading are intentionally excluded from timing.
 
 Examples:
-    python benchmarks/parity_pretrained_mnli.py --backend triton
-    python benchmarks/parity_pretrained_mnli.py --backend flashdeberta
-    python benchmarks/parity_pretrained_mnli.py --backend triton --dtype fp32
+    python -m benchmarks.parity_pretrained_mnli --backend triton
+    python -m benchmarks.parity_pretrained_mnli --backend flashdeberta
+    python -m benchmarks.parity_pretrained_mnli --backend triton --dtype fp32
 """
 
 from __future__ import annotations
@@ -112,7 +112,8 @@ def enable_backend(
     fp32_precision: str,
     layout: str,
 ) -> None:
-    """Enable one prepared DisentangledFlash inference backend."""
+    """Enable one prepared inference backend; QKV fusion is unconditional."""
+
     enable_deberta_inference(
         backbone,
         backend=backend,
@@ -202,6 +203,8 @@ def benchmark_model(
 ) -> tuple[float, float, float]:
     """Return p50_ms, p90_ms, mean_ms for full model forward."""
 
+    # Important: benchmark exactly the production-like forward, without
+    # output_hidden_states so hidden-state collection does not distort latency.
     def forward_once() -> None:
         forward_model(
             model,
@@ -216,6 +219,7 @@ def benchmark_model(
     torch.cuda.synchronize()
 
     timings_ms: list[float] = []
+
     start_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
     end_events = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
 
@@ -251,6 +255,21 @@ def load_hf_model(
     return model.to(device=device).eval()
 
 
+def candidate_execution_layout(backend: str, layout: str) -> str:
+    """Map the reported layout to the candidate's public forward interface."""
+
+    if backend != "flashdeberta":
+        return layout
+    if layout != "packed":
+        raise ValueError(
+            "flashdeberta exposes only its mask-driven internal varlen path; use --layout packed"
+        )
+    # FlashDeBERTa consumes the regular padded tensors and attention mask, then
+    # performs its own internal varlen execution. It does not expose our
+    # explicit forward_packed/cu_seqlens interface.
+    return "padded"
+
+
 def load_candidate_model(
     model_name: str,
     *,
@@ -266,8 +285,8 @@ def load_candidate_model(
             from flashdeberta import FlashDebertaV2ForSequenceClassification
         except ImportError as exc:
             raise RuntimeError(
-                "flashdeberta backend requires FlashDeBERTa. Install it with: "
-                "pip install -U flashdeberta"
+                "flashdeberta backend requires FlashDeBERTa. Install the benchmark "
+                "dependencies with: pip install -e '.[benchmark,hf]'"
             ) from exc
 
         model = FlashDebertaV2ForSequenceClassification.from_pretrained(
@@ -276,13 +295,8 @@ def load_candidate_model(
         )
         return model.to(device=device).eval()
 
-    model = load_hf_model(
-        model_name,
-        device=device,
-        dtype=dtype,
-    )
-    base_model_prefix = model.base_model_prefix
-    backbone = getattr(model, base_model_prefix)
+    model = load_hf_model(model_name, device=device, dtype=dtype)
+    backbone = getattr(model, model.base_model_prefix)
     enable_backend(
         backbone,
         backend=backend,
@@ -307,10 +321,8 @@ def main() -> None:
         raise ValueError("--batch-size must be >= 1")
     if args.bucket < 1:
         raise ValueError("--bucket must be >= 1")
-    if args.backend == "flashdeberta" and args.layout == "packed":
-        raise ValueError(
-            "flashdeberta does not expose this benchmark's packed encoder API; use --layout padded"
-        )
+
+    execution_layout = candidate_execution_layout(args.backend, args.layout)
 
     device = torch.device("cuda")
     dtype = {
@@ -354,23 +366,31 @@ def main() -> None:
 
     batch_size = inputs["input_ids"].size(0)
 
+    # ------------------------------------------------------------------
+    # Untouched Hugging Face reference.
+    # ------------------------------------------------------------------
     print("Loading / running Hugging Face reference...")
     reference = load_hf_model(args.model, device=device, dtype=dtype)
 
     id2label = {int(index): label for index, label in reference.config.id2label.items()}
 
     reference_logits, reference_hidden = run_model(reference, inputs)
+
     reference_p50, reference_p90, reference_mean = benchmark_model(
         reference,
         inputs,
         warmup=args.warmup,
         iterations=args.iterations,
     )
+
     reference_probs = reference_logits.softmax(dim=-1)
 
     del reference
     torch.cuda.empty_cache()
 
+    # ------------------------------------------------------------------
+    # Same checkpoint through the selected candidate implementation.
+    # ------------------------------------------------------------------
     print(f"Loading / running {args.backend} candidate...")
     candidate = load_candidate_model(
         args.model,
@@ -382,16 +402,21 @@ def main() -> None:
         dtype=dtype,
     )
 
-    candidate_logits, candidate_hidden = run_model(candidate, inputs, layout=args.layout)
+    candidate_logits, candidate_hidden = run_model(candidate, inputs, layout=execution_layout)
+
     candidate_p50, candidate_p90, candidate_mean = benchmark_model(
         candidate,
         inputs,
         warmup=args.warmup,
         iterations=args.iterations,
-        layout=args.layout,
+        layout=execution_layout,
     )
+
     candidate_probs = candidate_logits.softmax(dim=-1)
 
+    # ------------------------------------------------------------------
+    # Task-level parity.
+    # ------------------------------------------------------------------
     logit_error = (reference_logits - candidate_logits).abs()
     prob_error = (reference_probs - candidate_probs).abs()
     hidden_error = (reference_hidden - candidate_hidden).abs()
@@ -426,7 +451,7 @@ def main() -> None:
         print(f"  premise:    {premise}")
         print(f"  hypothesis: {hypothesis}")
         print(f"  reference:  {ref_label:<14} p={ref_conf:.8f}")
-        print(f"  {args.backend:<12}: {cand_label:<14} p={cand_conf:.8f}")
+        print(f"  {args.backend:<10}: {cand_label:<14} p={cand_conf:.8f}")
         print(f"  max logit delta: {float(logit_error[index].max()):.8g}")
         print(f"  max prob delta:  {float(prob_error[index].max()):.8g}")
 
@@ -442,6 +467,9 @@ def main() -> None:
     print(f"hidden max abs error:        {float(hidden_error.max()):.8g}")
     print(f"hidden mean abs error:       {float(hidden_error.mean()):.8g}")
 
+    # ------------------------------------------------------------------
+    # Full-task speed.
+    # ------------------------------------------------------------------
     reference_eps = batch_size / (reference_p50 / 1000.0)
     candidate_eps = batch_size / (candidate_p50 / 1000.0)
 
@@ -452,14 +480,15 @@ def main() -> None:
     print("=" * 92)
 
     print(
-        f"{'reference':<14} "
+        f"{'reference':<12} "
         f"p50={reference_p50:>9.3f} ms  "
         f"p90={reference_p90:>9.3f} ms  "
         f"mean={reference_mean:>9.3f} ms  "
         f"throughput={reference_eps:>10.2f} examples/s"
     )
+
     print(
-        f"{args.backend:<14} "
+        f"{args.backend:<12} "
         f"p50={candidate_p50:>9.3f} ms  "
         f"p90={candidate_p90:>9.3f} ms  "
         f"mean={candidate_mean:>9.3f} ms  "

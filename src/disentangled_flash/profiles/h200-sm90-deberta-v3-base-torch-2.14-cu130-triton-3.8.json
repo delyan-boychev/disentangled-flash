@@ -1,0 +1,2948 @@
+{
+  "format_version": 3,
+  "kernel_version": "deberta-attention-forward-runtime-length-v3",
+  "hardware": {
+    "backend": "cuda",
+    "name": "NVIDIA H200",
+    "compute_capability": [
+      9,
+      0
+    ]
+  },
+  "compiler": {
+    "torch": "2.14.0+cu130",
+    "triton_key": "3.8.058b25352786ff1d04468ce113f1986063da0b78640428046a28c8ede4c9126ac-e7b75e513fb868674fd2adc660c6527e4ad9e74f01120d8e2b1ad243329a0c92-28ff26b7e752df455c410418d72fd0afc5b3bfa952ca4bca95b1cfd5a31a0e2f-23d635e690d670bf61798e1259674b78c0ed5ba222ab6a455f329f27a758fc2d-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-a39587ad88b66ea78116454125470474c2a5cd783f9d0ab81d607820596004d2-24b908043301e5dfcdbc4cdb17b9b7313e650cdfd4098b2ebfb998af8994be4e-c5d3403b88b5bb728f8ac78c55163198e418430f126c842892c68cb4b6baaa78-3aaa775f592533d06c13c99c23bd117430b1e7c732c2ae64c571d84d01ad2c39-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-e898d9a654e9e51aecb43b263fe61102f7162375c4275307fd1830d18b814eb8-966a8105ff35077006b103266c3d8d292a56ad096a2d0dd6833027efb4bd1d50-74583a50ee248185462dd3e9a8c60b56cd9d45c57d08ffc3fe0d39e73119e97e-b4966729f21f0db6f20fa4cb9b2b5402c5735e1424ffba05dbd8f480dedee790-5d15c5bebef8d7aa51b21fd187e5faa95eba4a213254355bc69e0648013599f7-30106ed84518c6ca7aca08e2c0ee188755f512cc0cb2d7da8914cc48c1ad6dcc-adb54e71d0ffc3bdac437fbc97929769fbbe4ebd03e6361c6357f2a24f7c5954-27b2a5d1e8db008bacefe6019f63922bbd65926de90bb1b527ee597477d2f365-a610dc5c215589aab7a784e1c07acef3e16d53ef00f08de793899964956f4e2a-ebad24d351bb79b3068a60627c74372a07cb8cc9532ce106773402ad2515a2b4-0731cda9ecbdd902acab13604efda0f9dbeaf411bc42bdddff8454b69a62f54b-2c66ab6523cc7dcd8bdc3e68b8f8844657d7bd4fd0492774c9819b046b8f7674-f60c2bb2d8eebe1c191f4b8b819844414dd1bce243645635a094f9f92665a58e-08abee21ce6230a873ed0831f70f9570b7ce39969dbf9b2f28ae1a1992ee1cc7-1a7ae2a0c3de32df60ffc18f21a20f8dcf8bf3bc8cb018bb269b540533868829-0d99c1f30bdb86bd718c98bf026ced2a84a878f79630fa9b3fe099ce46e86ebd-113296c74fb8b8dcf67a1b82f71926842eb66d0c77fe2c4f8d0f315715a38fd4-18ba36f0d8827d4807c631a2b92f9615eb56c8aa7f914964a0bb6f2ba69f344d",
+    "cuda_runtime": "13.0"
+  },
+  "provenance": {
+    "driver": "unknown",
+    "python": "3.12.14",
+    "platform": "Linux-x86_64",
+    "seed": "0",
+    "preset": "standard",
+    "layouts": "padded,packed",
+    "warmup": "10",
+    "repetitions": "50",
+    "tie_margin": "0.02",
+    "candidate_sha256": "12c56f2ba3a9c5423448731201f5c2b4b4cc8fd8924f1797c6b504a9f7c6dd1a",
+    "generated_at": "2026-09-17T17:15:17.888191+00:00"
+  },
+  "entries": [
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.0504320003092289,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.050863999873399734,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.052000001072883606,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05652800016105175,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05111999996006489,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.051551999524235725,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.051631998270750046,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 32,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.052480001002550125,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.0520160011947155,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05092800036072731,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05385600030422211,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 64,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 128,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.053008001297712326,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05110400170087814,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.052719999104738235,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 32,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05268799886107445,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05180799961090088,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05307199992239475,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05278399959206581,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.051343999803066254,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 32,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05504000000655651,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.05411199852824211,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.061503998935222626,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.06524799764156342,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 128,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 384,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 32,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.06120000034570694,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.07097599655389786,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.07620799914002419,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.08022399991750717,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.07228799909353256,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.07823999971151352,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.07787199690937996,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.0904959999024868,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.12484799697995186,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 16,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.11849600076675415,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.16022400557994843,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.19051200151443481,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 384,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.18347200006246567,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.08862399682402611,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.10326400026679039,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.09299200028181076,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.0878399983048439,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.09343999996781349,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.09046400338411331,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.11607999727129936,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.11673600226640701,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.1361439973115921,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.2385760024189949,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.31115199625492096,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 512,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.30158400535583496,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.14211200177669525,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.17935999482870102,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.19624000042676926,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.14088000357151031,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.18425600230693817,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.1852639988064766,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.18622399866580963,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.22990399599075317,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.24588799476623535,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.4519519954919815,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.6221120059490204,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 768,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 16,
+        "block_n": 32,
+        "num_warps": 2,
+        "num_stages": 1
+      },
+      "latency_ms": 0.6074720025062561,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.21424000710248947,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.22431999444961548,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.24774399399757385,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.2149759978055954,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.22961600124835968,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.23387199640274048,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.28438401222229004,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.31811198592185974,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.3590880036354065,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.7242240011692047,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 1.0395519733428955,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 1024,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 1.0295199751853943,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.6447839736938477,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.7616160213947296,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.8410879969596863,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.6530559957027435,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.7719519734382629,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.7930079996585846,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 0.9127520024776459,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 1.1515679955482483,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 1.1899679899215698,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 2.405791997909546,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 3.8783199787139893,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 2048,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 3.8951680660247803,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 2.3447359800338745,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 2.867263913154602,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 3.1967040300369263,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 2.399168014526367,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 2.916848063468933,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 3.0261119604110718,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 3.4549440145492554,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 4.522320032119751,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 4.648591995239258,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 8.890688419342041,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 15.111552238464355,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 4096,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 15.22547197341919,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 8.96558427810669,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 11.205087661743164,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "bfloat16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 12.520415782928467,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 9.228031635284424,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 11.425343990325928,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float16",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 11.907055854797363,
+      "validated": true,
+      "validation": {
+        "rtol": "0.02",
+        "atol": "0.02",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 13.459007740020752,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 17.962271690368652,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "fast",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 18.4609432220459,
+      "validated": true,
+      "validation": {
+        "rtol": "0.005",
+        "atol": "0.005",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "packed",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 64,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 34.075822830200195,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "mixed_lengths,reversed_boundaries"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": false
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 58.84422492980957,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "dense_unmasked"
+      }
+    },
+    {
+      "workload": {
+        "length_regime": 8192,
+        "head_dim": 64,
+        "occupancy_regime": 32,
+        "slot_regime": 512,
+        "dtype": "float32",
+        "has_c2p": true,
+        "has_p2c": true,
+        "fp32_precision": "strict",
+        "layout": "padded",
+        "uses_padding_mask": true
+      },
+      "config": {
+        "block_m": 32,
+        "block_n": 64,
+        "num_warps": 4,
+        "num_stages": 1
+      },
+      "latency_ms": 60.31790351867676,
+      "validated": true,
+      "validation": {
+        "rtol": "0.0002",
+        "atol": "0.0002",
+        "patterns": "full,partial,one_token,fully_masked"
+      }
+    }
+  ]
+}

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -161,6 +162,17 @@ def test_mnli_benchmark_defaults_to_packed_layout():
 
     assert benchmark.parse_args([]).layout == "packed"
     assert benchmark.parse_args(["--layout", "padded"]).layout == "padded"
+
+
+def test_mnli_benchmark_supports_flashdeberta_internal_packed_path():
+    benchmark = load_parity_module()
+
+    args = benchmark.parse_args(["--backend", "flashdeberta"])
+
+    assert args.layout == "packed"
+    assert benchmark.candidate_execution_layout(args.backend, args.layout) == "padded"
+    with pytest.raises(ValueError, match="mask-driven internal varlen"):
+        benchmark.candidate_execution_layout("flashdeberta", "padded")
 
 
 def test_mnli_packed_path_runs_classifier_without_padding_attention():

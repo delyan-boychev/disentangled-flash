@@ -11,4 +11,7 @@ venv/
 *.json
 benchmarks/results/*
 !benchmarks/results/.gitkeep
+!benchmarks/results/h200_deberta_v3_base/
+!benchmarks/results/h200_deberta_v3_base/*.png
+!src/disentangled_flash/profiles/*.json
 .DS_Store
