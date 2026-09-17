@@ -6,12 +6,9 @@
 
 ***Fast exact DeBERTa-style disentangled attention in Triton.***
 
-DisentangledFlash is an inference-oriented implementation of bidirectional
-DeBERTa-v2/v3 disentangled self-attention. 
-
-The Triton kernel is inspired by [FlashAttention](https://github.com/Dao-AILab/flash-attention)'s tiling, IO-aware computations, and online softmax without memory materialization, while its relative position encoding implementation is inspired by [FlexAttention](https://pytorch.org/blog/flexattention/). It fuses QK, relative-score lookup, factorized padding-mask application, online softmax, and PV without materializing a `[B, H, L, L]` attention tensor. C2P/P2C projection score GEMMs remain regular PyTorch GEMMs over the pruned active relative-position slots.
-
-The PyTorch-optimized (`torch`) backend is constructed by optimizing operations, employing smart caching techniques, and leveraging fused QKV projection.
+DisentangledFlash provides fused Triton and optimized PyTorch inference backends
+for bidirectional DeBERTa-v2/v3 attention without materializing the
+`[B, H, L, L]` attention matrix.
 
 
 ## Status
@@ -29,20 +26,13 @@ The PyTorch-optimized (`torch`) backend is constructed by optimizing operations,
 Training/backward is not implemented. CPU/MPS use the PyTorch backend
 for development/benchmarking, not the Triton kernel.
 
-While currently tailored to DeBERTa-v2/v3, the kernel and caching abstractions are designed to be extensible to other architectures requiring factorized relative-position or disentangled attention schemes in the future.
-
 > [!IMPORTANT]
-> **GPU compatibility**: The Triton kernel has been validated on NVIDIA RTX
+> The Triton kernel has been validated on NVIDIA RTX
 > 6000 Ada (SM 8.9) and NVIDIA H200 (SM 9.0). A reviewed H200 profile for the
-> exact compiler stack documented below ships in the package. Other GPUs and
-> compiler stacks remain supported through bounded autotuning, but should be
-> calibrated and validated locally before performance-critical deployment.
-> Additional benchmark results and reviewed profiles are welcome.
+> documented compiler stack ships in the package. Other GPUs and stacks use
+> bounded autotuning and should be validated locally.
 
 ## Install
-
-Use a PyTorch build appropriate for your CUDA environment, then install this
-repository editable while developing:
 
 ```bash
 pip install -e ".[dev]"
@@ -53,9 +43,6 @@ For the pretrained GLUE/MNLI evaluation:
 ```bash
 pip install -e ".[dev,benchmark,hf]"
 ```
-
-`sentencepiece` and `protobuf` are included in the `hf` extra because the
-DeBERTa-v2 tokenizer uses a SentencePiece `spm.model`.
 
 ## Hugging Face usage
 
@@ -75,73 +62,27 @@ optimize_deberta(
 )
 ```
 
-`optimize_deberta()` replaces only the DeBERTa encoder attention path. The
-existing layer output, residual, FFN, convolution, classifier, and checkpoint
-parameter names are preserved.
-
-For lower-level experiments, `enable_deberta_inference(..., backend="torch")`
-selects the PyTorch backend instead of Triton.
+Only the encoder attention path is replaced; checkpoint names and the remaining
+model layers are preserved. Use `enable_deberta_inference(..., backend="torch")`
+to select the PyTorch backend.
 
 ## CUDA benchmark
-
-Install the optional comparison backend before running the complete matrix:
 
 ```bash
 pip install -e ".[benchmark]"
 ```
-
-The default benchmark is a full 12-layer `microsoft/deberta-v3-base`-architecture
-encoder comparison across the base implementation, DisentangledFlash's PyTorch
-and Triton implementations, and FlashDeBERTa:
 
 ```bash
 python -m benchmarks.benchmark_cuda \
   --output deberta_v3_base_encoder_cuda_results.json
 ```
 
-It evaluates padded and packed execution at sequence lengths `64`, `128`, `256`,
-`512`, `1024`, `2048`, `4096`, and `8192`. The base
-encoder has no external `cu_seqlens` interface, so its packed rows are reported
-as `UNSUPPORTED`, not silently substituted with padded execution. FlashDeBERTa
-automatically uses its native mask-driven internal varlen path and has no switch
-for a distinct dense-padded FlashDeBERTa kernel, so that implementation is
-reported under packed and its padded rows are `UNSUPPORTED`. DisentangledFlash's
-PyTorch and Triton implementations are measured in both modes; their packed rows
-use the explicit `forward_packed` interface. Packed speedups use the matching
-base padded result as the reference.
+The default matrix compares the full DeBERTa-v3-base encoder across Hugging
+Face, DF PyTorch, DF Triton, and FlashDeBERTa at lengths 64–8192 in padded and
+packed modes. It uses fresh deterministic inputs, records OOMs without stopping,
+and saves hardware, software, Slurm, git, command, and environment metadata.
 
-Warmup and measurement inputs never reuse tensor objects. Every iteration gets
-new deterministically generated token IDs, hidden states, sequence lengths, and
-masks; warmup and measurement use separate seed ranges. The same seeded samples
-are shared across implementations and layouts so comparisons remain fair.
-Masks use the integer dtype produced by Hugging Face tokenizers, including for
-FlashDeBERTa's convolution path. Numerical parity is run outside timing with one
-fresh sample at batch size 1 by default, avoiding a quadratic dense-reference
-allocation proportional to a large performance batch. Both values are recorded
-and can be changed with `--parity-samples` and `--parity-batch-size`.
-
-CUDA out-of-memory conditions are capacity results, not benchmark failures. An
-OOM row records the implementation, dtype, execution mode, layout, batch size,
-sequence length, failure stage, exception type, and message, then the benchmark
-clears the CUDA cache and continues. This is expected for the quadratic base
-encoder at sufficiently long sequences. Non-OOM exceptions are recorded as
-errors and make the parent command exit unsuccessfully after saving all results.
-
-The JSON report includes a reproducibility snapshot with:
-
-- OS, kernel, machine architecture, Python executable and version
-- CPU model, host core counts, process CPU affinity, and PyTorch thread counts
-- total and available host RAM plus cgroup CPU/memory limits
-- Slurm job, node, task, CPU, memory, and GPU allocation fields when present
-- every visible GPU's model, UUID, PCI address, compute capability, VRAM,
-  multiprocessor count, clock limits, power limit, driver, and NVIDIA topology
-- PyTorch CUDA build, cuDNN, PyTorch, Triton, Transformers, FlashDeBERTa, and
-  DisentangledFlash versions
-- git commit, branch, and dirty-worktree flag
-- the full command, requested model matrix, and a safe allowlist of relevant
-  CUDA/Triton/tuning environment variables
-
-Generate report-ready latency and memory figures from the JSON output with:
+Generate latency and memory plots with:
 
 ```bash
 python -m benchmarks.plot_cuda_results \
@@ -149,56 +90,19 @@ python -m benchmarks.plot_cuda_results \
   --output-dir benchmarks/results/deberta_v3_base_encoder
 ```
 
-This writes four latency figures and four peak-allocated-memory figures, one for
-each measured batch size. Every figure has separate FP16, BF16, and FP32 panels
-and shows padded and packed curves together. Latency uses the recorded sample
-mean (`mean_ms`); memory is the total peak CUDA allocation in GiB. Expected OOM
-points are annotated and omitted from the curves, while unsupported backend and
-layout combinations are not presented as measurements. PNG and vector PDF are
-produced by default.
-
-Attention-only experiments remain available explicitly (FlashDeBERTa is an
-encoder implementation):
-
-```bash
-python -m benchmarks.benchmark_cuda \
-  --scope attention \
-  --implementations base,torch,triton \
-  --layouts padded
-```
-
-To run a smaller encoder subset, override any matrix dimension:
-
-```bash
-python -m benchmarks.benchmark_cuda \
-  --implementations base,triton,flashdeberta \
-  --layouts padded,packed \
-  --dtypes fp16 \
-  --executions eager \
-  --batches 1,8 \
-  --lengths 64,512,2048,8192
-```
-
 ### Kernel tuning profiles
 
-The Triton backend uses a validated saved configuration when one exactly
-matches the GPU, compiler stack, kernel layout, and workload. Otherwise it
-safely falls back to Triton autotuning on first use. You can override that
-policy explicitly:
+Matching saved profiles are used automatically; otherwise Triton runs bounded
+autotuning on first use. Override this with:
 
 ```python
 from disentangled_flash import KernelConfig, KernelTuningOptions, optimize_deberta
 
-# Always retune, even when a bundled or personal profile matches.
 optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))
-
-# Use a personal profile before the bundled profiles.
 optimize_deberta(
     model,
     tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
 )
-
-# Advanced: bypass profiles and autotuning with one explicit configuration.
 optimize_deberta(
     model,
     tuning=KernelTuningOptions(
@@ -208,26 +112,10 @@ optimize_deberta(
 )
 ```
 
-Personal profiles placed in
-`$XDG_CACHE_HOME/disentangled_flash/profiles` (or
-`~/.cache/disentangled_flash/profiles`) are discovered automatically. Set
-`DISENTANGLED_FLASH_PROFILE_DIR` to use another directory. Explicit profile
-paths take precedence, followed by the user directory and bundled profiles.
-Installed package files are never modified.
-
-Profiles are compatible only with the exact GPU model, compute capability,
-kernel version, PyTorch version, Triton compiler key, and PyTorch CUDA runtime
-that produced them. The NVIDIA driver is recorded as diagnostic provenance but
-does not invalidate a profile. In `auto` mode an incompatible profile is
-ignored and bounded autotuning runs for workloads that are actually encountered;
-`profile_only` instead reports the exact incompatibility.
-
-The Triton autotuner specializes only on the finite length regime, head
-dimension, dtype/FP32 policy, relative-attention mode, and padding-mask mode.
-Exact sequence length, batch size, head count, and active-slot count are runtime
-scalars and are excluded from the autotune key. Consequently, changing 384 to
-383 does not trigger another benchmark sweep. Use `fixed` to bypass autotuning
-entirely; `profile_only` reports a missing finite-family profile.
+Profiles are discovered in the user cache, `DISENTANGLED_FLASH_PROFILE_DIR`, and
+the package. Compatibility is keyed by GPU/compiler stack and workload; the
+driver is diagnostic only. Exact length, batch size, head count, and active-slot
+count are runtime values rather than autotune keys.
 
 Generate a resumable profile on a CUDA machine with:
 
@@ -237,56 +125,20 @@ python -m disentangled_flash.tune \
   --output rtx-6000-ada.json
 ```
 
-Inspect compatibility with the current environment using:
-
 ```bash
 python -m disentangled_flash.tune inspect rtx-6000-ada.json
 ```
 
-Saved profiles use nine bounded sequence-length families: `64`, `128`, `384`,
-`512`, `768`, `1024`, `2048`, `4096`, and `8192`, plus occupancy families `8` and `32` batch-head
-programs. Runtime lengths select the next family (for example, 383 uses the 384
-profile). The exact length remains runtime data used for the launch grid, loop
-bounds, and partial-tile masks. Relative-position LUTs are prepared at the
-family size and indexed with a family offset, so they are reusable by every
-shorter exact length in that family. Triton inputs and custom tuning sweeps are
-currently capped at 8192.
-
-This compiler-safe contract uses profile format 3. Format-2 profiles lack the
-compiler fingerprint and packed-versus-padded workload identity, so they are
-intentionally rejected and should be regenerated.
-
-`quick` checks one representative workload. `standard` covers every bounded
-length family, supported head dimension and dtype, both occupancy regimes, and
-all relative-attention modes. It tunes separate winners for masked padded,
-unmasked dense, and mixed-length packed execution. Use `--layouts` and the
-other CLI options to narrow a custom run. Every accepted result is checked
-against a chunked PyTorch reference with multiple mask or packed-boundary
-patterns, and the output is saved after each workload so an interrupted run can
-resume.
-
-The original backend remains unfused and acts as the reference baseline. The
-PyTorch and Triton backends always use one packed QKV projection.
+The `standard` preset covers length families `64`, `128`, `384`, `512`, `768`,
+`1024`, `2048`, `4096`, and `8192`, supported dtypes, attention modes, occupancy
+regimes, and padded/packed layouts. Results are parity-checked and saved after
+each workload so tuning can resume.
 
 ### Packed unpadded inference
 
-Attention modules and optimized encoders accept a FlashAttention-style packed
-token layout through `forward_packed(hidden_states, cu_seqlens, max_seqlen)`.
-`hidden_states` has shape `[total_tokens, hidden_size]`; `cu_seqlens` is a
-contiguous int32/int64 tensor containing cumulative sequence boundaries. No
-dense padded batch or cross-sequence attention matrix is constructed. The
-Triton projects QKV once for the complete token buffer and dispatches one
-attention grid across every sequence/head tile. Each program reads its runtime
-boundaries from `cu_seqlens`, so tokens cannot attend across sequences and no
-dense padded batch is created. The PyTorch backend retains a segmented reference
-implementation for portability and validation.
-
-Use `pack_padded` and `unpack_packed` to convert right-padded tensors at an API
-boundary. Empty sequences and non-right-padded masks are rejected explicitly.
-When both conversion directions are needed, `pack_padded_with_info` returns a
-validated `PackedSequenceInfo` that can be passed as `packed_info` to
-`forward_packed` and `unpack_packed`. The encoder reuses this host metadata in
-every layer, avoiding repeated device synchronization:
+`forward_packed(hidden_states, cu_seqlens, max_seqlen)` accepts
+FlashAttention-style `[total_tokens, hidden_size]` input. Convert right-padded
+input with `pack_padded_with_info` and reuse its metadata across encoder layers:
 
 ```python
 from disentangled_flash import pack_padded_with_info, unpack_packed
@@ -308,30 +160,13 @@ output, _ = unpack_packed(
 
 ## Pretrained GLUE/MNLI evaluation
 
-The evaluator loads the real GLUE/MNLI matched validation split and
-`microsoft/deberta-v2-xlarge-mnli`. By default it runs the untouched Hugging
-Face model, both padded and packed DisentangledFlash PyTorch paths, both padded
-and packed Triton paths, and FlashDeBERTa's internal packed path.
-
 ```bash
 python -m benchmarks.evaluate_mnli
 ```
 
-The default is one complete measured dataset pass at batch size 8 with no
-warmup. A throttled progress bar reports completed batches for each
-implementation and run. Every dataset row is processed exactly once; the final
-partial batch is not filled by repeating examples. Dataset download, batched
-tokenization, model loading, and the single host-to-device transfer are
-completed before timing. The first model forward and any first-use compilation
-are therefore included. Use `--batch-size 16` when the model and GPU memory
-permit it.
-
-The report includes accuracy, full-dataset logit and probability errors, and
-the exact number of post-argmax classification mismatches against the Hugging
-Face reference. `full_parity` means that all classification decisions match,
-regardless of small numerical differences in the logits. `logits_close` remains
-a separate tolerance-based numerical diagnostic. Use `--require-full-parity`
-to make any decision mismatch produce a nonzero exit status.
+This runs one cold, full GLUE/MNLI matched-validation pass at batch size 8 across
+Hugging Face, DF PyTorch, DF Triton, and FlashDeBERTa. It reports performance,
+accuracy, numerical error, and classification-decision parity.
 
 To require the bundled H200 configuration and prohibit Triton autotuning:
 
@@ -341,33 +176,13 @@ python -m benchmarks.evaluate_mnli \
   --profile src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json
 ```
 
-Use `--runs N` for deliberate repeated full-dataset passes, `--limit N` for a
-smaller non-repeating subset, or `--split validation_mismatched` for the other
-MNLI validation split.
-
-## Hostile CUDA validation
+## CUDA validation
 
 ```bash
 python -m validation.validate_cuda
 ```
 
-The validation matrix covers FP16/BF16/FP32, boundary sequence lengths, several
-padding patterns, and C2P/P2C position modes while reporting raw max/mean errors.
-
-> [!NOTE]
-> **Test Coverage**: CPU tests cover the public inference API, packed conversion,
-> bounded tuning/profile dispatch, and launch contracts. CUDA correctness and
-> performance should still be validated on every supported GPU family before
-> publishing a bundled tuning profile.
-
-## GPU calibration
-
-The bounded families prevent retuning for every exact sequence length, but a
-missing hardware/workload family still evaluates the configured candidate set
-once. Offline calibration per GPU family can pre-select those configurations and
-remove that first-use benchmarking cost.
-
-Do not treat the current candidate table as a universal final table for every GPU.
+Run this before publishing a profile for a new GPU or compiler stack.
 
 
 ## Results: H200 DeBERTa-v3-base encoder
