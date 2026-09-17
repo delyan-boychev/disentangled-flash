@@ -175,6 +175,13 @@ def test_mnli_evaluation_rows_are_never_repeated_to_fill_a_batch():
     assert [index for start, end in ranges for index in range(start, end)] == list(range(10))
 
 
+def test_mnli_full_parity_means_no_decision_mismatches():
+    evaluation = load_mnli_evaluation_module()
+
+    assert evaluation.has_full_parity(0)
+    assert not evaluation.has_full_parity(1)
+
+
 def test_mnli_evaluation_exposes_strict_profile_only_mode():
     evaluation = load_mnli_evaluation_module()
 

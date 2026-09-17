@@ -352,6 +352,12 @@ def percentile(values: list[float], q: float) -> float:
     return ordered[lower] * (1.0 - fraction) + ordered[upper] * fraction
 
 
+def has_full_parity(decision_mismatches: int) -> bool:
+    """Return whether every classification decision matches the reference."""
+
+    return decision_mismatches == 0
+
+
 def print_performance(name: str, result: EvaluationResult, *, examples: int) -> None:
     times = list(result.run_times_ms)
     mean_ms = statistics.mean(times)
@@ -448,8 +454,7 @@ def main() -> None:
         logit_error = (result.logits - base.logits).abs()
         probability_error = (result.logits.softmax(dim=-1) - base_probabilities).abs()
         logits_close = torch.allclose(result.logits, base.logits, atol=atol, rtol=rtol)
-        decision_parity = mismatches == 0
-        full_parity = logits_close and decision_parity
+        full_parity = has_full_parity(mismatches)
 
         print_performance(variant.name, result, examples=examples)
         print(
