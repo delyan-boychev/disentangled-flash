@@ -1,8 +1,12 @@
-"""Task-level parity + speed smoke test for the Triton DeBERTa-v2/v3 encoder.
+"""Task-level parity + speed smoke test for pretrained DeBERTa-v2/v3 MNLI.
 
-Runs an official DeBERTa-v2 model fine-tuned on MNLI twice:
+Runs an official DeBERTa-v2 model fine-tuned on MNLI as:
   1. untouched Hugging Face reference
-  2. same checkpoint with only the DeBERTa encoder replaced by our inference backend
+  2. one candidate implementation:
+       - triton / torch: same checkpoint with only the encoder replaced by
+         DisentangledFlash
+       - flashdeberta: FlashDeBERTa's sequence-classification class loaded from
+         the same pretrained checkpoint
 
 It compares:
   * task predictions
@@ -12,13 +16,10 @@ It compares:
 
 Tokenization and model loading are intentionally excluded from timing.
 
-Example:
-    python parity_pretrained_mnli.py
-
-Optional:
-    python parity_pretrained_mnli.py --dtype fp32
-    python parity_pretrained_mnli.py --backend torch
-    python parity_pretrained_mnli.py --warmup 20 --iterations 100
+Examples:
+    python -m benchmarks.parity_pretrained_mnli --backend triton
+    python -m benchmarks.parity_pretrained_mnli --backend flashdeberta
+    python -m benchmarks.parity_pretrained_mnli --backend triton --dtype fp32
 """
 
 from __future__ import annotations
@@ -59,8 +60,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--backend",
-        choices=("triton", "torch"),
+        choices=("triton", "torch", "flashdeberta"),
         default="triton",
+        help="Candidate implementation compared against untouched Hugging Face.",
     )
     parser.add_argument(
         "--layout",
@@ -238,7 +240,7 @@ def benchmark_model(
     )
 
 
-def load_model(
+def load_hf_model(
     model_name: str,
     *,
     device: torch.device,
@@ -253,6 +255,58 @@ def load_model(
     return model.to(device=device).eval()
 
 
+def candidate_execution_layout(backend: str, layout: str) -> str:
+    """Map the reported layout to the candidate's public forward interface."""
+
+    if backend != "flashdeberta":
+        return layout
+    if layout != "packed":
+        raise ValueError(
+            "flashdeberta exposes only its mask-driven internal varlen path; use --layout packed"
+        )
+    # FlashDeBERTa consumes the regular padded tensors and attention mask, then
+    # performs its own internal varlen execution. It does not expose our
+    # explicit forward_packed/cu_seqlens interface.
+    return "padded"
+
+
+def load_candidate_model(
+    model_name: str,
+    *,
+    backend: str,
+    bucket: int,
+    fp32_precision: str,
+    layout: str,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.nn.Module:
+    if backend == "flashdeberta":
+        try:
+            from flashdeberta import FlashDebertaV2ForSequenceClassification
+        except ImportError as exc:
+            raise RuntimeError(
+                "flashdeberta backend requires FlashDeBERTa. Install the benchmark "
+                "dependencies with: pip install -e '.[benchmark,hf]'"
+            ) from exc
+
+        model = FlashDebertaV2ForSequenceClassification.from_pretrained(
+            model_name,
+            torch_dtype=dtype,
+        )
+        return model.to(device=device).eval()
+
+    model = load_hf_model(model_name, device=device, dtype=dtype)
+    backbone = getattr(model, model.base_model_prefix)
+    enable_backend(
+        backbone,
+        backend=backend,
+        bucket=bucket,
+        fp32_precision=fp32_precision,
+        layout=layout,
+    )
+    return model
+
+
 def main() -> None:
     args = parse_args()
 
@@ -263,6 +317,12 @@ def main() -> None:
         raise ValueError("--warmup must be >= 0")
     if args.iterations < 1:
         raise ValueError("--iterations must be >= 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.bucket < 1:
+        raise ValueError("--bucket must be >= 1")
+
+    execution_layout = candidate_execution_layout(args.backend, args.layout)
 
     device = torch.device("cuda")
     dtype = {
@@ -284,9 +344,6 @@ def main() -> None:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
 
     selected_examples = [EXAMPLES[index % len(EXAMPLES)] for index in range(args.batch_size)]
     premises = [premise for premise, _, _ in selected_examples]
@@ -313,7 +370,7 @@ def main() -> None:
     # Untouched Hugging Face reference.
     # ------------------------------------------------------------------
     print("Loading / running Hugging Face reference...")
-    reference = load_model(args.model, device=device, dtype=dtype)
+    reference = load_hf_model(args.model, device=device, dtype=dtype)
 
     id2label = {int(index): label for index, label in reference.config.id2label.items()}
 
@@ -332,30 +389,27 @@ def main() -> None:
     torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
-    # Same checkpoint, replacing only the DeBERTa encoder.
+    # Same checkpoint through the selected candidate implementation.
     # ------------------------------------------------------------------
-    print(f"Loading / running {args.backend} encoder...")
-    candidate = load_model(args.model, device=device, dtype=dtype)
-
-    base_model_prefix = candidate.base_model_prefix
-    backbone = getattr(candidate, base_model_prefix)
-
-    enable_backend(
-        backbone,
+    print(f"Loading / running {args.backend} candidate...")
+    candidate = load_candidate_model(
+        args.model,
         backend=args.backend,
         bucket=args.bucket,
         fp32_precision=args.fp32_precision,
         layout=args.layout,
+        device=device,
+        dtype=dtype,
     )
 
-    candidate_logits, candidate_hidden = run_model(candidate, inputs, layout=args.layout)
+    candidate_logits, candidate_hidden = run_model(candidate, inputs, layout=execution_layout)
 
     candidate_p50, candidate_p90, candidate_mean = benchmark_model(
         candidate,
         inputs,
         warmup=args.warmup,
         iterations=args.iterations,
-        layout=args.layout,
+        layout=execution_layout,
     )
 
     candidate_probs = candidate_logits.softmax(dim=-1)

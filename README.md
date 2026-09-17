@@ -32,7 +32,12 @@ for development/benchmarking, not the Triton kernel.
 While currently tailored to DeBERTa-v2/v3, the kernel and caching abstractions are designed to be extensible to other architectures requiring factorized relative-position or disentangled attention schemes in the future.
 
 > [!IMPORTANT]
-> **GPU Compatibility**: The Triton kernel has been validated and benchmarked primarily on the **NVIDIA RTX 6000 Ada** (Compute Capability 8.9). Further testing, benchmarking, and autotuning calibration are required to ensure optimal performance on other GPU models and hardware architectures. **Pull requests, benchmark results, and configurations for other GPUs are highly welcome!**
+> **GPU compatibility**: The Triton kernel has been validated on NVIDIA RTX
+> 6000 Ada (SM 8.9) and NVIDIA H200 (SM 9.0). A reviewed H200 profile for the
+> exact compiler stack documented below ships in the package. Other GPUs and
+> compiler stacks remain supported through bounded autotuning, but should be
+> calibrated and validated locally before performance-critical deployment.
+> Additional benchmark results and reviewed profiles are welcome.
 
 ## Install
 
@@ -318,6 +323,17 @@ The Triton candidate uses packed `cu_seqlens` inference by default while the
 untouched Hugging Face reference remains padded. Pass `--layout padded` to
 benchmark the regular padded candidate path instead.
 
+FlashDeBERTa can be selected against the same untouched checkpoint. It accepts
+the padded tensors and attention mask through its regular model forward and
+uses its mask-driven internal varlen path, which is reported as packed:
+
+```bash
+python -m benchmarks.parity_pretrained_mnli \
+  --model microsoft/deberta-v2-xlarge-mnli \
+  --backend flashdeberta \
+  --layout packed
+```
+
 ## Hostile CUDA validation
 
 ```bash
@@ -343,173 +359,132 @@ remove that first-use benchmarking cost.
 Do not treat the current candidate table as a universal final table for every GPU.
 
 
-## Results
+## Results: H200 DeBERTa-v3-base encoder
 
-DisentangledFlash was benchmarked against:
-
-- the original Hugging Face DeBERTa encoder,
-- the PyTorch implementation,
-- and the Triton DisentangledFlash implementation.
-
-The benchmark covers the full 12-layer encoder, not only the isolated attention operator.
+The current benchmark covers the complete 12-layer
+`microsoft/deberta-v3-base` encoder, not an isolated attention operator. It
+compares the original Hugging Face encoder, DisentangledFlash's fused-QKV
+PyTorch implementation, DisentangledFlash Triton, and FlashDeBERTa. The plots
+and tables below intentionally report only batch sizes 1 and 16.
 
 ### Benchmark configuration
 
 | Parameter | Value |
-|---|---:|
-| Hidden size | 768 |
-| Attention heads | 12 |
-| Head dimension | 64 |
-| Encoder layers | 12 |
-| FFN intermediate size | 3072 |
-| Convolution kernel | 3 |
-| Batch sizes | 1, 8, 16, 32 |
-| Sequence lengths | 16, 32, 64, 128, 256, 384, 512 |
-| Precisions | FP16, strict FP32 |
-| Execution mode | Eager |
-| GPU | NVIDIA RTX 6000 Ada Generation |
-| Compute capability | 8.9 |
+|---|---|
+| Model | `microsoft/deberta-v3-base` architecture |
+| Hidden size / heads / head dimension | 768 / 12 / 64 |
+| Encoder layers / FFN size / convolution | 12 / 3072 / 3 |
+| Reported batch sizes | 1, 16 |
+| Sequence lengths | 64, 128, 256, 512, 1024, 2048, 4096, 8192 |
+| Precisions | FP16, BF16, strict FP32 |
+| Execution | Eager inference |
+| Measurements | 3 warmups, 10 fresh measured inputs per point |
+| Packed-length distribution | Uniform from 60% through 100% of the padded length |
+| GPU | NVIDIA H200, SM 9.0, 143771 MiB VRAM |
+| Driver / power limit | 595.91.07 / 700 W |
+| Software | Python 3.12.14, PyTorch 2.14.0+cu130, Triton 3.8.0, cuDNN 9.2.4 |
+| Comparisons | Transformers 5.17.0, FlashDeBERTa 0.0.7 |
+| Host allocation | 16 CPU threads and 128 GiB RAM under Slurm |
+| Host node | Intel Xeon Platinum 8568Y+, 96 physical cores, 2.16 TB RAM |
+| OS | Linux 6.18.51-1-insait, x86-64, glibc 2.41 |
 
-> The benchmark snapshot below predates the current always-fused-QKV API and was run with QKV fusion disabled for both the PyTorch and Triton backends. The current DisentangledFlash implementation always uses fused QKV projection.
+Each iteration uses a newly generated tensor and the same deterministic sample
+for corresponding implementations. Latency is the sample mean and excludes
+model preparation, compilation, and offline tuning. Peak memory is total CUDA
+memory allocated, so it includes the model and persistent prepared-plan caches,
+not only temporary attention workspace. OOM points are capacity observations,
+not failed benchmark runs.
 
-### Overall encoder speedup
+### Latency
 
-Across all 28 tested `(batch size, sequence length)` configurations per precision:
+![H200 DeBERTa-v3-base latency at batch 1](benchmarks/results/h200_deberta_v3_base/latency_batch_1.png)
 
-| Precision | Geomean speedup vs. Hugging Face | Geomean speedup vs. PyTorch impl. | Best speedup vs. PyTorch impl. |
-|---|---:|---:|---:|
-| FP16 | **1.75×** | **1.32×** | **1.97×** |
-| FP32 | **1.56×** | **1.24×** | **1.50×** |
+![H200 DeBERTa-v3-base latency at batch 16](benchmarks/results/h200_deberta_v3_base/latency_batch_16.png)
 
-The advantage over the PyTorch implementation increases substantially for longer sequences, where the quadratic attention matrix becomes increasingly expensive.
+Geometric-mean end-to-end speedups for packed Triton over the eight sequence
+lengths are:
 
-### FP16 encoder latency
-
-Median end-to-end encoder latency:
-
-| Batch | Seq. length | Hugging Face | PyTorch impl. | DisentangledFlash | vs. HF | vs. PyTorch impl. |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 128 | 6.25 ms | 3.79 ms | **3.27 ms** | **1.91×** | **1.16×** |
-| 8 | 256 | 7.56 ms | 7.09 ms | **5.27 ms** | **1.43×** | **1.34×** |
-| 8 | 384 | 14.16 ms | 14.73 ms | **9.73 ms** | **1.45×** | **1.51×** |
-| 8 | 512 | 21.94 ms | 22.70 ms | **12.03 ms** | **1.82×** | **1.89×** |
-| 16 | 128 | 6.32 ms | 6.18 ms | **4.84 ms** | **1.30×** | **1.27×** |
-| 16 | 256 | 15.40 ms | 16.58 ms | **11.36 ms** | **1.36×** | **1.46×** |
-| 16 | 384 | 30.61 ms | 32.86 ms | **20.61 ms** | **1.48×** | **1.59×** |
-| 16 | 512 | 52.37 ms | 53.44 ms | **27.19 ms** | **1.93×** | **1.97×** |
-| 32 | 128 | 12.50 ms | 13.09 ms | **9.48 ms** | **1.32×** | **1.38×** |
-| 32 | 256 | 33.81 ms | 36.35 ms | **24.61 ms** | **1.37×** | **1.48×** |
-| 32 | 384 | 67.93 ms | 71.55 ms | **41.08 ms** | **1.65×** | **1.74×** |
-| 32 | 512 | 108.11 ms | 110.28 ms | **57.84 ms** | **1.87×** | **1.91×** |
-
-At `B=16, L=512`, DisentangledFlash reduces encoder latency from **53.44 ms to 27.19 ms** relative to the PyTorch path, corresponding to approximately a **49% latency reduction**.
-
-### FP32 encoder latency
-
-Strict FP32 also benefits significantly:
-
-| Batch | Seq. length | Hugging Face | PyTorch impl. | DisentangledFlash | vs. HF | vs. PyTorch impl. |
-|---:|---:|---:|---:|---:|---:|---:|
-| 8 | 128 | 12.86 ms | 11.93 ms | **10.22 ms** | **1.26×** | **1.17×** |
-| 8 | 256 | 27.24 ms | 27.50 ms | **22.73 ms** | **1.20×** | **1.21×** |
-| 8 | 384 | 45.98 ms | 45.91 ms | **34.40 ms** | **1.34×** | **1.33×** |
-| 8 | 512 | 70.78 ms | 69.20 ms | **46.09 ms** | **1.54×** | **1.50×** |
-| 16 | 128 | 25.50 ms | 24.47 ms | **21.11 ms** | **1.21×** | **1.16×** |
-| 16 | 256 | 52.04 ms | 53.26 ms | **41.73 ms** | **1.25×** | **1.28×** |
-| 16 | 384 | 93.33 ms | 93.72 ms | **65.53 ms** | **1.42×** | **1.43×** |
-| 16 | 512 | 137.84 ms | 137.07 ms | **91.96 ms** | **1.50×** | **1.49×** |
-| 32 | 128 | 46.55 ms | 45.94 ms | **38.61 ms** | **1.21×** | **1.19×** |
-| 32 | 256 | 109.15 ms | 110.59 ms | **84.57 ms** | **1.29×** | **1.31×** |
-| 32 | 384 | 183.83 ms | 185.52 ms | **130.02 ms** | **1.41×** | **1.43×** |
-| 32 | 512 | 280.22 ms | 278.36 ms | **187.99 ms** | **1.49×** | **1.48×** |
-
-### Scaling with sequence length
-
-Geometric-mean speedup across all tested batch sizes:
-
-| Sequence length | FP16 vs. HF | FP16 vs. PyTorch impl. | FP32 vs. HF | FP32 vs. PyTorch impl. |
+| Batch | Precision | vs. Hugging Face padded | vs. DF PyTorch packed | vs. FlashDeBERTa packed |
 |---:|---:|---:|---:|---:|
-| 16 | **1.96×** | **1.17×** | **2.10×** | **1.18×** |
-| 32 | **1.89×** | **1.18×** | **1.75×** | **1.17×** |
-| 64 | **1.81×** | **1.15×** | **1.52×** | **1.13×** |
-| 128 | **1.60×** | **1.23×** | **1.38×** | **1.17×** |
-| 256 | **1.52×** | **1.39×** | **1.37×** | **1.27×** |
-| 384 | **1.63×** | **1.48×** | **1.40×** | **1.34×** |
-| 512 | **1.91×** | **1.69×** | **1.55×** | **1.47×** |
+| 1 | FP16 | **1.66×** | **2.07×** | **1.22×** |
+| 1 | BF16 | **1.71×** | **2.12×** | **1.23×** |
+| 1 | FP32 | **1.52×** | **1.43×** | **1.24×** |
+| 16 | FP16 | **2.33×** | **5.75×** | **1.45×** |
+| 16 | BF16 | **2.29×** | **5.62×** | **1.38×** |
+| 16 | FP32 | **1.51×** | **2.33×** | **1.18×** |
 
-The comparison against the PyTorch implementation is particularly useful: both implementations already avoid several pieces of Hugging Face encoder overhead, so the increasing gap at long sequence lengths isolates the benefit of the streaming Triton attention path more clearly.
+For batch 16, comparisons against Hugging Face and packed DF PyTorch cover the
+seven mutually successful lengths through 4096 because those implementations
+OOM at 8192. Comparisons against FlashDeBERTa cover all eight lengths. Batch 1
+comparisons cover all eight lengths.
 
-### Peak GPU memory
+At the longest sequence, where all packed Triton and FlashDeBERTa points
+succeeded:
 
-At batch size 32, the memory advantage grows with sequence length:
+| Batch | Precision | DF Triton packed | FlashDeBERTa packed | Speedup | DF Triton peak | FlashDeBERTa peak | Memory reduction |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | FP16 | **40.13 ms** | 72.13 ms | **1.80×** | **1.01 GiB** | 3.07 GiB | **67.1%** |
+| 1 | BF16 | **39.35 ms** | 68.67 ms | **1.75×** | **1.01 GiB** | 3.07 GiB | **67.1%** |
+| 1 | FP32 | **155.66 ms** | 191.80 ms | **1.23×** | **1.99 GiB** | 3.57 GiB | **44.4%** |
+| 16 | FP16 | **726.94 ms** | 1093.03 ms | **1.50×** | **5.13 GiB** | 17.39 GiB | **70.5%** |
+| 16 | BF16 | **708.29 ms** | 1034.98 ms | **1.46×** | **5.13 GiB** | 17.39 GiB | **70.5%** |
+| 16 | FP32 | **2921.89 ms** | 3116.86 ms | **1.07×** | **10.24 GiB** | 26.22 GiB | **60.9%** |
 
-#### FP16
+Packed execution is not automatically faster for every small workload. This
+benchmark starts with padded model inputs and includes mask analysis, gathering
+into a packed tensor, `cu_seqlens` construction, packed boundary bookkeeping,
+and scattering back to a dense encoder output. At batch 1, that fixed cost is
+not amortized until long sequences; for batch 16 FP16/BF16, packed Triton
+overtakes padded Triton at length 512. Applications that keep data packed across
+the surrounding pipeline avoid part of this API-boundary cost.
 
-| Sequence length | Hugging Face | PyTorch impl. | DisentangledFlash | Reduction vs. PyTorch impl. |
-|---:|---:|---:|---:|---:|
-| 128 | 0.64 GB | 0.73 GB | **0.70 GB** | 4.2% |
-| 256 | 0.96 GB | 1.10 GB | **0.97 GB** | 12.3% |
-| 384 | 1.45 GB | 1.58 GB | **1.26 GB** | 20.3% |
-| 512 | 2.09 GB | 2.14 GB | **1.55 GB** | **27.3%** |
+### Peak allocated GPU memory
 
-#### FP32
+![H200 DeBERTa-v3-base peak memory at batch 1](benchmarks/results/h200_deberta_v3_base/memory_batch_1.png)
 
-| Sequence length | Hugging Face | PyTorch impl. | DisentangledFlash | Reduction vs. PyTorch impl. |
-|---:|---:|---:|---:|---:|
-| 128 | 1.25 GB | 1.44 GB | **1.38 GB** | 3.8% |
-| 256 | 1.87 GB | 2.19 GB | **1.92 GB** | 12.2% |
-| 384 | 2.85 GB | 3.13 GB | **2.50 GB** | 20.3% |
-| 512 | 4.12 GB | 4.25 GB | **3.09 GB** | **27.3%** |
+![H200 DeBERTa-v3-base peak memory at batch 16](benchmarks/results/h200_deberta_v3_base/memory_batch_16.png)
 
-This behavior is expected because DisentangledFlash performs tiled streaming softmax and does not materialize the full `[B, H, L, L]` attention score/probability tensor.
+At short lengths, total peak memory can make packed Triton look slightly larger
+than FlashDeBERTa because DisentangledFlash retains prepared relative-position
+plans and projections. For example, batch-16 FP16 at length 64 peaks at 0.664
+GiB for packed Triton and 0.599 GiB for FlashDeBERTa, but the incremental
+allocation above each backend's baseline is lower for Triton: 0.028 GiB versus
+0.045 GiB. Once attention workspace dominates, the streaming Triton path's
+lower incremental allocation also produces a substantially lower total peak,
+as the length-8192 table shows.
 
-### Numerical accuracy
+At batch 16 and length 8192, the Hugging Face encoder OOMs in every precision;
+packed DF PyTorch also OOMs in every precision, and padded DF PyTorch OOMs in
+FP32. Packed and padded Triton and packed FlashDeBERTa complete all three
+precisions.
 
-DisentangledFlash was compared directly against the original Hugging Face implementation at both the isolated attention level and across the full 12-layer DeBERTa encoder.
+### Bundled H200 tuning profile
 
-| Precision | Level | Max absolute error | Mean absolute error |
-|---|---|---:|---:|
-| FP16 | Attention | **7.63e-6** | **2.48e-7** |
-| FP16 | Full encoder | **1.56e-2** | **1.12e-3** |
-| FP32 | Attention | **4.89e-9** | **1.79e-10** |
-| FP32 | Full encoder | **7.57e-6** | **6.26e-7** |
+The package includes the reviewed
+[`h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json`](src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json)
+profile. Installed wheels discover it automatically; no environment variable or
+explicit profile path is required.
 
-The maximum absolute error is the worst observed value across all tested batch-size and sequence-length configurations. The mean absolute error is averaged across the 28 tested configurations for each precision and level.
+The profile contains 108 validated winners for the DeBERTa-v3-base workload:
+head dimension 64, C2P+P2C, FP16/BF16/FP32, padded masked, padded unmasked, and
+packed layouts across the nine bounded length families through 8192. It was
+generated on an H200 with 10 tuning warmups and 50 repetitions per candidate.
+It is intentionally a model-workload profile, not a universal H200 profile.
+
+Profile acceptance remains strict. The bundled entries match NVIDIA H200 SM
+9.0, PyTorch 2.14.0+cu130, CUDA runtime 13.0, and the recorded Triton 3.8.0
+compiler fingerprint. On another compiler stack the profile is ignored in
+`auto` mode and safe bounded autotuning is used instead; the NVIDIA driver is
+diagnostic metadata and does not control compatibility.
 
 ### Pretrained-model parity
 
-Task-level parity was additionally tested with the pretrained `microsoft/deberta-v2-xlarge-mnli` checkpoint.
-
-The original Hugging Face model and the same checkpoint with its DeBERTa encoder replaced by DisentangledFlash achieved **full task-level parity** on the parity test.
-
-The test verifies:
-
-- final MNLI predictions,
-- classification logits and probabilities,
-- final encoder hidden states,
-- and the complete sequence-classification inference path.
-
-This test exercising a real pretrained DeBERTa model rather than only synthetic attention tensors.
-
-### Test environment
-
-All current CUDA benchmarks and pretrained-model parity tests were run on:
-
-| Component | Configuration |
-|---|---|
-| OS | Ubuntu 24.04.3 LTS |
-| GPU | NVIDIA RTX 6000 Ada Generation |
-| Compute capability | 8.9 |
-| CUDA | 13.0 |
-| PyTorch | 2.13.0+cu13 |
-| Triton | 3.7.1 |
-| Transformers | 5.15.1 |
-| CPU | AMD Ryzen Threadripper PRO 7975WX, 32 cores |
-| System RAM | 512 GB |
-
-Latency numbers above are steady-state measurements. Triton compilation and autotuning startup cost are excluded from the reported p50 latency.
-
-Further validation and benchmarking are needed on other GPU architectures and configurations to guarantee optimal tuning and performance across different hardware.
+Task-level parity is additionally tested with the pretrained
+`microsoft/deberta-v2-xlarge-mnli` checkpoint. The original Hugging Face model
+and the same checkpoint with its encoder replaced by DisentangledFlash achieve
+matching predictions while the test also checks classification logits,
+probabilities, final hidden states, and the complete sequence-classification
+path.
 
 
 ## Attribution

@@ -22,6 +22,7 @@ from disentangled_flash.tuning import (
     ProfileEntry,
     ProfileRegistry,
     WorkloadKey,
+    load_bundled_profiles,
     load_profile,
     merge_profile_entry,
     save_profile,
@@ -87,6 +88,14 @@ def test_profile_json_round_trip(tmp_path):
     assert payload["entries"][0]["workload"]["length_regime"] == 128
     assert payload["entries"][0]["workload"]["layout"] == "padded"
     assert "sequence_length" not in payload["entries"][0]["workload"]
+
+
+def test_bundled_profiles_are_parseable_and_fully_validated():
+    profiles = load_bundled_profiles()
+
+    assert profiles
+    assert all(profile.entries for profile in profiles)
+    assert all(entry.validated for profile in profiles for entry in profile.entries)
 
 
 def test_registry_uses_explicit_order_and_normalized_gpu_name():
