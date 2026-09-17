@@ -79,20 +79,75 @@ selects the PyTorch backend instead of Triton.
 
 ## CUDA benchmark
 
-Attention-only:
+Install the optional comparison backend before running the complete matrix:
 
 ```bash
-python -m benchmarks.benchmark_cuda --scope attention
+pip install -e ".[benchmark]"
 ```
 
-Full encoder:
+The default benchmark is a full 12-layer `microsoft/deberta-v3-base`-architecture
+encoder comparison across the base implementation, DisentangledFlash's PyTorch
+and Triton implementations, and FlashDeBERTa:
 
 ```bash
 python -m benchmarks.benchmark_cuda \
-  --scope encoder \
-  --implementations original,torch,triton \
-  --dtypes fp16,fp32 \
-  --output encoder_attention_cuda_results.json
+  --output deberta_v3_base_encoder_cuda_results.json
+```
+
+It evaluates padded and packed execution at sequence lengths `64`, `128`, `256`,
+`512`, `1024`, `2048`, `4098`, and `8192`. The deliberately non-power-of-two
+`4098` case exercises the masked tail of the `8192` kernel family. The base
+encoder has no external `cu_seqlens` interface, so its packed rows are reported
+as `UNSUPPORTED`, not silently substituted with padded execution. FlashDeBERTa's
+packed rows use its native mask-driven internal varlen path. DisentangledFlash's
+PyTorch and Triton packed rows use the explicit `forward_packed` interface.
+
+Warmup and measurement inputs never reuse tensor objects. Every iteration gets
+new deterministically generated token IDs, hidden states, sequence lengths, and
+masks; warmup and measurement use separate seed ranges. The same seeded samples
+are shared across implementations and layouts so comparisons remain fair.
+
+CUDA out-of-memory conditions are capacity results, not benchmark failures. An
+OOM row records the implementation, dtype, execution mode, layout, batch size,
+sequence length, failure stage, exception type, and message, then the benchmark
+clears the CUDA cache and continues. This is expected for the quadratic base
+encoder at sufficiently long sequences. Non-OOM exceptions are recorded as
+errors and make the parent command exit unsuccessfully after saving all results.
+
+The JSON report includes a reproducibility snapshot with:
+
+- OS, kernel, machine architecture, Python executable and version
+- CPU model, host core counts, process CPU affinity, and PyTorch thread counts
+- total and available host RAM plus cgroup CPU/memory limits
+- Slurm job, node, task, CPU, memory, and GPU allocation fields when present
+- every visible GPU's model, UUID, PCI address, compute capability, VRAM,
+  multiprocessor count, clock limits, power limit, driver, and NVIDIA topology
+- PyTorch CUDA build, cuDNN, PyTorch, Triton, Transformers, FlashDeBERTa, and
+  DisentangledFlash versions
+- git commit, branch, and dirty-worktree flag
+- the full command, requested model matrix, and a safe allowlist of relevant
+  CUDA/Triton/tuning environment variables
+
+Attention-only experiments remain available explicitly (FlashDeBERTa is an
+encoder implementation):
+
+```bash
+python -m benchmarks.benchmark_cuda \
+  --scope attention \
+  --implementations base,torch,triton \
+  --layouts padded
+```
+
+To run a smaller encoder subset, override any matrix dimension:
+
+```bash
+python -m benchmarks.benchmark_cuda \
+  --implementations base,triton,flashdeberta \
+  --layouts padded,packed \
+  --dtypes fp16 \
+  --executions eager \
+  --batches 1,8 \
+  --lengths 64,512,2048,8192
 ```
 
 ### Kernel tuning profiles

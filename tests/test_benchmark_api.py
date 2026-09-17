@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,77 @@ def test_cuda_benchmark_exposes_unpadded_mode():
 
     assert args.assume_unpadded is True
     assert args.minimum_length_fraction == 1.0
+
+
+def test_cuda_benchmark_defaults_to_deberta_v3_base_matrix():
+    benchmark = load_benchmark_module()
+
+    args = benchmark.build_parser().parse_args([])
+
+    assert args.scope == "encoder"
+    assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
+    assert args.layouts == ["padded", "packed"]
+    assert args.lengths == [64, 128, 256, 512, 1024, 2048, 4098, 8192]
+    assert args.hidden_size == 768
+    assert args.num_attention_heads == 12
+    assert args.num_hidden_layers == 12
+    assert args.intermediate_size == 3072
+    assert args.vocab_size == 128100
+
+
+def test_cuda_benchmark_uses_distinct_reproducible_input_batches():
+    benchmark = load_benchmark_module()
+    embedding = torch.arange(256, dtype=torch.float32).view(64, 4)
+
+    first = benchmark.make_inputs(embedding, 3, 8, 3, 100, 0.5)
+    repeated = benchmark.make_inputs(embedding, 3, 8, 3, 100, 0.5)
+    measured = benchmark.make_inputs(embedding, 3, 8, 3, 10_100, 0.5)
+
+    assert all(torch.equal(a[0], b[0]) for a, b in zip(first, repeated))
+    assert any(not torch.equal(first[index][0], first[index + 1][0]) for index in range(2))
+    assert all(not torch.equal(a[0], b[0]) for a, b in zip(first, measured))
+
+
+def test_system_details_are_json_serializable_and_safe():
+    benchmark = load_benchmark_module()
+
+    details = benchmark.collect_system_details()
+
+    assert {"os", "cpu", "system_memory", "cuda", "nvidia_smi", "packages", "git"} <= set(details)
+    assert set(details["environment"]) <= set(benchmark.RELEVANT_ENVIRONMENT_VARIABLES)
+    json.dumps(details)
+
+
+def test_cuda_summary_handles_oom_and_unavailable_parity(capsys):
+    benchmark = load_benchmark_module()
+    metadata = {
+        "implementation": "triton",
+        "scope": "encoder",
+        "dtype": "fp16",
+        "execution": "eager",
+        "layout": "packed",
+    }
+    successful = {
+        "status": "ok",
+        "batch_size": 1,
+        "sequence_length": 64,
+        "p50_ms": 1.0,
+        "p90_ms": 1.1,
+        "docs_per_second": 1000.0,
+        "valid_tokens_per_second": 64000.0,
+        "max_abs_error": None,
+    }
+    oom = {
+        "status": "oom",
+        "batch_size": 32,
+        "sequence_length": 8192,
+    }
+
+    benchmark.print_summary([{"metadata": metadata, "results": [successful, oom]}])
+
+    output = capsys.readouterr().out
+    assert "N/A" in output
+    assert "OOM" in output
 
 
 def test_make_models_accepts_unpadded_mode():

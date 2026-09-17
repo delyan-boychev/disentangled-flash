@@ -20,6 +20,10 @@ hf = [
     "sentencepiece>=0.2",
     "protobuf>=4",
 ]
+benchmark = [
+    "transformers>=4.57",
+    "flashdeberta>=0.0.7",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.12",
