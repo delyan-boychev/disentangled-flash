@@ -125,7 +125,7 @@ We measure the latency and accuracy of the reference, PyTorch-optimized, and Tri
 * **MNLI Pretrained Parity Benchmark**:
   Verifies prediction parity against a Hugging Face pre-trained DeBERTa model:
   ```bash
-  python -m benchmarks.parity_pretrained_mnli
+  python -m benchmarks.evaluate_mnli --limit 64
   ```
 
 ### 2. Performance Metrics

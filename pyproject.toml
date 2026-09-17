@@ -21,6 +21,7 @@ hf = [
     "protobuf>=4",
 ]
 benchmark = [
+    "datasets>=2.19",
     "transformers>=4.57",
     "flashdeberta>=0.0.7",
     "matplotlib>=3.9",

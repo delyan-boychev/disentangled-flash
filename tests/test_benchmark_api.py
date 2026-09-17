@@ -3,34 +3,18 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_cuda.py"
-PARITY_PATH = ROOT / "benchmarks" / "parity_pretrained_mnli.py"
+MNLI_EVALUATION_PATH = ROOT / "benchmarks" / "evaluate_mnli.py"
 
 
 def load_benchmark_module():
     spec = importlib.util.spec_from_file_location(
         "benchmark_cuda",
         BENCHMARK_PATH,
-    )
-
-    assert spec is not None
-    assert spec.loader is not None
-
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-
-    return module
-
-
-def load_parity_module():
-    spec = importlib.util.spec_from_file_location(
-        "parity_pretrained_mnli",
-        PARITY_PATH,
     )
 
     assert spec is not None
@@ -150,42 +134,60 @@ def test_make_models_accepts_unpadded_mode():
     assert "assume_unpadded" in signature.parameters
 
 
-def test_pretrained_parity_accepts_torch_backend():
-    parity = load_parity_module()
-    args = parity.parse_args(["--backend", "torch"])
-
-    assert args.backend == "torch"
-
-
-def test_mnli_benchmark_defaults_to_packed_layout():
-    benchmark = load_parity_module()
-
-    assert benchmark.parse_args([]).layout == "packed"
-    assert benchmark.parse_args(["--layout", "padded"]).layout == "padded"
+def load_mnli_evaluation_module():
+    spec = importlib.util.spec_from_file_location(
+        "evaluate_mnli",
+        MNLI_EVALUATION_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    evaluation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluation)
+    return evaluation
 
 
-def test_mnli_benchmark_supports_flashdeberta_internal_packed_path():
-    benchmark = load_parity_module()
+def test_mnli_evaluation_defaults_to_full_single_pass_matrix():
+    evaluation = load_mnli_evaluation_module()
+    args = evaluation.parse_args([])
 
-    args = benchmark.parse_args(["--backend", "flashdeberta"])
+    assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
+    assert args.layouts == ["padded", "packed"]
+    assert args.split == "validation_matched"
+    assert args.limit == 0
+    assert args.runs == 1
+    assert evaluation.requested_variants(args.implementations, args.layouts) == (
+        evaluation.Variant("base", "padded"),
+        evaluation.Variant("torch", "padded"),
+        evaluation.Variant("torch", "packed"),
+        evaluation.Variant("triton", "padded"),
+        evaluation.Variant("triton", "packed"),
+        evaluation.Variant("flashdeberta", "packed"),
+    )
 
-    assert args.layout == "packed"
-    assert benchmark.candidate_execution_layout(args.backend, args.layout) == "padded"
-    with pytest.raises(ValueError, match="mask-driven internal varlen"):
-        benchmark.candidate_execution_layout("flashdeberta", "padded")
+
+def test_mnli_evaluation_rows_are_never_repeated_to_fill_a_batch():
+    evaluation = load_mnli_evaluation_module()
+
+    ranges = evaluation.batch_ranges(10, 4)
+
+    assert ranges == ((0, 4), (4, 8), (8, 10))
+    assert [index for start, end in ranges for index in range(start, end)] == list(range(10))
 
 
-def test_mnli_benchmark_exposes_strict_profile_only_mode():
-    benchmark = load_parity_module()
+def test_mnli_evaluation_exposes_strict_profile_only_mode():
+    evaluation = load_mnli_evaluation_module()
 
-    args = benchmark.parse_args(["--tuning-mode", "profile_only", "--profile", "h200.json"])
+    args = evaluation.parse_args(
+        ["--tuning-mode", "profile_only", "--profile", "h200.json", "--runs", "3"]
+    )
 
     assert args.tuning_mode == "profile_only"
     assert args.profile == ["h200.json"]
+    assert args.runs == 3
 
 
 def test_mnli_packed_path_runs_classifier_without_padding_attention():
-    benchmark = load_parity_module()
+    evaluation = load_mnli_evaluation_module()
 
     class Embeddings(nn.Module):
         def forward(self, *, input_ids, token_type_ids, mask):
@@ -206,7 +208,7 @@ def test_mnli_packed_path_runs_classifier_without_padding_attention():
         ):
             assert cu_seqlens.tolist() == [0, 2, 3]
             assert max_seqlen == 2
-            assert output_hidden_states is True
+            assert output_hidden_states is False
             assert return_dict is True
             assert packed_info.offsets == (0, 2, 3)
             return SimpleNamespace(last_hidden_state=hidden_states + 1)
@@ -226,13 +228,10 @@ def test_mnli_packed_path_runs_classifier_without_padding_attention():
         "attention_mask": torch.tensor([[1, 1, 0], [1, 0, 0]]),
         "token_type_ids": torch.zeros(2, 3, dtype=torch.long),
     }
-    logits, hidden = benchmark.forward_model(
+    logits = evaluation.forward_model(
         Model(),
         inputs,
         layout="packed",
-        output_hidden_states=True,
     )
 
     torch.testing.assert_close(logits, torch.tensor([[2.0, 12.0], [4.0, 14.0]]))
-    assert hidden is not None
-    assert torch.equal(hidden[:, -1], torch.tensor([[0.0, 0.0], [0.0, 0.0]]))
