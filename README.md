@@ -48,10 +48,10 @@ repository editable while developing:
 pip install -e ".[dev]"
 ```
 
-For the pretrained Hugging Face MNLI parity benchmark:
+For the pretrained GLUE/MNLI evaluation:
 
 ```bash
-pip install -e ".[dev,hf]"
+pip install -e ".[dev,benchmark,hf]"
 ```
 
 `sentencepiece` and `protobuf` are included in the `hf` extra because the
@@ -306,33 +306,40 @@ output, _ = unpack_packed(
 )
 ```
 
-## Pretrained task parity + speed
+## Pretrained GLUE/MNLI evaluation
 
-The MNLI script loads `microsoft/deberta-v2-xlarge-mnli`, compares the untouched
-Hugging Face model with the same checkpoint using DisentangledFlash, verifies
-logits/probabilities/hidden-state parity, and benchmarks the full classification
-forward. Tokenization and model loading are excluded from timing.
-
-Defaults are batch size 8 and 500 measured iterations:
+The evaluator loads the real GLUE/MNLI matched validation split and
+`microsoft/deberta-v2-xlarge-mnli`. By default it runs the untouched Hugging
+Face model, both padded and packed DisentangledFlash PyTorch paths, both padded
+and packed Triton paths, and FlashDeBERTa's internal packed path.
 
 ```bash
-python -m benchmarks.parity_pretrained_mnli
+python -m benchmarks.evaluate_mnli
 ```
 
-The Triton candidate uses packed `cu_seqlens` inference by default while the
-untouched Hugging Face reference remains padded. Pass `--layout padded` to
-benchmark the regular padded candidate path instead.
+The default is one complete measured dataset pass with no warmup. Every dataset
+row is processed exactly once; the final partial batch is not filled by
+repeating examples. Dataset download, batched tokenization, model loading, and
+the single host-to-device transfer are completed before timing. The first model
+forward and any first-use compilation are therefore included.
 
-FlashDeBERTa can be selected against the same untouched checkpoint. It accepts
-the padded tensors and attention mask through its regular model forward and
-uses its mask-driven internal varlen path, which is reported as packed:
+The report includes accuracy, full-dataset logit and probability errors, and
+the exact number of post-argmax classification mismatches against the Hugging
+Face reference. `full_parity` requires both tolerance-level logit parity and
+zero decision mismatches. Use `--require-full-parity` to make any mismatch
+produce a nonzero exit status.
+
+To require the bundled H200 configuration and prohibit Triton autotuning:
 
 ```bash
-python -m benchmarks.parity_pretrained_mnli \
-  --model microsoft/deberta-v2-xlarge-mnli \
-  --backend flashdeberta \
-  --layout packed
+python -m benchmarks.evaluate_mnli \
+  --tuning-mode profile_only \
+  --profile src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json
 ```
+
+Use `--runs N` for deliberate repeated full-dataset passes, `--limit N` for a
+smaller non-repeating subset, or `--split validation_mismatched` for the other
+MNLI validation split.
 
 ## Hostile CUDA validation
 
