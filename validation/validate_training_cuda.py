@@ -223,7 +223,9 @@ def main() -> None:
     parser.add_argument("--mask-pattern", choices=("none", "right"), default="none")
     parser.add_argument("--fp32-precision", choices=("strict", "fast"), default="strict")
     parser.add_argument("--assume-unpadded", action="store_true")
-    parser.add_argument("--layouts", nargs="+", choices=("padded", "packed"), default=["padded", "packed"])
+    parser.add_argument(
+        "--layouts", nargs="+", choices=("padded", "packed"), default=["padded", "packed"]
+    )
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--output", default="training_cuda_validation.json")
     args = parser.parse_args()

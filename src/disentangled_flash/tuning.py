@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -16,13 +17,31 @@ from typing import Any, Literal
 
 import torch
 
-PROFILE_FORMAT_VERSION = 3
-KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v3"
+PROFILE_FORMAT_VERSION = 4
+KERNEL_PROFILE_VERSION = "deberta-attention-launch-schema-v1"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
 KernelLayout = Literal["padded", "packed"]
 KernelPhase = Literal["inference", "training_forward", "backward_dq", "backward_dkv"]
+ProfileCompatibility = Literal["exact", "retargetable", "incompatible"]
 TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024, 2048, 4096, 8192)
 TUNING_BATCH_HEADS = (8, 32)
+
+
+def _kernel_source_digest() -> str:
+    """Fingerprint launch-relevant sources without tying profiles to comments elsewhere."""
+
+    package = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for relative in (Path("kernel.py"), Path("training") / "_kernels.py"):
+        path = package / relative
+        digest.update(relative.as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+KERNEL_SOURCE_DIGEST = _kernel_source_digest()
 
 
 def tuning_sequence_length(sequence_length: int) -> int:
@@ -112,7 +131,7 @@ class KernelConfig:
         return cls(**data)
 
 
-DEFAULT_KERNEL_CONFIGS = (
+BASE_FORWARD_KERNEL_CONFIGS = (
     KernelConfig(16, 16, 2),
     KernelConfig(16, 32, 2),
     KernelConfig(32, 32, 2),
@@ -124,11 +143,24 @@ DEFAULT_KERNEL_CONFIGS = (
     KernelConfig(128, 64, 4),
 )
 
+# First choose a tile/warp shape at one stage, then refine the strongest shapes
+# with deeper software pipelines.  Stage three is deliberately limited to the
+# normal DeBERTa head size; resource pruning removes it for FP32 and short rows.
+DEFAULT_KERNEL_CONFIGS = BASE_FORWARD_KERNEL_CONFIGS + (
+    KernelConfig(32, 32, 2, 2),
+    KernelConfig(32, 32, 4, 2),
+    KernelConfig(32, 64, 4, 2),
+    KernelConfig(64, 32, 4, 2),
+    KernelConfig(64, 64, 4, 2),
+    KernelConfig(32, 64, 4, 3),
+    KernelConfig(64, 32, 4, 3),
+)
+
 # Backward carries substantially more live state than forward.  Keep its
 # default search deliberately smaller and include the 8-warp schedules that
 # are often important at head dimension 128.  dQ and dK/dV are profiled as
 # separate phases because their optimal tile orientations need not match.
-DEFAULT_BACKWARD_KERNEL_CONFIGS = (
+BASE_BACKWARD_KERNEL_CONFIGS = (
     KernelConfig(16, 16, 4),
     KernelConfig(32, 32, 4),
     KernelConfig(32, 64, 4),
@@ -136,6 +168,35 @@ DEFAULT_BACKWARD_KERNEL_CONFIGS = (
     KernelConfig(64, 64, 4),
     KernelConfig(32, 64, 8),
     KernelConfig(64, 32, 8),
+)
+
+DEFAULT_DQ_KERNEL_CONFIGS = BASE_BACKWARD_KERNEL_CONFIGS + (
+    KernelConfig(32, 32, 4, 2),
+    KernelConfig(32, 64, 4, 2),
+    KernelConfig(64, 32, 4, 2),
+    KernelConfig(32, 64, 8, 2),
+)
+
+# dK/dV launches across the key dimension, so prefer N-oriented schedules when
+# otherwise tied.  It still owns an independent winner and stage depth.
+DEFAULT_DKV_KERNEL_CONFIGS = (
+    KernelConfig(16, 16, 4),
+    KernelConfig(32, 32, 4),
+    KernelConfig(64, 32, 4),
+    KernelConfig(32, 64, 4),
+    KernelConfig(64, 64, 4),
+    KernelConfig(64, 32, 8),
+    KernelConfig(32, 64, 8),
+    KernelConfig(32, 32, 4, 2),
+    KernelConfig(64, 32, 4, 2),
+    KernelConfig(32, 64, 4, 2),
+    KernelConfig(64, 32, 8, 2),
+)
+
+# Backward runtime autotuning historically imported this name.  Keep it as the
+# stable union while the tuner and training bundle use the phase-specific lists.
+DEFAULT_BACKWARD_KERNEL_CONFIGS = tuple(
+    dict.fromkeys(DEFAULT_DQ_KERNEL_CONFIGS + DEFAULT_DKV_KERNEL_CONFIGS)
 )
 
 
@@ -478,20 +539,39 @@ class KernelProfile:
     provenance: Mapping[str, str] = field(default_factory=dict)
     format_version: int = PROFILE_FORMAT_VERSION
     kernel_version: str = KERNEL_PROFILE_VERSION
+    kernel_digest: str = KERNEL_SOURCE_DIGEST
 
     def __post_init__(self) -> None:
         if self.format_version != PROFILE_FORMAT_VERSION:
             raise ValueError(f"unsupported profile format version: {self.format_version}")
-        if self.kernel_version != KERNEL_PROFILE_VERSION:
-            raise ValueError(f"incompatible kernel profile version: {self.kernel_version}")
+        if not isinstance(self.kernel_version, str) or not self.kernel_version:
+            raise ValueError("kernel profile version must be a non-empty string")
+        if not isinstance(self.kernel_digest, str) or not self.kernel_digest:
+            raise ValueError("kernel digest must be a non-empty string")
         keys = [entry.workload for entry in self.entries]
         if len(keys) != len(set(keys)):
             raise ValueError("profile contains duplicate workload entries")
+
+    def compatibility(
+        self,
+        hardware: HardwareSpec,
+        compiler: CompilerSpec,
+        *,
+        kernel_digest: str = KERNEL_SOURCE_DIGEST,
+    ) -> ProfileCompatibility:
+        """Classify reuse without confusing a measured compiler with a launch ABI."""
+
+        if not self.hardware.matches(hardware) or self.kernel_version != KERNEL_PROFILE_VERSION:
+            return "incompatible"
+        if self.compiler == compiler and self.kernel_digest == kernel_digest:
+            return "exact"
+        return "retargetable"
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "format_version": self.format_version,
             "kernel_version": self.kernel_version,
+            "kernel_digest": self.kernel_digest,
             "hardware": self.hardware.to_dict(),
             "compiler": self.compiler.to_dict(),
             "provenance": dict(self.provenance),
@@ -503,18 +583,42 @@ class KernelProfile:
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> KernelProfile:
         format_version = data.get("format_version") if isinstance(data, Mapping) else None
+        if format_version == 2:
+            raise ValueError(
+                "profile format 2 lacks compiler and kernel-layout compatibility; "
+                "regenerate it with the current tuner"
+            )
+        if format_version == 3:
+            _require_exact_keys(
+                data,
+                {
+                    "format_version",
+                    "kernel_version",
+                    "hardware",
+                    "compiler",
+                    "provenance",
+                    "entries",
+                },
+                set(),
+                "profile",
+            )
+            provenance = dict(data["provenance"])
+            provenance["migrated_from_format"] = "3"
+            return cls(
+                hardware=HardwareSpec.from_dict(data["hardware"]),
+                compiler=CompilerSpec.from_dict(data["compiler"]),
+                provenance=provenance,
+                entries=tuple(ProfileEntry.from_dict(entry) for entry in data["entries"]),
+                kernel_digest=f"legacy-v3:{data['kernel_version']}",
+            )
         if format_version != PROFILE_FORMAT_VERSION:
-            if format_version == 2:
-                raise ValueError(
-                    "profile format 2 lacks compiler and kernel-layout compatibility; "
-                    "regenerate it with the current tuner"
-                )
             raise ValueError(f"unsupported profile format version: {format_version}")
         _require_exact_keys(
             data,
             {
                 "format_version",
                 "kernel_version",
+                "kernel_digest",
                 "hardware",
                 "compiler",
                 "provenance",
@@ -534,9 +638,12 @@ class KernelProfile:
             raise TypeError("profile format_version must be an integer")
         if not isinstance(data["kernel_version"], str):
             raise TypeError("profile kernel_version must be a string")
+        if not isinstance(data["kernel_digest"], str):
+            raise TypeError("profile kernel_digest must be a string")
         return cls(
             format_version=data["format_version"],
             kernel_version=data["kernel_version"],
+            kernel_digest=data["kernel_digest"],
             hardware=HardwareSpec.from_dict(data["hardware"]),
             compiler=CompilerSpec.from_dict(data["compiler"]),
             provenance=data["provenance"],
@@ -670,7 +777,7 @@ class ProfileRegistry:
         workload: WorkloadKey,
     ) -> KernelConfig | None:
         for profile in self.profiles:
-            if not profile.hardware.matches(hardware) or profile.compiler != compiler:
+            if profile.compatibility(hardware, compiler) != "exact":
                 continue
             for entry in profile.entries:
                 if entry.validated and entry.workload == workload:
@@ -690,10 +797,22 @@ class ProfileRegistry:
         ]
         if not hardware_matches:
             return f"no profile matches GPU {hardware.name!r} {hardware.compute_capability}"
-        compiler_matches = [profile for profile in hardware_matches if profile.compiler == compiler]
-        if not compiler_matches:
-            details = "; ".join(hardware_matches[0].compiler.mismatches(compiler))
-            return f"profile compiler is incompatible ({details})"
+        exact_matches = [
+            profile
+            for profile in hardware_matches
+            if profile.compatibility(hardware, compiler) == "exact"
+        ]
+        if not exact_matches:
+            retargetable = [
+                profile
+                for profile in hardware_matches
+                if profile.compatibility(hardware, compiler) == "retargetable"
+            ]
+            if retargetable:
+                details = "; ".join(retargetable[0].compiler.mismatches(compiler))
+                suffix = f" ({details})" if details else " (kernel source changed)"
+                return f"profile requires local retargeting{suffix}"
+            return "profile launch schema is incompatible"
         return f"no validated profile entry matches workload {workload}"
 
 
@@ -719,13 +838,59 @@ def merge_profile_entry(
         compiler=compiler,
         entries=tuple(existing.values()),
         provenance=dict(provenance),
+        kernel_digest=KERNEL_SOURCE_DIGEST,
+    )
+
+
+def prepare_profile_retarget(
+    profile: KernelProfile,
+    *,
+    hardware: HardwareSpec,
+    compiler: CompilerSpec,
+    provenance: Mapping[str, str],
+) -> KernelProfile:
+    """Preserve old winners as pending seeds for an interruptible local retarget."""
+
+    compatibility = profile.compatibility(hardware, compiler)
+    if compatibility == "incompatible":
+        raise ValueError("cannot retarget a profile with different hardware or launch schema")
+    if compatibility == "exact":
+        # A resumed retarget already carries revalidated winners and pending seeds.
+        return profile
+    source_compiler = json.dumps(profile.compiler.to_dict(), sort_keys=True, separators=(",", ":"))
+    pending = tuple(
+        ProfileEntry(
+            workload=entry.workload,
+            config=entry.config,
+            latency_ms=entry.latency_ms,
+            validated=False,
+            validation={
+                **entry.validation,
+                "retarget_status": "pending",
+                "source_compiler": source_compiler,
+                "source_kernel_digest": profile.kernel_digest,
+            },
+        )
+        for entry in profile.entries
+    )
+    return KernelProfile(
+        hardware=hardware,
+        compiler=compiler,
+        entries=pending,
+        provenance=dict(provenance),
+        kernel_digest=KERNEL_SOURCE_DIGEST,
     )
 
 
 __all__ = [
+    "BASE_BACKWARD_KERNEL_CONFIGS",
+    "BASE_FORWARD_KERNEL_CONFIGS",
     "DEFAULT_BACKWARD_KERNEL_CONFIGS",
+    "DEFAULT_DKV_KERNEL_CONFIGS",
+    "DEFAULT_DQ_KERNEL_CONFIGS",
     "DEFAULT_KERNEL_CONFIGS",
     "KERNEL_PROFILE_VERSION",
+    "KERNEL_SOURCE_DIGEST",
     "PROFILE_FORMAT_VERSION",
     "TUNING_BATCH_HEADS",
     "TUNING_SEQUENCE_LENGTHS",
@@ -734,6 +899,7 @@ __all__ = [
     "KernelConfig",
     "KernelProfile",
     "KernelTuningOptions",
+    "ProfileCompatibility",
     "ProfileEntry",
     "ProfileRegistry",
     "WorkloadKey",
@@ -742,6 +908,7 @@ __all__ = [
     "load_bundled_profiles",
     "load_profile",
     "merge_profile_entry",
+    "prepare_profile_retarget",
     "save_profile",
     "tuning_batch_heads",
     "tuning_sequence_length",

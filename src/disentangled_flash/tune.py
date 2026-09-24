@@ -7,7 +7,7 @@ import hashlib
 import json
 import statistics
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import pairwise
@@ -19,8 +19,10 @@ import torch
 from . import kernel
 from .position import SharedPositionPlanCache
 from .tuning import (
-    DEFAULT_BACKWARD_KERNEL_CONFIGS,
+    DEFAULT_DKV_KERNEL_CONFIGS,
+    DEFAULT_DQ_KERNEL_CONFIGS,
     DEFAULT_KERNEL_CONFIGS,
+    KERNEL_SOURCE_DIGEST,
     TUNING_BATCH_HEADS,
     TUNING_SEQUENCE_LENGTHS,
     CompilerSpec,
@@ -32,6 +34,7 @@ from .tuning import (
     current_provenance,
     load_profile,
     merge_profile_entry,
+    prepare_profile_retarget,
     save_profile,
 )
 
@@ -160,25 +163,50 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
                                     )
 
 
+def _parse_candidate_list(payload: object, context: str) -> tuple[KernelConfig, ...]:
+    if not isinstance(payload, list):
+        raise TypeError(f"{context} must be a JSON array")
+    configs = tuple(KernelConfig.from_dict(item) for item in payload)
+    if not configs or len(configs) != len(set(configs)):
+        raise ValueError(f"{context} must contain unique configurations")
+    return configs
+
+
 def _load_candidates(
     path: Path | None,
-    *,
-    include_backward: bool = False,
-) -> tuple[KernelConfig, ...]:
+) -> tuple[
+    tuple[KernelConfig, ...],
+    tuple[KernelConfig, ...],
+    tuple[KernelConfig, ...],
+]:
+    """Return forward, dQ, and dK/dV candidates.
+
+    A JSON array applies to every phase; an object with ``forward``, ``dq``, and
+    ``dkv`` arrays gives each phase its own search space.
+    """
+
     if path is None:
-        if include_backward:
-            return tuple(dict.fromkeys(DEFAULT_KERNEL_CONFIGS + DEFAULT_BACKWARD_KERNEL_CONFIGS))
-        return DEFAULT_KERNEL_CONFIGS
+        return (
+            DEFAULT_KERNEL_CONFIGS,
+            DEFAULT_DQ_KERNEL_CONFIGS,
+            DEFAULT_DKV_KERNEL_CONFIGS,
+        )
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise ValueError(f"could not read candidate file {path}: {error}") from error
+    if isinstance(payload, dict):
+        phases = ("forward", "dq", "dkv")
+        if set(payload) != set(phases):
+            raise ValueError("candidate object must contain exactly forward, dq, and dkv")
+        forward, dq, dkv = (
+            _parse_candidate_list(payload[phase], f"{phase} candidates") for phase in phases
+        )
+        return forward, dq, dkv
     if not isinstance(payload, list):
-        raise TypeError("candidate file must contain a JSON array")
-    configs = tuple(KernelConfig.from_dict(item) for item in payload)
-    if not configs or len(configs) != len(set(configs)):
-        raise ValueError("candidate file must contain unique configurations")
-    return configs
+        raise TypeError("candidate file must contain a JSON array or a per-phase object")
+    configs = _parse_candidate_list(payload, "candidate file")
+    return configs, configs, configs
 
 
 def _make_padded_inputs(
@@ -857,6 +885,8 @@ def _profile_provenance(
         "warmup": str(args.warmup),
         "repetitions": str(args.repetitions),
         "tie_margin": str(args.tie_margin),
+        "search": "retarget" if getattr(args, "retarget", False) else "hierarchical",
+        "kernel_digest": KERNEL_SOURCE_DIGEST,
         "candidate_sha256": hashlib.sha256(candidate_payload).hexdigest(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -874,6 +904,86 @@ def _choose_winner(
     return min(near_ties, key=lambda result: candidates.index(result[1]))
 
 
+def _retarget_candidates(
+    seed: KernelConfig,
+    candidates: tuple[KernelConfig, ...],
+) -> tuple[KernelConfig, ...]:
+    """Use an old winner plus a small conservative neighborhood on a new compiler."""
+
+    selected = [seed]
+    selected.extend(
+        config
+        for config in candidates
+        if (
+            (config.block_m, config.block_n, config.num_warps)
+            == (seed.block_m, seed.block_n, seed.num_warps)
+            or config in {KernelConfig(32, 32, 4), KernelConfig(64, 64, 4)}
+        )
+    )
+    return tuple(dict.fromkeys(selected))
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    latency_ms: float
+    config: KernelConfig
+    rejected: tuple[str, ...] = ()
+
+
+def _format_config(config: KernelConfig) -> str:
+    return f"{config.block_m}x{config.block_n}w{config.num_warps}s{config.num_stages}"
+
+
+def _search_configs(
+    candidates: tuple[KernelConfig, ...],
+    evaluate: Callable[[KernelConfig], float],
+    *,
+    tie_margin: float,
+    label: str,
+    seed: KernelConfig | None = None,
+    retarget: bool = False,
+) -> SearchResult:
+    """Tune tile/warps first and pipeline depth around the strongest shapes."""
+
+    ordered = tuple(dict.fromkeys(((seed,) if seed is not None else ()) + candidates))
+    if retarget and seed is not None:
+        base = _retarget_candidates(seed, ordered)
+        refinements: tuple[KernelConfig, ...] = ()
+    else:
+        base = tuple(config for config in ordered if config.num_stages == 1)
+        refinements = tuple(config for config in ordered if config.num_stages > 1)
+
+    results: list[tuple[float, KernelConfig]] = []
+    rejected: list[str] = []
+
+    def run_configs(configs: Iterable[KernelConfig]) -> None:
+        for config in configs:
+            try:
+                results.append((evaluate(config), config))
+            # Backends report compile/resource failures through several exception
+            # families, so one bad candidate must not abort the complete run.
+            except Exception as error:  # noqa: BLE001
+                print(f"  rejected {label} {config}: {type(error).__name__}: {error}")
+                rejected.append(f"{_format_config(config)}:{type(error).__name__}")
+                torch.cuda.empty_cache()
+
+    run_configs(base)
+    if not results:
+        raise RuntimeError(f"no correct {label} configuration survived")
+    if refinements:
+        strongest = {
+            (config.block_m, config.block_n, config.num_warps)
+            for _latency, config in sorted(results, key=lambda result: result[0])[:2]
+        }
+        run_configs(
+            config
+            for config in refinements
+            if (config.block_m, config.block_n, config.num_warps) in strongest
+        )
+    latency, winner = _choose_winner(results, ordered, tie_margin)
+    return SearchResult(latency, winner, tuple(rejected))
+
+
 def run(args: argparse.Namespace) -> None:
     if kernel.triton is None or not torch.cuda.is_available():
         raise RuntimeError("the tuning command requires CUDA and Triton")
@@ -887,15 +997,87 @@ def run(args: argparse.Namespace) -> None:
     unknown_passes = set(passes) - {"inference", "training"}
     if unknown_passes:
         raise ValueError(f"unsupported tuning passes: {sorted(unknown_passes)}")
-    candidates = _load_candidates(args.candidates, include_backward="training" in passes)
+    forward_candidates, dq_candidates, dkv_candidates = _load_candidates(args.candidates)
+    all_candidates = tuple(dict.fromkeys(forward_candidates + dq_candidates + dkv_candidates))
     output_path = args.output.expanduser().resolve()
     profile: KernelProfile | None = load_profile(output_path) if output_path.exists() else None
-    if profile is not None and not profile.hardware.matches(hardware):
-        raise ValueError("the output profile belongs to a different GPU model")
-    if profile is not None and profile.compiler != compiler:
-        details = "; ".join(profile.compiler.mismatches(compiler))
-        raise ValueError(f"the output profile belongs to a different compiler ({details})")
-    completed = set() if profile is None else {entry.workload for entry in profile.entries}
+    retarget = bool(getattr(args, "retarget", False))
+    if retarget and profile is None:
+        raise ValueError("retarget requires an existing profile")
+    if profile is not None:
+        compatibility = profile.compatibility(hardware, compiler)
+        if compatibility == "incompatible":
+            raise ValueError("the output profile has incompatible hardware or launch schema")
+        if retarget:
+            profile = prepare_profile_retarget(
+                profile,
+                hardware=hardware,
+                compiler=compiler,
+                provenance=_profile_provenance(args, all_candidates),
+            )
+            save_profile(profile, output_path)
+            print(f"Retargeting {len(profile.entries)} saved winners for the current compiler")
+        elif compatibility != "exact":
+            details = "; ".join(profile.compiler.mismatches(compiler))
+            suffix = f" ({details})" if details else ""
+            raise ValueError(
+                "the output profile requires retargeting"
+                f"{suffix}; run `python -m disentangled_flash.tune retarget {output_path}`"
+            )
+    seed_entries = {} if profile is None else {entry.workload: entry for entry in profile.entries}
+    completed = {workload for workload, entry in seed_entries.items() if entry.validated}
+
+    def is_cached(workload: WorkloadKey) -> bool:
+        return workload in completed and not args.retest
+
+    def search_phase(
+        workload: WorkloadKey,
+        candidates: tuple[KernelConfig, ...],
+        evaluate: Callable[[KernelConfig], float],
+        label: str,
+    ) -> tuple[SearchResult, str]:
+        """Reuse a validated winner, revalidate a pending seed, or search from scratch."""
+
+        seed = seed_entries.get(workload)
+        if is_cached(workload):
+            assert seed is not None
+            return SearchResult(seed.latency_ms, seed.config), "cached"
+        pending = seed is not None and not seed.validated
+        result = _search_configs(
+            candidates,
+            evaluate,
+            tie_margin=args.tie_margin,
+            label=label,
+            seed=None if seed is None else seed.config,
+            retarget=pending,
+        )
+        return result, "retarget" if pending else "hierarchical"
+
+    def record(
+        workload: WorkloadKey,
+        result: SearchResult,
+        search: str,
+        extra: dict[str, str] | None = None,
+    ) -> None:
+        nonlocal profile
+        validation = {**_validation_metadata(workload), "search": search, **(extra or {})}
+        if result.rejected:
+            validation["rejected"] = ";".join(result.rejected)
+        profile = merge_profile_entry(
+            profile,
+            hardware=hardware,
+            compiler=compiler,
+            entry=ProfileEntry(
+                workload=workload,
+                config=result.config,
+                latency_ms=result.latency_ms,
+                validation=validation,
+            ),
+            provenance=_profile_provenance(args, all_candidates),
+        )
+        save_profile(profile, output_path)
+        completed.add(workload)
+
     cases = list(_cases(args))
     if not torch.cuda.is_bf16_supported():
         skipped = sum(case.dtype == "bfloat16" for case in cases)
@@ -903,7 +1085,11 @@ def run(args: argparse.Namespace) -> None:
         if skipped:
             print(f"Skipping {skipped} BF16 workloads unsupported by this GPU")
     workload_count = len(cases) * (int("inference" in passes) + 3 * int("training" in passes))
-    print(f"Tuning {workload_count} workloads on {hardware.name}; {len(candidates)} candidates")
+    print(
+        f"Tuning {workload_count} workloads on {hardware.name}; "
+        f"forward={len(forward_candidates)}, dQ={len(dq_candidates)}, "
+        f"dK/dV={len(dkv_candidates)} candidates"
+    )
     inference_cases = cases if "inference" in passes else []
     for index, case in enumerate(inference_cases, start=1):
         arguments, workload = _make_inputs(
@@ -913,51 +1099,41 @@ def run(args: argparse.Namespace) -> None:
             max_relative_positions=args.max_relative_positions,
             position_embedding_size=args.position_embedding_size,
         )
-        if workload in completed and not args.retest:
+        if retarget and workload not in seed_entries:
+            continue
+        if is_cached(workload):
             print(f"[{index}/{len(inference_cases)} inference] cached {workload}")
             continue
         expected = _reference_for_workload(arguments, workload)
-        winners: list[tuple[float, KernelConfig]] = []
-        for config in candidates:
-            try:
-                latency, actual = _run_config(
-                    arguments,
-                    config,
-                    workload,
-                    warmup=args.warmup,
-                    repetitions=args.repetitions,
-                )
-                strict_index = 16 if workload.layout == "packed" else 18
-                _validate_output(actual, expected, strict_fp32=bool(arguments[strict_index]))
-                if workload.layout == "packed":
-                    _validate_packed_patterns(arguments, config)
-                elif workload.uses_padding_mask:
-                    _validate_mask_patterns(arguments, config)
-                winners.append((latency, config))
-            # Backends report compile/resource failures through several exception
-            # families, so one bad candidate must not abort the complete run.
-            except Exception as error:  # noqa: BLE001
-                print(f"  rejected {config}: {type(error).__name__}: {error}")
-                torch.cuda.empty_cache()
-        if not winners:
-            raise RuntimeError(f"no correct configuration survived for {workload}")
-        latency, winner = _choose_winner(winners, candidates, args.tie_margin)
-        entry = ProfileEntry(
-            workload=workload,
-            config=winner,
-            latency_ms=latency,
-            validation=_validation_metadata(workload),
+        strict_index = 16 if workload.layout == "packed" else 18
+
+        def evaluate_inference(
+            config: KernelConfig,
+            _arguments: tuple[object, ...] = arguments,
+            _workload: WorkloadKey = workload,
+            _expected: torch.Tensor = expected,
+            _strict_index: int = strict_index,
+        ) -> float:
+            latency, actual = _run_config(
+                _arguments,
+                config,
+                _workload,
+                warmup=args.warmup,
+                repetitions=args.repetitions,
+            )
+            _validate_output(actual, _expected, strict_fp32=bool(_arguments[_strict_index]))
+            if _workload.layout == "packed":
+                _validate_packed_patterns(_arguments, config)
+            elif _workload.uses_padding_mask:
+                _validate_mask_patterns(_arguments, config)
+            return latency
+
+        result, search = search_phase(workload, forward_candidates, evaluate_inference, "inference")
+        record(workload, result, search)
+        print(
+            f"[{index}/{len(inference_cases)} inference] "
+            f"{result.latency_ms:.4f} ms {result.config} {workload}"
         )
-        profile = merge_profile_entry(
-            profile,
-            hardware=hardware,
-            compiler=compiler,
-            entry=entry,
-            provenance=_profile_provenance(args, candidates),
-        )
-        save_profile(profile, output_path)
-        completed.add(workload)
-        print(f"[{index}/{len(inference_cases)} inference] {latency:.4f} ms {winner} {workload}")
 
     training_cases = cases if "training" in passes else []
     for index, case in enumerate(training_cases, start=1):
@@ -972,7 +1148,9 @@ def run(args: argparse.Namespace) -> None:
             phase: replace(base_workload, phase=phase)
             for phase in ("training_forward", "backward_dq", "backward_dkv")
         }
-        if all(workload in completed for workload in phase_workloads.values()) and not args.retest:
+        if retarget and not any(workload in seed_entries for workload in phase_workloads.values()):
+            continue
+        if all(is_cached(workload) for workload in phase_workloads.values()):
             print(f"[{index}/{len(training_cases)} training] cached {base_workload}")
             continue
         expected = _training_reference(inputs, base_workload)
@@ -986,7 +1164,15 @@ def run(args: argparse.Namespace) -> None:
         strict_fp32 = base_workload.dtype == "float32" and (
             base_workload.fp32_precision == "strict"
         )
-        baseline = candidates[0]
+
+        def baseline(workload: WorkloadKey, candidates: tuple[KernelConfig, ...]) -> KernelConfig:
+            seed = seed_entries.get(workload)
+            if seed is not None:
+                return seed.config
+            return next(config for config in candidates if config.num_stages == 1)
+
+        dq_baseline = baseline(phase_workloads["backward_dq"], dq_candidates)
+        dkv_baseline = baseline(phase_workloads["backward_dkv"], dkv_candidates)
 
         def measure(
             forward_config: KernelConfig,
@@ -1018,67 +1204,68 @@ def run(args: argparse.Namespace) -> None:
             )
             return forward_ms, backward_ms
 
-        forward_results: list[tuple[float, KernelConfig]] = []
-        for config in candidates:
-            try:
-                forward_ms, _ = measure(config, baseline, baseline)
-                forward_results.append((forward_ms, config))
-            except Exception as error:  # noqa: BLE001
-                print(f"  rejected training forward {config}: {type(error).__name__}: {error}")
-                torch.cuda.empty_cache()
-        forward_latency, forward_winner = _choose_winner(
-            forward_results,
-            candidates,
-            args.tie_margin,
+        forward, forward_search = search_phase(
+            phase_workloads["training_forward"],
+            forward_candidates,
+            lambda config, _dq=dq_baseline, _dkv=dkv_baseline: measure(config, _dq, _dkv)[0],
+            "training forward",
+        )
+        dq, dq_search = search_phase(
+            phase_workloads["backward_dq"],
+            dq_candidates,
+            lambda config, _fwd=forward.config, _dkv=dkv_baseline: measure(_fwd, config, _dkv)[1],
+            "dQ",
+        )
+        dkv, dkv_search = search_phase(
+            phase_workloads["backward_dkv"],
+            dkv_candidates,
+            lambda config, _fwd=forward.config, _dq=dq.config: measure(_fwd, _dq, config)[1],
+            "dK/dV",
         )
 
-        dq_results: list[tuple[float, KernelConfig]] = []
-        for config in candidates:
-            try:
-                _, backward_ms = measure(forward_winner, config, baseline)
-                dq_results.append((backward_ms, config))
-            except Exception as error:  # noqa: BLE001
-                print(f"  rejected dQ {config}: {type(error).__name__}: {error}")
-                torch.cuda.empty_cache()
-        dq_latency, dq_winner = _choose_winner(dq_results, candidates, args.tie_margin)
-
-        dkv_results: list[tuple[float, KernelConfig]] = []
-        for config in candidates:
-            try:
-                _, backward_ms = measure(forward_winner, dq_winner, config)
-                dkv_results.append((backward_ms, config))
-            except Exception as error:  # noqa: BLE001
-                print(f"  rejected dK/dV {config}: {type(error).__name__}: {error}")
-                torch.cuda.empty_cache()
-        dkv_latency, dkv_winner = _choose_winner(dkv_results, candidates, args.tie_margin)
-
-        training_results = (
-            ("training_forward", forward_latency, forward_winner),
-            ("backward_dq", dq_latency, dq_winner),
-            ("backward_dkv", dkv_latency, dkv_winner),
-        )
-        for phase, latency, winner in training_results:
-            workload = phase_workloads[phase]
-            entry = ProfileEntry(
-                workload=workload,
-                config=winner,
-                latency_ms=latency,
-                validation=_validation_metadata(workload),
+        # Confirm numerical parity and end-to-end behavior with the three
+        # independently selected winners rather than trusting coordinate timings.
+        combined_forward_ms, combined_backward_ms = measure(forward.config, dq.config, dkv.config)
+        refined = False
+        # dQ was measured against the baseline dK/dV schedule.  If the final
+        # combination regresses past that measurement, re-tune dQ once with the
+        # selected dK/dV winner instead of iterating coordinate descent.
+        if dq_search != "cached" and combined_backward_ms > dq.latency_ms * (1 + args.tie_margin):
+            retuned = _search_configs(
+                dq_candidates,
+                lambda config, _fwd=forward.config, _dkv=dkv.config: measure(_fwd, config, _dkv)[1],
+                tie_margin=args.tie_margin,
+                label="dQ refinement",
+                seed=dq.config,
             )
-            profile = merge_profile_entry(
-                profile,
-                hardware=hardware,
-                compiler=compiler,
-                entry=entry,
-                provenance=_profile_provenance(args, candidates),
+            dq = replace(retuned, rejected=dq.rejected + retuned.rejected)
+            combined_forward_ms, combined_backward_ms = measure(
+                forward.config, dq.config, dkv.config
             )
-            save_profile(profile, output_path)
-            completed.add(workload)
+            refined = True
+
+        combined = {
+            "combined_forward_ms": f"{combined_forward_ms:.9g}",
+            "combined_backward_ms": f"{combined_backward_ms:.9g}",
+        }
+        for phase, result, search in (
+            ("training_forward", forward, forward_search),
+            ("backward_dq", dq, dq_search),
+            ("backward_dkv", dkv, dkv_search),
+        ):
+            if search == "cached":
+                continue
+            extra = dict(combined)
+            if refined and phase == "backward_dq":
+                extra["refined"] = "dq"
+            record(phase_workloads[phase], result, search, extra)
         print(
             f"[{index}/{len(training_cases)} training] "
-            f"fwd={forward_latency:.4f} ms {forward_winner}; "
-            f"dQ-total={dq_latency:.4f} ms {dq_winner}; "
-            f"dK/dV-total={dkv_latency:.4f} ms {dkv_winner} {base_workload}"
+            f"fwd={forward.latency_ms:.4f} ms {forward.config}; "
+            f"dQ-total={dq.latency_ms:.4f} ms {dq.config}; "
+            f"dK/dV-total={dkv.latency_ms:.4f} ms {dkv.config}; "
+            f"combined={combined_forward_ms:.4f}+{combined_backward_ms:.4f} ms "
+            f"{base_workload}"
         )
     print(f"Saved {len(profile.entries) if profile else 0} entries to {output_path}")
 
@@ -1125,7 +1312,10 @@ def inspect_profile(path: Path, device: int = 0) -> bool:
 
     profile = load_profile(path.expanduser().resolve())
     print(f"Profile: {path}")
-    print(f"Format: {profile.format_version}; kernel: {profile.kernel_version}")
+    print(
+        f"Format: {profile.format_version}; kernel: {profile.kernel_version}; "
+        f"digest: {profile.kernel_digest[:12]}"
+    )
     print(
         f"GPU: {profile.hardware.name} "
         f"sm_{profile.hardware.compute_capability[0]}{profile.hardware.compute_capability[1]}"
@@ -1135,17 +1325,27 @@ def inspect_profile(path: Path, device: int = 0) -> bool:
     issues = list(profile.compiler.mismatches(compiler))
     if torch.cuda.is_available():
         hardware = HardwareSpec.current(device)
-        if not profile.hardware.matches(hardware):
+        compatibility = profile.compatibility(hardware, compiler)
+        if compatibility == "exact":
+            print("Compatibility: exact")
+            print("Compatible: yes")
+            return True
+        if compatibility == "retargetable":
+            if profile.kernel_digest != KERNEL_SOURCE_DIGEST:
+                issues.append("kernel source digest differs")
+            print("Compatibility: retargetable")
+            print(f"Retarget with: python -m disentangled_flash.tune retarget {path}")
+        else:
             issues.append(f"hardware: profile={profile.hardware.name!r}, current={hardware.name!r}")
+            print("Compatibility: incompatible")
     else:
         issues.append("hardware: CUDA is unavailable, so GPU compatibility was not checked")
+        print("Compatibility: unknown")
     if issues:
         print("Compatible: no")
         for issue in issues:
             print(f"  - {issue}")
-        return False
-    print("Compatible: yes")
-    return True
+    return False
 
 
 def build_inspect_parser() -> argparse.ArgumentParser:
@@ -1161,7 +1361,14 @@ def main(argv: list[str] | None = None) -> None:
         inspect_args = build_inspect_parser().parse_args(arguments[1:])
         inspect_profile(inspect_args.profile, inspect_args.device)
         return
-    args = build_parser().parse_args(arguments)
+    if arguments[:1] == ["retarget"]:
+        if len(arguments) < 2:
+            raise SystemExit("retarget requires a profile path")
+        args = build_parser().parse_args(["--output", arguments[1], *arguments[2:]])
+        args.retarget = True
+    else:
+        args = build_parser().parse_args(arguments)
+        args.retarget = False
     if (
         args.warmup < 0
         or args.repetitions < 1

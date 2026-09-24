@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -64,6 +66,9 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             )
         )
         self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
+        # Training-forward workloads whose saved schedules failed to compile or
+        # launch; every phase of such a workload falls back to bounded autotuning.
+        self._failed_profile_workloads: set[WorkloadKey] = set()
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
 
     def _resolve_kernel_config(
@@ -114,6 +119,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 workload,
             )
         config = self._resolved_kernel_configs[cache_key]
+        if replace(workload, phase="training_forward") in self._failed_profile_workloads:
+            config = None
         if config is None and self.tuning.mode == "profile_only":
             raise RuntimeError(
                 self._profile_registry.explain_miss(
@@ -123,6 +130,45 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 )
             )
         return config
+
+    def _launch_with_profile_fallback(
+        self,
+        launch: Callable[[KernelConfig | None, KernelConfig | None, KernelConfig | None], Any],
+        config_options: dict[str, Any],
+    ) -> Any:
+        forward_config = self._resolve_kernel_config(**config_options, phase="training_forward")
+        dq_config = None
+        dkv_config = None
+        if torch.is_grad_enabled():
+            dq_config = self._resolve_kernel_config(**config_options, phase="backward_dq")
+            dkv_config = self._resolve_kernel_config(**config_options, phase="backward_dkv")
+        if forward_config is None and dq_config is None and dkv_config is None:
+            return launch(None, None, None)
+        try:
+            return launch(forward_config, dq_config, dkv_config)
+        except Exception as error:
+            if self.tuning.mode == "profile_only":
+                raise RuntimeError(
+                    "saved training kernel configuration failed to launch: "
+                    f"forward={forward_config}, dQ={dq_config}, dK/dV={dkv_config}"
+                ) from error
+            hidden_states = config_options["hidden_states"]
+            self._failed_profile_workloads.add(
+                WorkloadKey(
+                    sequence_length=config_options["sequence_length"],
+                    head_dim=self.attention_head_size,
+                    batch_heads=config_options["batch_heads"],
+                    active_slots=config_options["active_slots"],
+                    dtype=str(hidden_states.dtype).removeprefix("torch."),
+                    has_c2p=config_options["has_c2p"],
+                    has_p2c=config_options["has_p2c"],
+                    fp32_precision=self.fp32_precision,
+                    layout=config_options["layout"],
+                    uses_padding_mask=config_options["uses_padding_mask"],
+                    phase="training_forward",
+                )
+            )
+            return launch(None, None, None)
 
     def _normalize_mask(
         self,
@@ -216,31 +262,24 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             "layout": "padded",
             "uses_padding_mask": has_padding,
         }
-        forward_config = self._resolve_kernel_config(
-            **config_options,
-            phase="training_forward",
-        )
-        dq_config = None
-        dkv_config = None
-        if torch.is_grad_enabled():
-            dq_config = self._resolve_kernel_config(**config_options, phase="backward_dq")
-            dkv_config = self._resolve_kernel_config(**config_options, phase="backward_dkv")
-
-        output = training_attention(
-            query_layer,
-            key_layer,
-            value_layer,
-            pos_key,
-            pos_query,
-            plan.delta_to_local,
-            mask,
-            score_scale=score_scale,
-            has_padding=has_padding,
-            strict_fp32=self.fp32_precision == "strict",
-            forward_config=forward_config,
-            dq_config=dq_config,
-            dkv_config=dkv_config,
-            autotune_candidates=self.tuning.candidates,
+        output = self._launch_with_profile_fallback(
+            lambda forward_config, dq_config, dkv_config: training_attention(
+                query_layer,
+                key_layer,
+                value_layer,
+                pos_key,
+                pos_query,
+                plan.delta_to_local,
+                mask,
+                score_scale=score_scale,
+                has_padding=has_padding,
+                strict_fp32=self.fp32_precision == "strict",
+                forward_config=forward_config,
+                dq_config=dq_config,
+                dkv_config=dkv_config,
+                autotune_candidates=self.tuning.candidates,
+            ),
+            config_options,
         )
         return output, None
 
@@ -302,30 +341,24 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             "layout": "packed",
             "uses_padding_mask": False,
         }
-        forward_config = self._resolve_kernel_config(
-            **config_options,
-            phase="training_forward",
-        )
-        dq_config = None
-        dkv_config = None
-        if torch.is_grad_enabled():
-            dq_config = self._resolve_kernel_config(**config_options, phase="backward_dq")
-            dkv_config = self._resolve_kernel_config(**config_options, phase="backward_dkv")
-        output = training_attention_packed(
-            query_layer,
-            key_layer,
-            value_layer,
-            pos_key,
-            pos_query,
-            plan.delta_to_local,
-            cu_seqlens,
-            max_seqlen=info.max_seqlen,
-            score_scale=score_scale,
-            strict_fp32=self.fp32_precision == "strict",
-            forward_config=forward_config,
-            dq_config=dq_config,
-            dkv_config=dkv_config,
-            autotune_candidates=self.tuning.candidates,
+        output = self._launch_with_profile_fallback(
+            lambda forward_config, dq_config, dkv_config: training_attention_packed(
+                query_layer,
+                key_layer,
+                value_layer,
+                pos_key,
+                pos_query,
+                plan.delta_to_local,
+                cu_seqlens,
+                max_seqlen=info.max_seqlen,
+                score_scale=score_scale,
+                strict_fp32=self.fp32_precision == "strict",
+                forward_config=forward_config,
+                dq_config=dq_config,
+                dkv_config=dkv_config,
+                autotune_candidates=self.tuning.candidates,
+            ),
+            config_options,
         )
         return output, None
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 
+import pytest
 import torch
 
 import disentangled_flash
@@ -47,6 +48,49 @@ def test_training_attention_accepts_shared_tuning_options() -> None:
     target = TritonTrainingDisentangledSelfAttention(make_config(), tuning=tuning)
 
     assert target.tuning is tuning
+
+
+def test_training_attention_falls_back_to_autotune_when_saved_schedule_fails() -> None:
+    config = KernelConfig(32, 64, 4)
+    target = TritonTrainingDisentangledSelfAttention(
+        make_config(),
+        tuning=KernelTuningOptions(mode="fixed", fixed_config=config),
+    )
+    launches = []
+
+    def launch(forward_config, dq_config, dkv_config):
+        launches.append((forward_config, dq_config, dkv_config))
+        if forward_config is not None:
+            raise RuntimeError("out of resources")
+        return "autotuned"
+
+    options = {
+        "hidden_states": torch.empty(1, 1, 256),
+        "sequence_length": 128,
+        "batch_heads": 4,
+        "active_slots": 128,
+        "has_c2p": True,
+        "has_p2c": True,
+        "layout": "padded",
+        "uses_padding_mask": True,
+    }
+    with torch.enable_grad():
+        assert target._launch_with_profile_fallback(launch, options) == "autotuned"
+    assert launches == [(config, config, config), (None, None, None)]
+
+
+def test_profile_only_training_attention_raises_when_saved_schedule_fails(monkeypatch) -> None:
+    target = TritonTrainingDisentangledSelfAttention(
+        make_config(),
+        tuning=KernelTuningOptions(mode="profile_only", use_bundled_profiles=False),
+    )
+    monkeypatch.setattr(target, "_resolve_kernel_config", lambda **_kwargs: KernelConfig(32, 64, 4))
+
+    def launch(*_configs):
+        raise RuntimeError("out of resources")
+
+    with pytest.raises(RuntimeError, match="saved training kernel configuration failed"):
+        target._launch_with_profile_fallback(launch, {"hidden_states": torch.empty(1)})
 
 
 def test_training_public_api_is_exported() -> None:

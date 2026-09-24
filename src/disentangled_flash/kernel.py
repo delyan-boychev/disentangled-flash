@@ -148,6 +148,8 @@ if triton is not None:
                 config.kwargs["BLOCK_N"],
             )
             in allowed_shapes
+            and not (is_fp32 and config.num_stages > 1)
+            and not (config.num_stages > 2 and (sequence_length < 384 or head_dim != 64))
         ]
 
         # 32x32 is deliberately present as a conservative fallback for every

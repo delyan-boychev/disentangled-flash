@@ -16,7 +16,8 @@ from typing import Any
 import torch
 
 from ..tuning import (
-    DEFAULT_BACKWARD_KERNEL_CONFIGS,
+    DEFAULT_DKV_KERNEL_CONFIGS,
+    DEFAULT_DQ_KERNEL_CONFIGS,
     DEFAULT_KERNEL_CONFIGS,
     KernelConfig,
     tuning_sequence_length,
@@ -620,9 +621,7 @@ if triton is not None:
             other=0.0,
         )
         output_offsets = (
-            query_tokens[:, None] * (NUM_HEADS * HEAD_DIM)
-            + head * HEAD_DIM
-            + dims[None, :]
+            query_tokens[:, None] * (NUM_HEADS * HEAD_DIM) + head * HEAD_DIM + dims[None, :]
         )
         do = tl.load(grad_output + output_offsets, mask=row_mask[:, None], other=0.0)
         lse = tl.load(
@@ -812,9 +811,7 @@ if triton is not None:
                 other=0.0,
             )
             output_offsets = (
-                query_tokens[:, None] * (NUM_HEADS * HEAD_DIM)
-                + head * HEAD_DIM
-                + dims[None, :]
+                query_tokens[:, None] * (NUM_HEADS * HEAD_DIM) + head * HEAD_DIM + dims[None, :]
             )
             do = tl.load(grad_output + output_offsets, mask=row_mask[:, None], other=0.0)
             lse = tl.load(
@@ -941,6 +938,8 @@ if triton is not None:
                 continue
             if (is_fp32 or head_dim == 128) and block_m * block_n > 2048:
                 continue
+            if is_fp32 and config.num_stages > 1:
+                continue
             if head_dim == 128 and config.num_warps < 4:
                 continue
             kept.append(config)
@@ -957,7 +956,7 @@ if triton is not None:
         atomic_output: str,
         *,
         packed: bool = False,
-        configs: tuple[KernelConfig, ...] = DEFAULT_BACKWARD_KERNEL_CONFIGS,
+        configs: tuple[KernelConfig, ...],
     ) -> Any:
         triton_configs = [
             triton.Config(
@@ -983,48 +982,57 @@ if triton is not None:
 
     @cache
     def _make_training_autotune_bundle(
-        configs: tuple[KernelConfig, ...],
+        forward_configs: tuple[KernelConfig, ...],
+        dq_configs: tuple[KernelConfig, ...],
+        dkv_configs: tuple[KernelConfig, ...],
     ) -> tuple[Any, Any, Any, Any, Any, Any]:
         return (
-            _make_autotuned_kernel(configs),
-            _make_packed_autotuned_kernel(configs),
+            _make_autotuned_kernel(forward_configs),
+            _make_packed_autotuned_kernel(forward_configs),
             _make_backward_autotuned_kernel(
                 _backward_dq_dc_kernel,
                 "grad_c2p",
-                configs=configs,
+                configs=dq_configs,
             ),
             _make_backward_autotuned_kernel(
                 _backward_dkv_dt_kernel,
                 "grad_p2c",
-                configs=configs,
+                configs=dkv_configs,
             ),
             _make_backward_autotuned_kernel(
                 _packed_backward_dq_dc_kernel,
                 "grad_c2p",
                 packed=True,
-                configs=configs,
+                configs=dq_configs,
             ),
             _make_backward_autotuned_kernel(
                 _packed_backward_dkv_dt_kernel,
                 "grad_p2c",
                 packed=True,
-                configs=configs,
+                configs=dkv_configs,
             ),
         )
 
-    _DEFAULT_TRAINING_CONFIGS = tuple(
-        dict.fromkeys(DEFAULT_KERNEL_CONFIGS + DEFAULT_BACKWARD_KERNEL_CONFIGS)
+    _DEFAULT_TRAINING_CONFIGS = (
+        DEFAULT_KERNEL_CONFIGS,
+        DEFAULT_DQ_KERNEL_CONFIGS,
+        DEFAULT_DKV_KERNEL_CONFIGS,
     )
-    _training_autotune_bundles = [_make_training_autotune_bundle(_DEFAULT_TRAINING_CONFIGS)]
+    _training_autotune_bundles = [_make_training_autotune_bundle(*_DEFAULT_TRAINING_CONFIGS)]
     _training_autotune_bundle_ids = {_DEFAULT_TRAINING_CONFIGS: 0}
 
-    def _register_training_autotune_candidates(configs: tuple[KernelConfig, ...]) -> int:
-        existing = _training_autotune_bundle_ids.get(configs)
+    def _register_training_autotune_candidates(
+        configs: tuple[KernelConfig, ...] | None,
+    ) -> int:
+        phase_configs = (
+            _DEFAULT_TRAINING_CONFIGS if configs is None else (configs, configs, configs)
+        )
+        existing = _training_autotune_bundle_ids.get(phase_configs)
         if existing is not None:
             return existing
         identifier = len(_training_autotune_bundles)
-        _training_autotune_bundles.append(_make_training_autotune_bundle(configs))
-        _training_autotune_bundle_ids[configs] = identifier
+        _training_autotune_bundles.append(_make_training_autotune_bundle(*phase_configs))
+        _training_autotune_bundle_ids[phase_configs] = identifier
         return identifier
 
 
@@ -1217,7 +1225,7 @@ if (
         fallback = _backward_tile_config(sequence_length, head_dim)
         preprocess_block = dq_block_m or fallback.block_m
         preprocess_warps = dq_num_warps or fallback.num_warps
-        preprocess_stages = dq_num_stages or fallback.num_stages
+        preprocess_stages = 1
         preprocess_grid = (
             triton.cdiv(sequence_length, preprocess_block),
             batch_size * num_heads,
@@ -1555,7 +1563,7 @@ if (
             HEAD_DIM=head_dim,
             BLOCK_M=preprocess_block,
             num_warps=dq_num_warps or fallback.num_warps,
-            num_stages=dq_num_stages or fallback.num_stages,
+            num_stages=1,
         )
 
         dq_kernel = _packed_backward_dq_dc_kernel
@@ -2039,13 +2047,13 @@ def training_attention(
             pos_query_tensor = _empty_optional(query)
 
     store_lse = torch.is_grad_enabled()
+
     def config_values(config: KernelConfig | None) -> tuple[int, int, int, int]:
         if config is None:
             return 0, 0, 0, 0
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
-    candidates = autotune_candidates or _DEFAULT_TRAINING_CONFIGS
-    autotune_bundle_id = _register_training_autotune_candidates(tuple(candidates))
+    autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
     output, _lse = _training_attention_forward_op(
         query,
         key,
@@ -2112,7 +2120,9 @@ def training_attention_packed(
         or delta_to_local.numel() != 2 * max_seqlen - 1
         or not delta_to_local.is_contiguous()
     ):
-        raise ValueError("delta_to_local must be a contiguous int32 vector with 2*max_seqlen-1 entries")
+        raise ValueError(
+            "delta_to_local must be a contiguous int32 vector with 2*max_seqlen-1 entries"
+        )
 
     has_c2p = pos_key is not None
     has_p2c = pos_query is not None
@@ -2139,8 +2149,7 @@ def training_attention_packed(
             return 0, 0, 0, 0
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
-    candidates = autotune_candidates or _DEFAULT_TRAINING_CONFIGS
-    autotune_bundle_id = _register_training_autotune_candidates(tuple(candidates))
+    autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
     output, _lse = _training_attention_packed_forward_op(
         query,
         key,

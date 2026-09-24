@@ -8,15 +8,22 @@ from disentangled_flash.tune import (
     PRESETS,
     TuningCase,
     _cases,
+    _load_candidates,
     _make_inputs,
     _make_training_inputs,
     _packed_reference,
     _reference,
+    _search_configs,
     _training_reference,
     build_parser,
     inspect_profile,
+    main,
 )
 from disentangled_flash.tuning import (
+    DEFAULT_DKV_KERNEL_CONFIGS,
+    DEFAULT_DQ_KERNEL_CONFIGS,
+    DEFAULT_KERNEL_CONFIGS,
+    KERNEL_SOURCE_DIGEST,
     CompilerSpec,
     HardwareSpec,
     KernelConfig,
@@ -28,6 +35,7 @@ from disentangled_flash.tuning import (
     load_bundled_profiles,
     load_profile,
     merge_profile_entry,
+    prepare_profile_retarget,
     save_profile,
     tuning_sequence_length,
 )
@@ -88,7 +96,8 @@ def test_profile_json_round_trip(tmp_path):
     assert save_profile(expected, destination) == destination.resolve()
     assert load_profile(destination) == expected
     payload = json.loads(destination.read_text())
-    assert payload["format_version"] == 3
+    assert payload["format_version"] == 4
+    assert payload["kernel_digest"] == KERNEL_SOURCE_DIGEST
     assert payload["compiler"]["triton_key"] == "triton-test-key"
     assert payload["entries"][0]["workload"]["length_regime"] == 128
     assert payload["entries"][0]["workload"]["layout"] == "padded"
@@ -102,9 +111,7 @@ def test_profile_phase_separates_training_forward_and_backward_winners():
         ProfileEntry(make_workload(phase="backward_dq"), KernelConfig(32, 64, 4), 0.2),
         ProfileEntry(make_workload(phase="backward_dkv"), KernelConfig(64, 64, 8), 0.3),
     )
-    registry = ProfileRegistry(
-        (KernelProfile(make_hardware(), make_compiler(), entries=entries),)
-    )
+    registry = ProfileRegistry((KernelProfile(make_hardware(), make_compiler(), entries=entries),))
 
     assert registry.resolve(
         make_hardware(), make_compiler(), make_workload(phase="training_forward")
@@ -270,11 +277,246 @@ def test_registry_isolates_padded_and_packed_winners():
         make_compiler(cuda_runtime="13.0"),
     ],
 )
-def test_registry_rejects_incompatible_compilers(compiler):
+def test_registry_requires_retargeting_for_different_compilers(compiler):
     registry = ProfileRegistry((make_profile(),))
 
     assert registry.resolve(make_hardware(), compiler, make_workload()) is None
-    assert "incompatible" in registry.explain_miss(make_hardware(), compiler, make_workload())
+    assert "retargeting" in registry.explain_miss(make_hardware(), compiler, make_workload())
+
+
+def test_profile_compatibility_distinguishes_exact_retargetable_and_incompatible():
+    profile = make_profile()
+
+    assert profile.compatibility(make_hardware(), make_compiler()) == "exact"
+    assert (
+        profile.compatibility(make_hardware(), make_compiler(triton_key="different"))
+        == "retargetable"
+    )
+    incompatible = KernelProfile(
+        hardware=profile.hardware,
+        compiler=profile.compiler,
+        entries=profile.entries,
+        kernel_version="different-launch-schema",
+    )
+    assert incompatible.compatibility(make_hardware(), make_compiler()) == "incompatible"
+
+
+def test_prepare_retarget_preserves_winners_as_pending_seeds():
+    source = make_profile()
+    current = make_compiler(triton_key="different")
+
+    pending = prepare_profile_retarget(
+        source,
+        hardware=make_hardware(),
+        compiler=current,
+        provenance={"kind": "retarget"},
+    )
+
+    assert pending.compiler == current
+    assert pending.kernel_digest == KERNEL_SOURCE_DIGEST
+    assert pending.entries[0].config == source.entries[0].config
+    assert pending.entries[0].validated is False
+    assert pending.entries[0].validation["retarget_status"] == "pending"
+
+
+def test_default_candidates_search_pipeline_depth_by_phase():
+    assert {config.num_stages for config in DEFAULT_KERNEL_CONFIGS} == {1, 2, 3}
+    assert {config.num_stages for config in DEFAULT_DQ_KERNEL_CONFIGS} == {1, 2}
+    assert {config.num_stages for config in DEFAULT_DKV_KERNEL_CONFIGS} == {1, 2}
+
+
+def test_hierarchical_search_refines_stages_only_for_strong_shapes():
+    candidates = (
+        KernelConfig(32, 32, 4, 1),
+        KernelConfig(64, 64, 4, 1),
+        KernelConfig(32, 32, 4, 2),
+        KernelConfig(64, 64, 4, 2),
+    )
+    measured = []
+    latencies = {
+        candidates[0]: 2.0,
+        candidates[1]: 1.0,
+        candidates[2]: 1.8,
+        candidates[3]: 0.8,
+    }
+
+    result = _search_configs(
+        candidates,
+        lambda config: measured.append(config) or latencies[config],
+        tie_margin=0.0,
+        label="test",
+    )
+
+    assert measured == list(candidates)
+    assert result.latency_ms == 0.8
+    assert result.config == KernelConfig(64, 64, 4, 2)
+    assert result.rejected == ()
+
+
+def test_hierarchical_search_skips_stages_for_weak_shapes_and_records_rejections():
+    weak = KernelConfig(16, 16, 4)
+    strong = KernelConfig(64, 64, 4)
+    broken = KernelConfig(32, 32, 4)
+    candidates = (
+        weak,
+        strong,
+        broken,
+        KernelConfig(16, 16, 4, 2),
+        KernelConfig(64, 64, 4, 2),
+        KernelConfig(64, 64, 4, 3),
+    )
+    latencies = {
+        weak: 3.0,
+        strong: 1.0,
+        KernelConfig(16, 16, 4, 2): 2.5,
+        KernelConfig(64, 64, 4, 2): 0.9,
+    }
+    measured = []
+
+    def evaluate(config):
+        measured.append(config)
+        if config == broken or config.num_stages == 3:
+            raise RuntimeError("out of resources")
+        return latencies[config]
+
+    result = _search_configs(candidates, evaluate, tie_margin=0.0, label="test")
+
+    # Only two stage-one shapes survive, so both remain eligible for refinement.
+    assert KernelConfig(16, 16, 4, 2) in measured
+    assert result.config == KernelConfig(64, 64, 4, 2)
+    assert result.rejected == ("32x32w4s1:RuntimeError", "64x64w4s3:RuntimeError")
+
+    latencies[broken] = 2.0
+    measured.clear()
+    result = _search_configs(
+        candidates,
+        lambda config: measured.append(config) or latencies.get(config, 0.5),
+        tie_margin=0.0,
+        label="test",
+    )
+    assert KernelConfig(16, 16, 4, 2) not in measured
+    assert result.config == KernelConfig(64, 64, 4, 3)
+
+
+def test_search_raises_when_every_candidate_fails():
+    def evaluate(_config):
+        raise RuntimeError("compile failure")
+
+    with pytest.raises(RuntimeError, match="no correct test configuration"):
+        _search_configs((KernelConfig(32, 32, 4),), evaluate, tie_margin=0.0, label="test")
+
+
+def test_retarget_search_measures_only_seed_neighborhood():
+    seed = KernelConfig(32, 64, 8, 2)
+    candidates = (
+        KernelConfig(16, 16, 4),
+        KernelConfig(32, 32, 4),
+        KernelConfig(32, 64, 8),
+        KernelConfig(64, 64, 4),
+        KernelConfig(64, 32, 4, 2),
+    )
+    measured = []
+
+    result = _search_configs(
+        candidates,
+        lambda config: measured.append(config) or 1.0,
+        tie_margin=0.0,
+        label="test",
+        seed=seed,
+        retarget=True,
+    )
+
+    assert measured == [
+        seed,
+        KernelConfig(32, 32, 4),
+        KernelConfig(32, 64, 8),
+        KernelConfig(64, 64, 4),
+    ]
+    assert result.config == seed
+
+
+def test_candidate_file_accepts_shared_list_and_per_phase_object(tmp_path):
+    shared = [KernelConfig(32, 32, 4).to_dict()]
+    path = tmp_path / "shared.json"
+    path.write_text(json.dumps(shared))
+    assert _load_candidates(path) == ((KernelConfig(32, 32, 4),),) * 3
+
+    phased = {
+        "forward": [KernelConfig(64, 64, 4, 2).to_dict()],
+        "dq": [KernelConfig(32, 64, 4).to_dict()],
+        "dkv": [KernelConfig(64, 32, 8).to_dict()],
+    }
+    path = tmp_path / "phased.json"
+    path.write_text(json.dumps(phased))
+    assert _load_candidates(path) == (
+        (KernelConfig(64, 64, 4, 2),),
+        (KernelConfig(32, 64, 4),),
+        (KernelConfig(64, 32, 8),),
+    )
+
+    path.write_text(json.dumps({"forward": phased["forward"]}))
+    with pytest.raises(ValueError, match="forward, dq, and dkv"):
+        _load_candidates(path)
+
+
+def test_retarget_is_resumable_on_an_exact_profile():
+    current = make_compiler(triton_key="different")
+    pending = prepare_profile_retarget(
+        make_profile(),
+        hardware=make_hardware(),
+        compiler=current,
+        provenance={},
+    )
+    revalidated = merge_profile_entry(
+        pending,
+        hardware=make_hardware(),
+        compiler=current,
+        entry=ProfileEntry(make_workload(), KernelConfig(32, 64, 4, 2), 0.1),
+        provenance={},
+    )
+
+    resumed = prepare_profile_retarget(
+        revalidated,
+        hardware=make_hardware(),
+        compiler=current,
+        provenance={},
+    )
+
+    assert resumed == revalidated
+    assert resumed.entries[0].validated
+
+
+def test_format_three_profile_migrates_as_retargetable(tmp_path):
+    payload = make_profile().to_dict()
+    payload.pop("kernel_digest")
+    payload["format_version"] = 3
+    payload["kernel_version"] = "deberta-attention-forward-runtime-length-v3"
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(payload))
+
+    profile = load_profile(path)
+    registry = ProfileRegistry((profile,))
+
+    assert profile.provenance["migrated_from_format"] == "3"
+    assert profile.compatibility(make_hardware(), make_compiler()) == "retargetable"
+    assert registry.resolve(make_hardware(), make_compiler(), make_workload()) is None
+    assert "retargeting" in registry.explain_miss(make_hardware(), make_compiler(), make_workload())
+
+
+def test_retarget_command_targets_the_profile(monkeypatch, tmp_path):
+    captured = []
+    monkeypatch.setattr("disentangled_flash.tune.run", captured.append)
+    profile = tmp_path / "profile.json"
+
+    main(["retarget", str(profile), "--passes", "training"])
+    main(["--output", str(profile)])
+
+    assert captured[0].retarget is True
+    assert captured[0].output == profile
+    assert captured[0].passes == ("training",)
+    assert captured[1].retarget is False
+    with pytest.raises(SystemExit, match="profile path"):
+        main(["retarget"])
 
 
 def test_autotune_key_excludes_exact_runtime_dimensions():
