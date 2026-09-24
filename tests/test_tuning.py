@@ -7,6 +7,7 @@ from disentangled_flash.kernel import AUTOTUNE_SPECIALIZATION_KEY
 from disentangled_flash.tune import (
     PRESETS,
     TuningCase,
+    _cases,
     _make_inputs,
     _make_training_inputs,
     _packed_reference,
@@ -160,15 +161,20 @@ def test_tuning_sequence_lengths_use_bounded_families(length, representative):
     assert tuning_sequence_length(length) == representative
 
 
-def test_standard_is_the_broadest_supported_preset():
+def test_standard_covers_supported_deberta_variants_and_all_kernel_phases():
     assert set(PRESETS) == {"quick", "standard"}
-    assert PRESETS["standard"]["relative_modes"] == ("none", "c2p", "p2c", "both")
+    assert PRESETS["standard"]["head_dims"] == (64,)
+    assert PRESETS["standard"]["batch_heads"] == (8, 32)
+    assert PRESETS["standard"]["relative_modes"] == ("both",)
     assert PRESETS["standard"]["layouts"] == ("padded", "packed")
     assert PRESETS["standard"]["passes"] == ("inference", "training")
     assert PRESETS["standard"]["lengths"][-1] == 8192
     args = build_parser().parse_args(["--output", "profile.json"])
     assert args.preset == "standard"
     assert args.passes is None
+    cases = list(_cases(args))
+    assert len(cases) == 216
+    assert len(cases) * (1 + 3) == 864
 
 
 def test_packed_tuning_case_uses_mixed_boundaries_and_separate_workload():

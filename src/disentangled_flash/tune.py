@@ -67,10 +67,13 @@ PRESETS = {
     },
     "standard": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
-        "head_dims": (32, 64, 128),
+        # Official DeBERTa-v2/v3 variants keep a 64-wide attention head.  Both
+        # occupancy families are needed: xsmall can land in the <=8 family,
+        # while base and larger variants land in the <=32 family.
+        "head_dims": (64,),
         "batch_heads": TUNING_BATCH_HEADS,
         "dtypes": ("float16", "bfloat16", "float32"),
-        "relative_modes": ("none", "c2p", "p2c", "both"),
+        "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
     },

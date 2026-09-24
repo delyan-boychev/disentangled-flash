@@ -146,8 +146,6 @@ Generate a resumable profile on a CUDA machine with:
 
 ```bash
 python -m disentangled_flash.tune \
-  --preset standard \
-  --passes inference,training \
   --output rtx-6000-ada.json
 ```
 
@@ -155,12 +153,15 @@ python -m disentangled_flash.tune \
 python -m disentangled_flash.tune inspect rtx-6000-ada.json
 ```
 
-The `standard` preset covers length families `64`, `128`, `384`, `512`, `768`,
-`1024`, `2048`, `4096`, and `8192`, supported dtypes, attention modes, occupancy
-regimes, and padded/packed layouts. Results are parity-checked and saved after
-each workload so tuning can resume. `--passes inference` or `--passes training`
-can restrict a run. Training profiles record separate `training_forward`,
-`backward_dq`, and `backward_dkv` winners.
+The default `standard` preset covers all supported DeBERTa-v2/v3 variants: length
+families `64`, `128`, `384`, `512`, `768`, `1024`, `2048`, `4096`, and `8192`,
+head dimension 64, both launch-occupancy regimes, supported dtypes, C2P+P2C
+relative attention, and padded/packed layouts. It evaluates 216 workload shapes
+across `inference`, `training_forward`, `backward_dq`, and `backward_dkv`, for
+864 phase workloads in total. Results are parity-checked and saved after each
+workload so tuning can resume. `--passes inference` or `--passes training` can
+restrict a run; the shape and attention options remain available for custom
+architectures.
 
 ### Packed unpadded inference and training
 
