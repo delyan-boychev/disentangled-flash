@@ -1086,7 +1086,18 @@ def run(args: argparse.Namespace) -> None:
                 f"{suffix}; run `python -m disentangled_flash.tune retarget {output_path}`"
             )
     seed_entries = {} if profile is None else {entry.workload: entry for entry in profile.entries}
-    completed = {workload for workload, entry in seed_entries.items() if entry.validated}
+
+    def is_allowed(workload: WorkloadKey, config: KernelConfig) -> bool:
+        return config in conservative_candidates(
+            (config,), dtype=workload.dtype, phase=workload.phase
+        )
+
+    # Saved winners outside the conservative FP32 space are re-tuned on resume.
+    completed = {
+        workload
+        for workload, entry in seed_entries.items()
+        if entry.validated and is_allowed(workload, entry.config)
+    }
 
     def is_cached(workload: WorkloadKey) -> bool:
         return workload in completed and not args.retest
@@ -1105,9 +1116,7 @@ def run(args: argparse.Namespace) -> None:
             return SearchResult(seed.latency_ms, seed.config), "cached"
         candidates = conservative_candidates(candidates, dtype=workload.dtype, phase=workload.phase)
         # A saved seed outside the conservative space is searched from scratch.
-        if seed is not None and seed.config not in conservative_candidates(
-            (seed.config,), dtype=workload.dtype, phase=workload.phase
-        ):
+        if seed is not None and not is_allowed(workload, seed.config):
             seed = None
         pending = seed is not None and not seed.validated
         result = _search_configs(
@@ -1244,9 +1253,7 @@ def run(args: argparse.Namespace) -> None:
                 candidates, dtype=workload.dtype, phase=workload.phase
             )
             seed = seed_entries.get(workload)
-            if seed is not None and seed.config in conservative_candidates(
-                (seed.config,), dtype=workload.dtype, phase=workload.phase
-            ):
+            if seed is not None and is_allowed(workload, seed.config):
                 return seed.config
             return next(config for config in allowed if config.num_stages == 1)
 
@@ -1311,7 +1318,11 @@ def run(args: argparse.Namespace) -> None:
         # selected dK/dV winner instead of iterating coordinate descent.
         if dq_search != "cached" and combined_backward_ms > dq.latency_ms * (1 + args.tie_margin):
             retuned = _search_configs(
-                dq_candidates,
+                conservative_candidates(
+                    dq_candidates,
+                    dtype=base_workload.dtype,
+                    phase="backward_dq",
+                ),
                 lambda config, _fwd=forward.config, _dkv=dkv.config: measure(_fwd, config, _dkv)[1],
                 tie_margin=args.tie_margin,
                 label="dQ refinement",
