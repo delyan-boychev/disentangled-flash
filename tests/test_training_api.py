@@ -73,6 +73,7 @@ def test_training_attention_falls_back_to_autotune_when_saved_schedule_fails() -
         "has_p2c": True,
         "layout": "padded",
         "uses_padding_mask": True,
+        "has_dropout": False,
     }
     with torch.enable_grad():
         assert target._launch_with_profile_fallback(launch, options) == "autotuned"

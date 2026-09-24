@@ -31,12 +31,18 @@ from .tuning import (
     KernelProfile,
     ProfileEntry,
     WorkloadKey,
+    conservative_candidates,
     current_provenance,
     load_profile,
     merge_profile_entry,
     prepare_profile_retarget,
     save_profile,
+    tuning_dtype,
 )
+
+# DeBERTa-v2/v3 checkpoints ship attention_probs_dropout_prob=0.1.  The rate is
+# a runtime scalar, so any non-zero rate shares the dropout schedule.
+TUNING_DROPOUT_P = 0.1
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ PRESETS = {
         "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
+        "dropout": ("off",),
     },
     "standard": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
@@ -75,10 +82,14 @@ PRESETS = {
         # while base and larger variants land in the <=32 family.
         "head_dims": (64,),
         "batch_heads": TUNING_BATCH_HEADS,
-        "dtypes": ("float16", "bfloat16", "float32"),
+        # FP16 and BF16 share one ``half`` precision family, as in
+        # FlashAttention and FlexAttention; BF16 is the measured representative.
+        "dtypes": ("bfloat16", "float32"),
         "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
+        # Dropout changes register pressure, so training tunes both variants.
+        "dropout": ("off", "on"),
     },
 }
 
@@ -137,6 +148,11 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
     unsupported_head_dims = set(head_dims) - {32, 64, 128}
     if unsupported_head_dims:
         raise ValueError(f"unsupported head dimensions: {sorted(unsupported_head_dims)}")
+    # One measured dtype per precision family; the first requested one wins.
+    families: dict[str, str] = {}
+    for dtype_name in dtypes:
+        families.setdefault(tuning_dtype(dtype_name), dtype_name)
+    dtypes = tuple(families.values())
     if max(lengths) > TUNING_SEQUENCE_LENGTHS[-1]:
         raise ValueError(f"tuning lengths must not exceed {TUNING_SEQUENCE_LENGTHS[-1]}")
     for length in lengths:
@@ -161,6 +177,14 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
                                         layout=layout,
                                         uses_padding_mask=uses_padding_mask,
                                     )
+
+
+def _dropout_modes(args: argparse.Namespace) -> tuple[bool, ...]:
+    modes = args.dropout or PRESETS[args.preset]["dropout"]
+    unknown = set(modes) - {"off", "on"}
+    if unknown:
+        raise ValueError(f"unsupported dropout modes: {sorted(unknown)}")
+    return tuple(mode == "on" for mode in modes)
 
 
 def _parse_candidate_list(payload: object, context: str) -> tuple[KernelConfig, ...]:
@@ -378,6 +402,8 @@ class TrainingInputs:
     sequence_metadata: torch.Tensor
     max_seqlen: int
     score_scale: float
+    dropout_p: float = 0.0
+    dropout_seed: torch.Tensor | None = None
 
     def grad_tensors(self) -> tuple[torch.Tensor, ...]:
         tensors = [self.query, self.key, self.value]
@@ -395,6 +421,7 @@ def _make_training_inputs(
     position_buckets: int = 256,
     max_relative_positions: int = 512,
     position_embedding_size: int = 256,
+    dropout_p: float = 0.0,
 ) -> tuple[TrainingInputs, WorkloadKey]:
     dtype = _dtype(case.dtype)
     if case.layout == "packed":
@@ -450,6 +477,11 @@ def _make_training_inputs(
         sequence_metadata=sequence_metadata,
         max_seqlen=case.sequence_length,
         score_scale=(case.head_dim * scale_factor) ** -0.5,
+        dropout_p=dropout_p,
+        # A fixed seed makes every candidate see the same mask as the reference.
+        dropout_seed=(
+            torch.tensor([0x1BF52], device=device, dtype=torch.int64) if dropout_p else None
+        ),
     )
     workload = WorkloadKey(
         sequence_length=case.sequence_length,
@@ -463,6 +495,7 @@ def _make_training_inputs(
         layout=case.layout,
         uses_padding_mask=case.uses_padding_mask,
         phase="training_forward",
+        has_dropout=dropout_p > 0.0,
     )
     return inputs, workload
 
@@ -482,6 +515,8 @@ def _run_training_forward(
         "forward_config": forward_config,
         "dq_config": dq_config,
         "dkv_config": dkv_config,
+        "dropout_p": inputs.dropout_p,
+        "dropout_seed": inputs.dropout_seed,
     }
     if workload.layout == "packed":
         return training_attention_packed(
@@ -682,12 +717,28 @@ def _packed_reference(arguments: tuple[object, ...]) -> torch.Tensor:
     return output.squeeze(0)
 
 
+def _dropout_keep(inputs: TrainingInputs, stream_start: int, streams: int, length: int):
+    if not inputs.dropout_p:
+        return None
+    from .training._kernels import dropout_keep_mask
+
+    assert inputs.dropout_seed is not None
+    return dropout_keep_mask(
+        inputs.dropout_seed,
+        stream_start=stream_start,
+        streams=streams,
+        length=length,
+        dropout_p=inputs.dropout_p,
+    )
+
+
 def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.Tensor:
     def sequence_attention(
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         mask: torch.Tensor | None,
+        keep: torch.Tensor | None = None,
     ) -> torch.Tensor:
         length = query.size(-2)
         positions = torch.arange(length, device=query.device)
@@ -714,10 +765,14 @@ def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.
             pair_mask = mask[:, None] & mask[None, :]
             scores = scores.masked_fill(~pair_mask, float("-inf"))
             scores = torch.where(~mask[:, None], torch.zeros_like(scores), scores)
-        context = torch.matmul(torch.softmax(scores, dim=-1), value.float()).to(query.dtype)
+        probabilities = torch.softmax(scores, dim=-1)
+        if keep is not None:
+            probabilities = probabilities * keep / (1.0 - inputs.dropout_p)
+        context = torch.matmul(probabilities, value.float()).to(query.dtype)
         return context.transpose(0, 1).reshape(length, -1)
 
     if workload.layout == "packed":
+        num_heads = inputs.query.size(0)
         boundaries = inputs.sequence_metadata.detach().cpu().tolist()
         return torch.cat(
             [
@@ -726,17 +781,20 @@ def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.
                     inputs.key[:, start:end],
                     inputs.value[:, start:end],
                     None,
+                    _dropout_keep(inputs, sequence * num_heads, num_heads, end - start),
                 )
-                for start, end in pairwise(boundaries)
+                for sequence, (start, end) in enumerate(pairwise(boundaries))
             ],
             dim=0,
         )
     mask = inputs.sequence_metadata[0] if workload.uses_padding_mask else None
+    num_heads, length = inputs.query.size(1), inputs.query.size(2)
     return sequence_attention(
         inputs.query[0],
         inputs.key[0],
         inputs.value[0],
         mask,
+        _dropout_keep(inputs, 0, num_heads, length),
     ).unsqueeze(0)
 
 
@@ -821,7 +879,10 @@ def _validation_metadata(workload: WorkloadKey) -> dict[str, str]:
         patterns = "full,partial,one_token,fully_masked"
     else:
         patterns = "dense_unmasked"
-    return {"rtol": rtol, "atol": atol, "patterns": patterns}
+    metadata = {"rtol": rtol, "atol": atol, "patterns": patterns}
+    if workload.has_dropout:
+        metadata["dropout_p"] = str(TUNING_DROPOUT_P)
+    return metadata
 
 
 def _validate_mask_patterns(arguments: tuple[object, ...], config: KernelConfig) -> None:
@@ -1042,6 +1103,12 @@ def run(args: argparse.Namespace) -> None:
         if is_cached(workload):
             assert seed is not None
             return SearchResult(seed.latency_ms, seed.config), "cached"
+        candidates = conservative_candidates(candidates, dtype=workload.dtype, phase=workload.phase)
+        # A saved seed outside the conservative space is searched from scratch.
+        if seed is not None and seed.config not in conservative_candidates(
+            (seed.config,), dtype=workload.dtype, phase=workload.phase
+        ):
+            seed = None
         pending = seed is not None and not seed.validated
         result = _search_configs(
             candidates,
@@ -1079,12 +1146,19 @@ def run(args: argparse.Namespace) -> None:
         completed.add(workload)
 
     cases = list(_cases(args))
-    if not torch.cuda.is_bf16_supported():
-        skipped = sum(case.dtype == "bfloat16" for case in cases)
-        cases = [case for case in cases if case.dtype != "bfloat16"]
-        if skipped:
-            print(f"Skipping {skipped} BF16 workloads unsupported by this GPU")
-    workload_count = len(cases) * (int("inference" in passes) + 3 * int("training" in passes))
+    if not torch.cuda.is_bf16_supported() and any(case.dtype == "bfloat16" for case in cases):
+        # FP16 measures the same half-precision family on GPUs without BF16.
+        cases = [
+            replace(case, dtype="float16") if case.dtype == "bfloat16" else case for case in cases
+        ]
+        print("Measuring the half-precision family with FP16; this GPU lacks BF16")
+    dropout_modes = _dropout_modes(args)
+    training_cases = (
+        [(case, dropout) for case in cases for dropout in dropout_modes]
+        if "training" in passes
+        else []
+    )
+    workload_count = len(cases) * int("inference" in passes) + 3 * len(training_cases)
     print(
         f"Tuning {workload_count} workloads on {hardware.name}; "
         f"forward={len(forward_candidates)}, dQ={len(dq_candidates)}, "
@@ -1135,14 +1209,14 @@ def run(args: argparse.Namespace) -> None:
             f"{result.latency_ms:.4f} ms {result.config} {workload}"
         )
 
-    training_cases = cases if "training" in passes else []
-    for index, case in enumerate(training_cases, start=1):
+    for index, (case, dropout) in enumerate(training_cases, start=1):
         inputs, base_workload = _make_training_inputs(
             case,
             device,
             position_buckets=args.position_buckets,
             max_relative_positions=args.max_relative_positions,
             position_embedding_size=args.position_embedding_size,
+            dropout_p=TUNING_DROPOUT_P if dropout else 0.0,
         )
         phase_workloads = {
             phase: replace(base_workload, phase=phase)
@@ -1166,10 +1240,15 @@ def run(args: argparse.Namespace) -> None:
         )
 
         def baseline(workload: WorkloadKey, candidates: tuple[KernelConfig, ...]) -> KernelConfig:
+            allowed = conservative_candidates(
+                candidates, dtype=workload.dtype, phase=workload.phase
+            )
             seed = seed_entries.get(workload)
-            if seed is not None:
+            if seed is not None and seed.config in conservative_candidates(
+                (seed.config,), dtype=workload.dtype, phase=workload.phase
+            ):
                 return seed.config
-            return next(config for config in candidates if config.num_stages == 1)
+            return next(config for config in allowed if config.num_stages == 1)
 
         dq_baseline = baseline(phase_workloads["backward_dq"], dq_candidates)
         dkv_baseline = baseline(phase_workloads["backward_dkv"], dkv_candidates)
@@ -1281,6 +1360,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-heads", type=_csv_ints)
     parser.add_argument("--dtypes", type=_csv_strings)
     parser.add_argument("--relative-modes", type=_csv_strings)
+    parser.add_argument(
+        "--dropout",
+        type=_csv_strings,
+        help="comma-separated off and/or on attention-dropout variants for training",
+    )
     parser.add_argument(
         "--layouts",
         type=_csv_strings,

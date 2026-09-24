@@ -24,8 +24,10 @@ differentiable training paths.
 - FlashAttention-style packed, unpadded inference and training with `cu_seqlens`
 - **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
-The training Triton path currently requires self-attention, head dimensions 32,
-64, or 128, and `attention_probs_dropout_prob=0`. It does not yet support
+The training Triton path requires self-attention and head dimensions 32, 64, or
+128. Attention-probability dropout (`attention_probs_dropout_prob`) runs inside
+the fused kernels: like FlashAttention, the Philox mask is regenerated in the
+backward pass instead of being stored. It does not yet support
 `output_attentions=True` or custom pairwise relative-position tensors. CPU/MPS
 use the differentiable PyTorch backend rather than Triton.
 
@@ -155,11 +157,16 @@ python -m disentangled_flash.tune inspect rtx-6000-ada.json
 
 The default `standard` preset covers all supported DeBERTa-v2/v3 variants: length
 families `64`, `128`, `384`, `512`, `768`, `1024`, `2048`, `4096`, and `8192`,
-head dimension 64, both launch-occupancy regimes, supported dtypes, C2P+P2C
-relative attention, and padded/packed layouts. It evaluates 216 workload shapes
-across `inference`, `training_forward`, `backward_dq`, and `backward_dkv`, for
-864 phase workloads in total. Results are parity-checked and saved after each
-workload so tuning can resume. `--passes inference` or `--passes training` can
+head dimension 64, both launch-occupancy regimes, C2P+P2C relative attention,
+and padded/packed layouts. Like FlashAttention and FlexAttention, FP16 and BF16
+share one half-precision schedule family (measured with BF16), while strict FP32
+and fast FP32/TF32 are tuned separately over a conservative search: one pipeline
+stage, forward tiles up to 64x64, and backward tiles up to 2048 elements. Training phases are tuned with and
+without attention dropout, because the in-kernel mask changes register pressure.
+That is 162 workload shapes, giving 162 `inference` workloads plus 972 training
+workloads (`training_forward`, `backward_dq`, and `backward_dkv` for both dropout
+variants), 1134 phase workloads in total. Results are parity-checked and saved after each workload so tuning can
+resume. `--passes inference`, `--passes training`, or `--dropout off|on` can
 restrict a run; the shape and attention options remain available for custom
 architectures.
 

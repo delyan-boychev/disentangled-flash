@@ -8,6 +8,7 @@ from disentangled_flash.tune import (
     PRESETS,
     TuningCase,
     _cases,
+    _dropout_modes,
     _load_candidates,
     _make_inputs,
     _make_training_inputs,
@@ -32,11 +33,13 @@ from disentangled_flash.tuning import (
     ProfileEntry,
     ProfileRegistry,
     WorkloadKey,
+    conservative_candidates,
     load_bundled_profiles,
     load_profile,
     merge_profile_entry,
     prepare_profile_retarget,
     save_profile,
+    tuning_dtype,
     tuning_sequence_length,
 )
 
@@ -180,8 +183,12 @@ def test_standard_covers_supported_deberta_variants_and_all_kernel_phases():
     assert args.preset == "standard"
     assert args.passes is None
     cases = list(_cases(args))
-    assert len(cases) == 216
-    assert len(cases) * (1 + 3) == 864
+    # FP16/BF16 share the half family: 9 lengths x 2 occupancies x
+    # (half, FP32 strict, FP32 fast) x (masked, unmasked, packed).
+    assert len(cases) == 162
+    assert {case.dtype for case in cases} == {"bfloat16", "float32"}
+    assert _dropout_modes(args) == (False, True)
+    assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 1134
 
 
 def test_packed_tuning_case_uses_mixed_boundaries_and_separate_workload():
@@ -683,3 +690,106 @@ def test_tuning_reference_query_chunking_preserves_results():
     small_chunks = _reference(arguments, query_chunk_size=3)
 
     torch.testing.assert_close(small_chunks, one_chunk)
+
+
+def test_half_precision_family_shares_fp16_and_bf16_workloads():
+    fp16 = make_workload()
+    bf16 = WorkloadKey(**{**_workload_kwargs(fp16), "dtype": "bfloat16"})
+    fp32 = WorkloadKey(**{**_workload_kwargs(fp16), "dtype": "float32"})
+
+    assert tuning_dtype("float16") == tuning_dtype("bfloat16") == "half"
+    assert fp16 == bf16
+    assert fp16.to_dict()["dtype"] == "half"
+    assert fp32 != fp16
+    with pytest.raises(ValueError, match="dtype"):
+        tuning_dtype("float64")
+
+
+def _workload_kwargs(workload):
+    return {
+        "sequence_length": workload.sequence_length,
+        "head_dim": workload.head_dim,
+        "batch_heads": workload.batch_heads,
+        "active_slots": workload.active_slots,
+        "dtype": workload.dtype,
+        "has_c2p": workload.has_c2p,
+        "has_p2c": workload.has_p2c,
+        "fp32_precision": workload.fp32_precision,
+        "layout": workload.layout,
+        "uses_padding_mask": workload.uses_padding_mask,
+        "phase": workload.phase,
+        "has_dropout": workload.has_dropout,
+    }
+
+
+def test_dropout_is_a_separate_training_workload():
+    plain = make_workload(phase="backward_dq")
+    dropped = WorkloadKey(**{**_workload_kwargs(plain), "has_dropout": True})
+
+    assert plain != dropped
+    assert WorkloadKey.from_dict(dropped.to_dict()) == dropped
+    legacy = plain.to_dict()
+    legacy.pop("has_dropout")
+    assert WorkloadKey.from_dict(legacy).has_dropout is False
+    with pytest.raises(ValueError, match="inference workloads cannot use attention dropout"):
+        WorkloadKey(**{**_workload_kwargs(make_workload()), "has_dropout": True})
+
+
+def test_legacy_fp16_and_bf16_twins_collapse_on_load(tmp_path):
+    payload = make_profile().to_dict()
+    fp16_entry = payload["entries"][0]
+    fp16_entry["workload"]["dtype"] = "float16"
+    bf16_entry = json.loads(json.dumps(fp16_entry))
+    bf16_entry["workload"]["dtype"] = "bfloat16"
+    bf16_entry["config"] = KernelConfig(32, 32, 4).to_dict()
+    payload["entries"] = [fp16_entry, bf16_entry]
+    path = tmp_path / "legacy.json"
+    path.write_text(json.dumps(payload))
+
+    profile = load_profile(path)
+
+    assert len(profile.entries) == 1
+    assert profile.entries[0].workload.dtype == "half"
+    assert profile.entries[0].config == KernelConfig.from_dict(fp16_entry["config"])
+
+    payload["entries"] = [fp16_entry, json.loads(json.dumps(fp16_entry))]
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="duplicate"):
+        load_profile(path)
+
+
+def test_cases_measure_one_dtype_per_precision_family():
+    args = build_parser().parse_args(
+        ["--output", "p.json", "--dtypes", "float16,bfloat16,float32", "--lengths", "64"]
+    )
+
+    assert {case.dtype for case in _cases(args)} == {"float16", "float32"}
+
+
+def test_dropout_modes_follow_cli_and_reject_unknown_values():
+    args = build_parser().parse_args(["--output", "p.json", "--dropout", "on"])
+    assert _dropout_modes(args) == (True,)
+    assert _dropout_modes(
+        build_parser().parse_args(["--output", "p.json", "--preset", "quick"])
+    ) == (False,)
+    args = build_parser().parse_args(["--output", "p.json", "--dropout", "sometimes"])
+    with pytest.raises(ValueError, match="dropout modes"):
+        _dropout_modes(args)
+
+
+def test_fp32_searches_only_conservative_single_stage_schedules():
+    for phase, candidates, limit in (
+        ("inference", DEFAULT_KERNEL_CONFIGS, 64 * 64),
+        ("training_forward", DEFAULT_KERNEL_CONFIGS, 64 * 64),
+        ("backward_dq", DEFAULT_DQ_KERNEL_CONFIGS, 2048),
+        ("backward_dkv", DEFAULT_DKV_KERNEL_CONFIGS, 2048),
+    ):
+        fp32 = conservative_candidates(candidates, dtype="float32", phase=phase)
+        assert fp32
+        assert all(config.num_stages == 1 for config in fp32)
+        assert all(config.block_m * config.block_n <= limit for config in fp32)
+        assert conservative_candidates(candidates, dtype="bfloat16", phase=phase) == candidates
+
+    assert conservative_candidates(
+        (KernelConfig(128, 64, 4),), dtype="float32", phase="inference"
+    ) == (KernelConfig(32, 32, 4),)

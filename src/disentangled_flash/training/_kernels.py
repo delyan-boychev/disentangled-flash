@@ -44,6 +44,7 @@ if triton is not None:
     from ..kernel import (
         _deberta_attention_forward_kernel,
         _deberta_attention_packed_forward_kernel,
+        _dropout_keep,
         _make_autotuned_kernel,
         _make_packed_autotuned_kernel,
     )
@@ -150,6 +151,10 @@ if triton is not None:
         LENGTH_REGIME: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -277,7 +282,11 @@ if triton is not None:
                     dp = tl.dot(do, tl.trans(v), input_precision="tf32")
             else:
                 dp = tl.dot(do, tl.trans(v))
-            ds_raw = p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE
+            dp = dp.to(tl.float32)
+            if HAS_DROPOUT:
+                keep = _dropout_keep(dropout_seed, batch_head, rows, cols, DROPOUT_P)
+                dp = tl.where(keep, dp * DROPOUT_SCALE, 0.0)
+            ds_raw = p * (dp - row_delta[:, None]) * SCORE_SCALE
             ds_raw = tl.where(score_grad_pair, ds_raw, 0.0)
 
             if IS_FP32:
@@ -359,6 +368,10 @@ if triton is not None:
         LENGTH_REGIME: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         key_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -489,22 +502,29 @@ if triton is not None:
                     dp = tl.dot(do, tl.trans(v), input_precision="tf32")
             else:
                 dp = tl.dot(do, tl.trans(v))
-            ds_raw = p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE
+            dp = dp.to(tl.float32)
+            if HAS_DROPOUT:
+                keep = _dropout_keep(dropout_seed, batch_head, rows, cols, DROPOUT_P)
+                dp = tl.where(keep, dp * DROPOUT_SCALE, 0.0)
+                p_dropped = tl.where(keep, p * DROPOUT_SCALE, 0.0)
+            else:
+                p_dropped = p
+            ds_raw = p * (dp - row_delta[:, None]) * SCORE_SCALE
             ds_raw = tl.where(score_grad_pair, ds_raw, 0.0)
 
             if IS_FP32:
                 if STRICT_FP32:
                     dk += tl.dot(tl.trans(ds_raw), q, input_precision="ieee")
-                    dv += tl.dot(tl.trans(p), do, input_precision="ieee")
+                    dv += tl.dot(tl.trans(p_dropped), do, input_precision="ieee")
                 else:
                     dk += tl.dot(tl.trans(ds_raw), q, input_precision="tf32")
-                    dv += tl.dot(tl.trans(p), do, input_precision="tf32")
+                    dv += tl.dot(tl.trans(p_dropped), do, input_precision="tf32")
             elif IS_BF16:
                 dk += tl.dot(tl.trans(ds_raw.to(tl.bfloat16)), q)
-                dv += tl.dot(tl.trans(p.to(tl.bfloat16)), do)
+                dv += tl.dot(tl.trans(p_dropped.to(tl.bfloat16)), do)
             else:
                 dk += tl.dot(tl.trans(ds_raw.to(tl.float16)), q)
-                dv += tl.dot(tl.trans(p.to(tl.float16)), do)
+                dv += tl.dot(tl.trans(p_dropped.to(tl.float16)), do)
 
             if HAS_P2C:
                 tl.atomic_add(
@@ -597,6 +617,10 @@ if triton is not None:
         LENGTH_REGIME: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         sequence_head = tl.program_id(1)
@@ -690,9 +714,13 @@ if triton is not None:
                     dp = tl.dot(do, tl.trans(v), input_precision="tf32")
             else:
                 dp = tl.dot(do, tl.trans(v))
+            dp = dp.to(tl.float32)
+            if HAS_DROPOUT:
+                keep = _dropout_keep(dropout_seed, sequence_head, rows, cols, DROPOUT_P)
+                dp = tl.where(keep, dp * DROPOUT_SCALE, 0.0)
             ds = tl.where(
                 pair_mask,
-                p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE,
+                p * (dp - row_delta[:, None]) * SCORE_SCALE,
                 0.0,
             )
             if IS_FP32:
@@ -763,6 +791,10 @@ if triton is not None:
         LENGTH_REGIME: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         key_block = tl.program_id(0)
         sequence_head = tl.program_id(1)
@@ -858,24 +890,31 @@ if triton is not None:
                     dp = tl.dot(do, tl.trans(v), input_precision="tf32")
             else:
                 dp = tl.dot(do, tl.trans(v))
+            dp = dp.to(tl.float32)
+            if HAS_DROPOUT:
+                keep = _dropout_keep(dropout_seed, sequence_head, rows, cols, DROPOUT_P)
+                dp = tl.where(keep, dp * DROPOUT_SCALE, 0.0)
+                p_dropped = tl.where(keep, p * DROPOUT_SCALE, 0.0)
+            else:
+                p_dropped = p
             ds = tl.where(
                 pair_mask,
-                p * (dp.to(tl.float32) - row_delta[:, None]) * SCORE_SCALE,
+                p * (dp - row_delta[:, None]) * SCORE_SCALE,
                 0.0,
             )
             if IS_FP32:
                 if STRICT_FP32:
                     dk += tl.dot(tl.trans(ds), q, input_precision="ieee")
-                    dv += tl.dot(tl.trans(p), do, input_precision="ieee")
+                    dv += tl.dot(tl.trans(p_dropped), do, input_precision="ieee")
                 else:
                     dk += tl.dot(tl.trans(ds), q, input_precision="tf32")
-                    dv += tl.dot(tl.trans(p), do, input_precision="tf32")
+                    dv += tl.dot(tl.trans(p_dropped), do, input_precision="tf32")
             elif IS_BF16:
                 dk += tl.dot(tl.trans(ds.to(tl.bfloat16)), q)
-                dv += tl.dot(tl.trans(p.to(tl.bfloat16)), do)
+                dv += tl.dot(tl.trans(p_dropped.to(tl.bfloat16)), do)
             else:
                 dk += tl.dot(tl.trans(ds.to(tl.float16)), q)
-                dv += tl.dot(tl.trans(p.to(tl.float16)), do)
+                dv += tl.dot(tl.trans(p_dropped.to(tl.float16)), do)
             if HAS_P2C:
                 tl.atomic_add(
                     dt_base + key_tokens[None, :] * ACTIVE_SLOTS + local_slot,
@@ -893,6 +932,61 @@ if triton is not None:
             dv,
             mask=col_mask[:, None],
         )
+
+
+if triton is not None:
+
+    @triton.jit
+    def _dropout_keep_mask_kernel(
+        dropout_seed,
+        keep,
+        STREAM_START,
+        LENGTH,
+        DROPOUT_P,
+        BLOCK: tl.constexpr,
+    ):
+        row_block = tl.program_id(0)
+        col_block = tl.program_id(1)
+        stream = tl.program_id(2)
+        rows = row_block * BLOCK + tl.arange(0, BLOCK)
+        cols = col_block * BLOCK + tl.arange(0, BLOCK)
+        kept = _dropout_keep(dropout_seed, STREAM_START + stream, rows, cols, DROPOUT_P)
+        tl.store(
+            keep + (stream * LENGTH + rows[:, None]).to(tl.int64) * LENGTH + cols[None, :],
+            kept.to(tl.int8),
+            mask=(rows[:, None] < LENGTH) & (cols[None, :] < LENGTH),
+        )
+
+
+def dropout_keep_mask(
+    dropout_seed: torch.Tensor,
+    *,
+    stream_start: int,
+    streams: int,
+    length: int,
+    dropout_p: float,
+) -> torch.Tensor:
+    """Materialize the kernels' attention-dropout keep mask for validation.
+
+    Streams are ``batch * heads + head`` for padded attention and
+    ``sequence * heads + head`` for packed attention.  Returns a bool tensor of
+    shape ``[streams, length, length]``.
+    """
+
+    _require_training_runtime()
+    _validate_dropout(dropout_p, dropout_seed)
+    keep = torch.empty((streams, length, length), device=dropout_seed.device, dtype=torch.int8)
+    block = 64
+    grid = (triton.cdiv(length, block), triton.cdiv(length, block), streams)
+    _dropout_keep_mask_kernel[grid](
+        dropout_seed.reshape(1),
+        keep,
+        stream_start,
+        length,
+        float(dropout_p),
+        BLOCK=block,
+    )
+    return keep.bool()
 
 
 def _backward_tile_config(sequence_length: int, head_dim: int) -> KernelConfig:
@@ -918,6 +1012,7 @@ if triton is not None:
         "IS_BF16",
         "IS_FP32",
         "STRICT_FP32",
+        "HAS_DROPOUT",
     ]
 
     def _prune_backward_configs(
@@ -980,6 +1075,9 @@ if triton is not None:
             autotune_kwargs["cache_results"] = True
         return triton.autotune(**autotune_kwargs)(kernel)
 
+    # Dropout changes register pressure, so it keys its own autotuned schedule.
+    _TRAINING_FORWARD_EXTRA_KEY = ("HAS_DROPOUT",)
+
     @cache
     def _make_training_autotune_bundle(
         forward_configs: tuple[KernelConfig, ...],
@@ -987,8 +1085,8 @@ if triton is not None:
         dkv_configs: tuple[KernelConfig, ...],
     ) -> tuple[Any, Any, Any, Any, Any, Any]:
         return (
-            _make_autotuned_kernel(forward_configs),
-            _make_packed_autotuned_kernel(forward_configs),
+            _make_autotuned_kernel(forward_configs, _TRAINING_FORWARD_EXTRA_KEY),
+            _make_packed_autotuned_kernel(forward_configs, _TRAINING_FORWARD_EXTRA_KEY),
             _make_backward_autotuned_kernel(
                 _backward_dq_dc_kernel,
                 "grad_c2p",
@@ -1040,6 +1138,47 @@ def _empty_optional(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_empty((0,))
 
 
+def _dropout_launch_options(dropout_p: float, dropout_seed: torch.Tensor) -> dict[str, Any]:
+    has_dropout = dropout_p > 0.0
+    return {
+        "dropout_seed": dropout_seed,
+        "DROPOUT_P": float(dropout_p),
+        "DROPOUT_SCALE": 1.0 / (1.0 - dropout_p) if has_dropout else 1.0,
+        "HAS_DROPOUT": has_dropout,
+    }
+
+
+def _validate_dropout(dropout_p: float, dropout_seed: torch.Tensor | None) -> None:
+    if isinstance(dropout_p, bool) or not isinstance(dropout_p, (int, float)):
+        raise TypeError("dropout_p must be a float")
+    if not 0.0 <= dropout_p < 1.0:
+        raise ValueError("dropout_p must be in [0, 1)")
+    if dropout_seed is not None and (
+        dropout_seed.dtype != torch.int64 or dropout_seed.numel() != 1
+    ):
+        raise ValueError("dropout_seed must be a one-element int64 tensor")
+
+
+def _resolve_dropout_seed(
+    reference: torch.Tensor,
+    dropout_p: float,
+    dropout_seed: torch.Tensor | None,
+) -> torch.Tensor:
+    """Draw a fresh device-side Philox seed per call unless one is supplied.
+
+    Keeping the seed on the device avoids a host synchronization, respects the
+    CUDA generator state, and traces cleanly under torch.compile.
+    """
+
+    if dropout_p == 0.0:
+        return torch.empty((0,), device=reference.device, dtype=torch.int64)
+    if dropout_seed is not None:
+        if dropout_seed.device != reference.device:
+            raise ValueError("dropout_seed must be on the query device")
+        return dropout_seed.reshape(1)
+    return torch.randint(0, 2**62, (1,), device=reference.device, dtype=torch.int64)
+
+
 if (
     triton is not None
     and hasattr(torch.library, "triton_op")
@@ -1064,6 +1203,8 @@ if (
         has_p2c: bool,
         strict_fp32: bool,
         store_lse: bool,
+        dropout_p: float,
+        dropout_seed: torch.Tensor,
         autotune_bundle_id: int,
         forward_block_m: int,
         forward_block_n: int,
@@ -1149,6 +1290,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             STORE_LSE=store_lse,
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **launch_options,
         )
         return output, lse_log2
@@ -1173,6 +1315,8 @@ if (
         has_c2p: bool,
         has_p2c: bool,
         strict_fp32: bool,
+        dropout_p: float,
+        dropout_seed: torch.Tensor,
         autotune_bundle_id: int,
         dq_block_m: int,
         dq_block_n: int,
@@ -1314,6 +1458,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(sequence_length),
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **dq_options,
         )
 
@@ -1385,6 +1530,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(sequence_length),
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **dkv_options,
         )
         return grad_query, grad_key, grad_value, grad_c2p, grad_p2c
@@ -1407,6 +1553,8 @@ if (
         has_p2c: bool,
         strict_fp32: bool,
         store_lse: bool,
+        dropout_p: float,
+        dropout_seed: torch.Tensor,
         autotune_bundle_id: int,
         forward_block_m: int,
         forward_block_n: int,
@@ -1486,6 +1634,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             STORE_LSE=store_lse,
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **launch_options,
         )
         return output, lse_log2
@@ -1510,6 +1659,8 @@ if (
         has_c2p: bool,
         has_p2c: bool,
         strict_fp32: bool,
+        dropout_p: float,
+        dropout_seed: torch.Tensor,
         autotune_bundle_id: int,
         dq_block_m: int,
         dq_block_n: int,
@@ -1620,6 +1771,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(max_seqlen),
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **dq_options,
         )
 
@@ -1681,6 +1833,7 @@ if (
             IS_FP32=query.dtype == torch.float32,
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(max_seqlen),
+            **_dropout_launch_options(dropout_p, dropout_seed),
             **dkv_options,
         )
         return grad_query, grad_key, grad_value, grad_c2p, grad_p2c
@@ -1700,6 +1853,8 @@ if (
             has_p2c,
             strict_fp32,
             store_lse,
+            dropout_p,
+            dropout_seed,
             autotune_bundle_id,
             forward_block_m,
             forward_block_n,
@@ -1728,7 +1883,10 @@ if (
             attention_mask,
             attention_output,
             lse_log2,
+            dropout_seed,
         )
+        ctx.dropout_p = dropout_p
+        ctx.input_count = len(inputs)
         ctx.score_scale = score_scale
         ctx.has_padding = has_padding
         ctx.has_c2p = has_c2p
@@ -1754,6 +1912,7 @@ if (
             attention_mask,
             output,
             lse_log2,
+            dropout_seed,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = _training_attention_backward_op(
             query,
@@ -1771,6 +1930,8 @@ if (
             ctx.has_c2p,
             ctx.has_p2c,
             ctx.strict_fp32,
+            ctx.dropout_p,
+            dropout_seed,
             ctx.autotune_bundle_id,
             *ctx.dq_config,
             *ctx.dkv_config,
@@ -1788,34 +1949,9 @@ if (
             grad_key = grad_key + torch.matmul(grad_p2c_typed, pos_query)
             grad_pos_query = torch.matmul(grad_p2c_typed.transpose(-1, -2), key).sum(dim=0)
 
-        return (
-            grad_query,
-            grad_key,
-            grad_value,
-            grad_pos_key,
-            grad_pos_query,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        gradients = (grad_query, grad_key, grad_value, grad_pos_key, grad_pos_query)
+
+        return gradients + (None,) * (ctx.input_count - len(gradients))
 
     _training_attention_forward_op.register_autograd(
         _training_attention_autograd_backward,
@@ -1841,6 +1977,8 @@ if (
             has_p2c,
             strict_fp32,
             store_lse,
+            dropout_p,
+            dropout_seed,
             autotune_bundle_id,
             forward_block_m,
             forward_block_n,
@@ -1869,7 +2007,10 @@ if (
             cu_seqlens,
             attention_output,
             lse_log2,
+            dropout_seed,
         )
+        ctx.dropout_p = dropout_p
+        ctx.input_count = len(inputs)
         ctx.max_seqlen = max_seqlen
         ctx.score_scale = score_scale
         ctx.has_c2p = has_c2p
@@ -1895,6 +2036,7 @@ if (
             cu_seqlens,
             output,
             lse_log2,
+            dropout_seed,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = (
             _training_attention_packed_backward_op(
@@ -1913,6 +2055,8 @@ if (
                 ctx.has_c2p,
                 ctx.has_p2c,
                 ctx.strict_fp32,
+                ctx.dropout_p,
+                dropout_seed,
                 ctx.autotune_bundle_id,
                 *ctx.dq_config,
                 *ctx.dkv_config,
@@ -1928,34 +2072,8 @@ if (
             grad_p2c_typed = grad_p2c.to(dtype=key.dtype)
             grad_key = grad_key + torch.matmul(grad_p2c_typed, pos_query)
             grad_pos_query = torch.matmul(grad_p2c_typed.transpose(-1, -2), key)
-        return (
-            grad_query,
-            grad_key,
-            grad_value,
-            grad_pos_key,
-            grad_pos_query,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        gradients = (grad_query, grad_key, grad_value, grad_pos_key, grad_pos_query)
+        return gradients + (None,) * (ctx.input_count - len(gradients))
 
     _training_attention_packed_forward_op.register_autograd(
         _training_attention_packed_autograd_backward,
@@ -1985,6 +2103,8 @@ def training_attention(
     dq_config: KernelConfig | None = None,
     dkv_config: KernelConfig | None = None,
     autotune_candidates: tuple[KernelConfig, ...] | None = None,
+    dropout_p: float = 0.0,
+    dropout_seed: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Differentiable fused attention entry point.
 
@@ -1993,9 +2113,15 @@ def training_attention(
     grad-enabled custom operator saves Q/K/V/O/LSE and the tiny position tables,
     but not the BHLR C2P/P2C intermediates; those are recomputed in backward.
     Under ``no_grad()`` the shared forward runs with ``STORE_LSE=False``.
+
+    ``dropout_p`` applies attention-probability dropout inside the kernels.
+    The mask is regenerated in backward from a one-element int64 Philox seed;
+    a fresh seed is drawn from the CUDA generator unless ``dropout_seed`` is
+    given.
     """
 
     _require_training_runtime()
+    _validate_dropout(dropout_p, dropout_seed)
     if query.device.type != "cuda":
         raise RuntimeError("training attention requires CUDA tensors")
     if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -2068,6 +2194,8 @@ def training_attention(
         bool(has_p2c),
         bool(strict_fp32),
         bool(store_lse),
+        float(dropout_p),
+        _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
         autotune_bundle_id,
         *config_values(forward_config),
         *config_values(dq_config),
@@ -2092,10 +2220,13 @@ def training_attention_packed(
     dq_config: KernelConfig | None = None,
     dkv_config: KernelConfig | None = None,
     autotune_candidates: tuple[KernelConfig, ...] | None = None,
+    dropout_p: float = 0.0,
+    dropout_seed: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Differentiable packed attention over FlashAttention-style boundaries."""
 
     _require_training_runtime()
+    _validate_dropout(dropout_p, dropout_seed)
     if query.device.type != "cuda":
         raise RuntimeError("packed training attention requires CUDA tensors")
     if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -2164,6 +2295,8 @@ def training_attention_packed(
         bool(has_p2c),
         bool(strict_fp32),
         bool(torch.is_grad_enabled()),
+        float(dropout_p),
+        _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
         autotune_bundle_id,
         *config_values(forward_config),
         *config_values(dq_config),
@@ -2172,4 +2305,4 @@ def training_attention_packed(
     return output
 
 
-__all__ = ["training_attention", "training_attention_packed"]
+__all__ = ["dropout_keep_mask", "training_attention", "training_attention_packed"]

@@ -44,6 +44,22 @@ def _kernel_source_digest() -> str:
 KERNEL_SOURCE_DIGEST = _kernel_source_digest()
 
 
+def tuning_dtype(dtype: str) -> str:
+    """Map a tensor dtype to its tuning precision family.
+
+    FP16 and BF16 have the same element size and tensor-core throughput, so
+    FlashAttention compiles one tile set for both and FlexAttention selects the
+    same default blocks for both.  FP32 keeps its own family; its strict (IEEE)
+    and fast (TF32) paths are separated by ``fp32_precision``.
+    """
+
+    if dtype in {"float16", "bfloat16", "half"}:
+        return "half"
+    if dtype == "float32":
+        return "float32"
+    raise ValueError("dtype must be float16, bfloat16, or float32")
+
+
 def tuning_sequence_length(sequence_length: int) -> int:
     """Map an exact runtime length to the finite profiled kernel family."""
 
@@ -200,6 +216,38 @@ DEFAULT_BACKWARD_KERNEL_CONFIGS = tuple(
 )
 
 
+# FP32 tiles are twice as large in registers and shared memory, so FP32 keeps a
+# conservative FlexAttention-style search: one pipeline stage, forward tiles up
+# to 64x64, and backward tiles up to 2048 elements.  These limits mirror the
+# runtime autotune pruning, so the tuner never selects a schedule that bounded
+# autotuning would reject.
+FP32_MAX_FORWARD_TILE = 64 * 64
+FP32_MAX_BACKWARD_TILE = 2048
+
+
+def conservative_candidates(
+    configs: tuple[KernelConfig, ...],
+    *,
+    dtype: str,
+    phase: str,
+) -> tuple[KernelConfig, ...]:
+    """Restrict FP32 searches to resource-safe schedules; other dtypes pass through."""
+
+    if tuning_dtype(dtype) != "float32":
+        return configs
+    limit = (
+        FP32_MAX_FORWARD_TILE
+        if phase in {"inference", "training_forward"}
+        else FP32_MAX_BACKWARD_TILE
+    )
+    kept = tuple(
+        config
+        for config in configs
+        if config.num_stages == 1 and config.block_m * config.block_n <= limit
+    )
+    return kept or (KernelConfig(32, 32, 4),)
+
+
 @dataclass(frozen=True, order=True)
 class WorkloadKey:
     """Finite workload family used to select a saved kernel schedule."""
@@ -215,6 +263,7 @@ class WorkloadKey:
     layout: KernelLayout = "padded"
     uses_padding_mask: bool = True
     phase: KernelPhase = "inference"
+    has_dropout: bool = False
 
     def __post_init__(self) -> None:
         for name in ("sequence_length", "head_dim", "batch_heads"):
@@ -237,8 +286,9 @@ class WorkloadKey:
             )
         if not isinstance(self.has_c2p, bool) or not isinstance(self.has_p2c, bool):
             raise TypeError("has_c2p and has_p2c must be booleans")
-        if self.dtype not in {"float16", "bfloat16", "float32"}:
-            raise ValueError("dtype must be float16, bfloat16, or float32")
+        if not isinstance(self.dtype, str):
+            raise TypeError("dtype must be a string")
+        object.__setattr__(self, "dtype", tuning_dtype(self.dtype))
         if self.fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be strict or fast")
         if self.layout not in {"padded", "packed"}:
@@ -256,6 +306,10 @@ class WorkloadKey:
             raise ValueError(
                 "phase must be inference, training_forward, backward_dq, or backward_dkv"
             )
+        if not isinstance(self.has_dropout, bool):
+            raise TypeError("has_dropout must be a boolean")
+        if self.has_dropout and self.phase == "inference":
+            raise ValueError("inference workloads cannot use attention dropout")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -270,6 +324,7 @@ class WorkloadKey:
             "layout": self.layout,
             "uses_padding_mask": self.uses_padding_mask,
             "phase": self.phase,
+            "has_dropout": self.has_dropout,
         }
 
     @classmethod
@@ -286,9 +341,10 @@ class WorkloadKey:
             "layout",
             "uses_padding_mask",
         }
-        # ``phase`` was added compatibly to profile format 3.  Entries written
-        # before training tuning existed are inference entries by definition.
-        _require_exact_keys(data, fields, {"phase"}, "workload key")
+        # ``phase`` was added compatibly to profile format 3 and ``has_dropout``
+        # to format 4.  Older entries are inference or dropout-free by
+        # definition, and their float16/bfloat16 dtypes map to ``half``.
+        _require_exact_keys(data, fields, {"phase", "has_dropout"}, "workload key")
         integer_fields = {"length_regime", "head_dim", "occupancy_regime", "slot_regime"}
         if any(
             isinstance(data[name], bool) or not isinstance(data[name], int)
@@ -303,6 +359,8 @@ class WorkloadKey:
             raise TypeError("workload layout must be a string")
         if not isinstance(data["uses_padding_mask"], bool):
             raise TypeError("workload uses_padding_mask must be a boolean")
+        if not isinstance(data.get("has_dropout", False), bool):
+            raise TypeError("workload has_dropout must be a boolean")
         return cls(
             sequence_length=data["length_regime"],
             head_dim=data["head_dim"],
@@ -315,6 +373,7 @@ class WorkloadKey:
             layout=data["layout"],
             uses_padding_mask=data["uses_padding_mask"],
             phase=data.get("phase", "inference"),
+            has_dropout=data.get("has_dropout", False),
         )
 
 
@@ -531,6 +590,29 @@ class ProfileEntry:
         )
 
 
+def _load_entries(items: Any) -> tuple[ProfileEntry, ...]:
+    """Parse saved entries, merging legacy FP16/BF16 twins into one half entry.
+
+    Profiles written before precision families kept separate float16 and
+    bfloat16 winners.  Both now map to the same workload, so the first saved
+    winner is kept as the seed; retargeting revalidates it.
+    """
+
+    if not isinstance(items, list):
+        raise TypeError("profile entries must be a JSON array")
+    entries: dict[WorkloadKey, ProfileEntry] = {}
+    saved_dtypes: dict[WorkloadKey, set[str]] = {}
+    for item in items:
+        entry = ProfileEntry.from_dict(item)
+        saved_dtype = item["workload"]["dtype"]
+        seen = saved_dtypes.setdefault(entry.workload, set())
+        if saved_dtype in seen or (seen and not seen | {saved_dtype} <= {"float16", "bfloat16"}):
+            raise ValueError("profile contains duplicate workload entries")
+        seen.add(saved_dtype)
+        entries.setdefault(entry.workload, entry)
+    return tuple(entries.values())
+
+
 @dataclass(frozen=True)
 class KernelProfile:
     hardware: HardwareSpec
@@ -608,7 +690,7 @@ class KernelProfile:
                 hardware=HardwareSpec.from_dict(data["hardware"]),
                 compiler=CompilerSpec.from_dict(data["compiler"]),
                 provenance=provenance,
-                entries=tuple(ProfileEntry.from_dict(entry) for entry in data["entries"]),
+                entries=_load_entries(data["entries"]),
                 kernel_digest=f"legacy-v3:{data['kernel_version']}",
             )
         if format_version != PROFILE_FORMAT_VERSION:
@@ -647,7 +729,7 @@ class KernelProfile:
             hardware=HardwareSpec.from_dict(data["hardware"]),
             compiler=CompilerSpec.from_dict(data["compiler"]),
             provenance=data["provenance"],
-            entries=tuple(ProfileEntry.from_dict(entry) for entry in data["entries"]),
+            entries=_load_entries(data["entries"]),
         )
 
 
@@ -889,6 +971,8 @@ __all__ = [
     "DEFAULT_DKV_KERNEL_CONFIGS",
     "DEFAULT_DQ_KERNEL_CONFIGS",
     "DEFAULT_KERNEL_CONFIGS",
+    "FP32_MAX_BACKWARD_TILE",
+    "FP32_MAX_FORWARD_TILE",
     "KERNEL_PROFILE_VERSION",
     "KERNEL_SOURCE_DIGEST",
     "PROFILE_FORMAT_VERSION",
@@ -903,6 +987,7 @@ __all__ = [
     "ProfileEntry",
     "ProfileRegistry",
     "WorkloadKey",
+    "conservative_candidates",
     "current_provenance",
     "default_user_profile_directory",
     "load_bundled_profiles",

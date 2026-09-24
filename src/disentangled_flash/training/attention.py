@@ -32,9 +32,10 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
     operators on every forward so gradients flow through all original DeBERTa
     parameters. Only immutable relative-position geometry is cached.
 
-    Attention-probability dropout is intentionally unsupported in the first
-    training kernel. Hidden-state dropout and positional-embedding dropout stay
-    ordinary PyTorch modules and continue to work normally.
+    Attention-probability dropout runs inside the fused kernels in training
+    mode: the Philox mask is regenerated in backward rather than stored, as in
+    FlashAttention. Hidden-state dropout and positional-embedding dropout stay
+    ordinary PyTorch modules.
     """
 
     def __init__(
@@ -82,6 +83,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         has_p2c: bool,
         layout: str,
         uses_padding_mask: bool,
+        has_dropout: bool,
         phase: str,
     ) -> KernelConfig | None:
         if self.tuning.mode == "autotune":
@@ -107,6 +109,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             layout=layout,
             uses_padding_mask=uses_padding_mask,
             phase=phase,
+            has_dropout=has_dropout,
         )
         device_index = hidden_states.device.index
         if device_index is None:
@@ -166,6 +169,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                     layout=config_options["layout"],
                     uses_padding_mask=config_options["uses_padding_mask"],
                     phase="training_forward",
+                    has_dropout=config_options["has_dropout"],
                 )
             )
             return launch(None, None, None)
@@ -209,11 +213,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             raise TypeError("training attention supports FP16, BF16, and FP32")
         if self.attention_head_size not in {32, 64, 128}:
             raise ValueError("training attention supports head dimensions 32, 64, and 128")
-        if self.training and self.attention_probability_dropout != 0.0:
-            raise NotImplementedError(
-                "attention_probs_dropout_prob must be 0 for the first training kernel; "
-                "deterministic fused attention dropout is a follow-up milestone"
-            )
 
         batch_size, sequence_length = hidden_states.shape[:2]
         mask, has_padding = self._normalize_mask(
@@ -252,6 +251,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
         active_slots = int(plan.active_slots.numel())
+        dropout_p = self.attention_probability_dropout if self.training else 0.0
         config_options = {
             "hidden_states": hidden_states,
             "sequence_length": sequence_length,
@@ -261,6 +261,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             "has_p2c": has_p2c,
             "layout": "padded",
             "uses_padding_mask": has_padding,
+            "has_dropout": dropout_p > 0.0,
         }
         output = self._launch_with_profile_fallback(
             lambda forward_config, dq_config, dkv_config: training_attention(
@@ -278,6 +279,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 dq_config=dq_config,
                 dkv_config=dkv_config,
                 autotune_candidates=self.tuning.candidates,
+                dropout_p=dropout_p,
             ),
             config_options,
         )
@@ -298,10 +300,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             raise RuntimeError("packed Triton training attention requires CUDA")
         if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
             raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
-        if self.training and self.attention_probability_dropout != 0.0:
-            raise NotImplementedError(
-                "attention_probs_dropout_prob must be 0 for packed training attention"
-            )
         info = resolve_packed_info(
             cu_seqlens,
             hidden_states.size(0),
@@ -331,6 +329,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         has_p2c = self.relative_attention and "p2c" in self.pos_att_type
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
+        dropout_p = self.attention_probability_dropout if self.training else 0.0
         config_options = {
             "hidden_states": hidden_states,
             "sequence_length": info.max_seqlen,
@@ -340,6 +339,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             "has_p2c": has_p2c,
             "layout": "packed",
             "uses_padding_mask": False,
+            "has_dropout": dropout_p > 0.0,
         }
         output = self._launch_with_profile_fallback(
             lambda forward_config, dq_config, dkv_config: training_attention_packed(
@@ -357,6 +357,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 dq_config=dq_config,
                 dkv_config=dkv_config,
                 autotune_candidates=self.tuning.candidates,
+                dropout_p=dropout_p,
             ),
             config_options,
         )

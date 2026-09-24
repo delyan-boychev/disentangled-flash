@@ -156,6 +156,16 @@ if triton is not None:
         # non-tiny sequence class.
         return kept or configs[:1]
 
+    # Counter-based attention-dropout mask shared by forward and backward. Each
+    # (batch or sequence, head) stream uses its own Philox key and each
+    # in-sequence (row, column) pair its own 32-bit counter, so the backward
+    # kernels regenerate exactly the forward mask without storing it.
+    @triton.jit
+    def _dropout_keep(dropout_seed, stream, rows, cols, DROPOUT_P):
+        seed = tl.load(dropout_seed) + stream
+        counters = rows.to(tl.uint32)[:, None] * 65536 + cols.to(tl.uint32)[None, :]
+        return tl.rand(seed, counters) >= DROPOUT_P
+
     @triton.jit(
         do_not_specialize=[
             "ACTIVE_SLOTS",
@@ -203,6 +213,10 @@ if triton is not None:
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         PHYSICAL_PAIRS: tl.constexpr = False,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -352,6 +366,13 @@ if triton is not None:
                 new_row_max = tl.max(scores, axis=1)
                 probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = tl.sum(probabilities, axis=1)
+                # The softmax denominator and LSE stay undropped; only the
+                # value accumulation sees the mask, as in FlashAttention.
+                if HAS_DROPOUT:
+                    keep = _dropout_keep(
+                        dropout_seed, batch_head, query_offsets, key_offsets, DROPOUT_P
+                    )
+                    probabilities = tl.where(keep, probabilities, 0.0)
 
                 if IS_FP32:
                     if STRICT_FP32:
@@ -396,6 +417,11 @@ if triton is not None:
                     correction = tl.math.exp2(row_max - new_row_max)
                     probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
+                if HAS_DROPOUT:
+                    keep = _dropout_keep(
+                        dropout_seed, batch_head, query_offsets, key_offsets, DROPOUT_P
+                    )
+                    probabilities = tl.where(keep, probabilities, 0.0)
 
                 accumulator *= correction[:, None]
                 if IS_FP32:
@@ -430,6 +456,8 @@ if triton is not None:
             row_sum = new_row_sum
 
         accumulator /= row_sum[:, None]
+        if HAS_DROPOUT:
+            accumulator *= DROPOUT_SCALE
         tl.store(
             output_base
             + query_offsets[:, None] * (NUM_HEADS * HEAD_DIM)
@@ -486,6 +514,10 @@ if triton is not None:
         STORE_LSE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
+        dropout_seed=None,
+        DROPOUT_P=0.0,
+        DROPOUT_SCALE=1.0,
+        HAS_DROPOUT: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         sequence_head = tl.program_id(1)
@@ -586,6 +618,11 @@ if triton is not None:
                 new_row_max = tl.max(scores, axis=1)
                 probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = tl.sum(probabilities, axis=1)
+                if HAS_DROPOUT:
+                    keep = _dropout_keep(
+                        dropout_seed, sequence_head, query_offsets, key_offsets, DROPOUT_P
+                    )
+                    probabilities = tl.where(keep, probabilities, 0.0)
                 if IS_FP32:
                     if STRICT_FP32:
                         accumulator = tl.dot(
@@ -614,6 +651,11 @@ if triton is not None:
                 )
                 probabilities = tl.math.exp2(scores - normalization_center[:, None])
                 new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
+                if HAS_DROPOUT:
+                    keep = _dropout_keep(
+                        dropout_seed, sequence_head, query_offsets, key_offsets, DROPOUT_P
+                    )
+                    probabilities = tl.where(keep, probabilities, 0.0)
                 accumulator *= correction[:, None]
                 if IS_FP32:
                     if STRICT_FP32:
@@ -646,6 +688,8 @@ if triton is not None:
             row_sum = new_row_sum
 
         accumulator /= row_sum[:, None]
+        if HAS_DROPOUT:
+            accumulator *= DROPOUT_SCALE
         tl.store(
             output
             + query_tokens[:, None] * (NUM_HEADS * HEAD_DIM)
@@ -675,10 +719,13 @@ if triton is not None:
         "STORE_LSE",
     ]
 
-    def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
+    def _make_autotuned_kernel(
+        configs: tuple[KernelConfig, ...],
+        extra_key: tuple[str, ...] = (),
+    ) -> Any:
         autotune_kwargs: dict[str, Any] = {
             "configs": [_as_triton_config(config) for config in configs],
-            "key": _AUTOTUNE_KEY,
+            "key": [*_AUTOTUNE_KEY, *extra_key],
             "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
         }
         if "cache_results" in inspect.signature(triton.autotune).parameters:
@@ -687,10 +734,13 @@ if triton is not None:
 
     _deberta_attention_autotuned_kernel = _make_autotuned_kernel(DEFAULT_KERNEL_CONFIGS)
 
-    def _make_packed_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
+    def _make_packed_autotuned_kernel(
+        configs: tuple[KernelConfig, ...],
+        extra_key: tuple[str, ...] = (),
+    ) -> Any:
         autotune_kwargs: dict[str, Any] = {
             "configs": [_as_triton_config(config) for config in configs],
-            "key": _PACKED_AUTOTUNE_KEY,
+            "key": [*_PACKED_AUTOTUNE_KEY, *extra_key],
             "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
         }
         if "cache_results" in inspect.signature(triton.autotune).parameters:

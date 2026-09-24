@@ -65,8 +65,6 @@ def _resolve_backend(
                 "wrap_triton",
             )
         )
-        if float(getattr(config, "attention_probs_dropout_prob", 0.0)) != 0.0:
-            triton_supported = False
     if backend == "auto":
         triton_supported = (
             triton_supported
