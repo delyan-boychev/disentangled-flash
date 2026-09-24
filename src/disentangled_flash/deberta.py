@@ -174,7 +174,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
 
         profile_registry = (
             ProfileRegistry.from_options(self.tuning)
-            if backend == "triton" and self.tuning.mode in {"auto", "profile_only"}
+            if self.backend == "triton" and self.tuning.mode in {"auto", "profile_only"}
             else None
         )
         for layer in self.layer:
@@ -188,7 +188,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
                 kwargs["fp32_precision"] = fp32_precision
             elif self.backend == "triton":
                 kwargs["fp32_precision"] = fp32_precision
-            if self.inference and self.backend == "triton":
+            if self.backend == "triton":
                 kwargs["tuning"] = self.tuning
                 kwargs["profile_registry"] = profile_registry
             replacement = attention_class(config, **kwargs)
@@ -413,14 +413,12 @@ class DebertaV2OptimizedEncoder(nn.Module):
         return_dict: bool = True,
         packed_info: PackedSequenceInfo | None = None,
     ) -> Any:
-        """Execute an unpadded inference batch using cumulative boundaries."""
+        """Execute an unpadded inference or training batch using cumulative boundaries."""
 
-        if not self.inference:
-            raise RuntimeError("forward_packed() is available only when inference=True")
-        if self.training:
-            raise RuntimeError("forward_packed() requires encoder.eval()")
-        if torch.is_grad_enabled():
-            raise RuntimeError("forward_packed() requires no_grad() or inference_mode()")
+        if self.inference and self.training:
+            raise RuntimeError("packed inference requires encoder.eval()")
+        if self.inference and torch.is_grad_enabled():
+            raise RuntimeError("packed inference requires no_grad() or inference_mode()")
         if hidden_states.ndim != 2:
             raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
         if cu_seqlens.device != hidden_states.device:
@@ -834,6 +832,7 @@ def enable_deberta_training(
     *,
     backend: str = "triton",
     fp32_precision: str = "strict",
+    tuning: KernelTuningOptions | None = None,
     assume_unpadded: bool = False,
 ) -> nn.Module:
     """Enable the same optimized encoder with differentiable parameter handling."""
@@ -843,6 +842,7 @@ def enable_deberta_training(
         backend=backend,
         inference=False,
         fp32_precision=fp32_precision,
+        tuning=tuning,
         assume_unpadded=assume_unpadded,
     )
 

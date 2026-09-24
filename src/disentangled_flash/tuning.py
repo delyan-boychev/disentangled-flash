@@ -20,6 +20,7 @@ PROFILE_FORMAT_VERSION = 3
 KERNEL_PROFILE_VERSION = "deberta-attention-forward-runtime-length-v3"
 TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
 KernelLayout = Literal["padded", "packed"]
+KernelPhase = Literal["inference", "training_forward", "backward_dq", "backward_dkv"]
 TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024, 2048, 4096, 8192)
 TUNING_BATCH_HEADS = (8, 32)
 
@@ -123,6 +124,20 @@ DEFAULT_KERNEL_CONFIGS = (
     KernelConfig(128, 64, 4),
 )
 
+# Backward carries substantially more live state than forward.  Keep its
+# default search deliberately smaller and include the 8-warp schedules that
+# are often important at head dimension 128.  dQ and dK/dV are profiled as
+# separate phases because their optimal tile orientations need not match.
+DEFAULT_BACKWARD_KERNEL_CONFIGS = (
+    KernelConfig(16, 16, 4),
+    KernelConfig(32, 32, 4),
+    KernelConfig(32, 64, 4),
+    KernelConfig(64, 32, 4),
+    KernelConfig(64, 64, 4),
+    KernelConfig(32, 64, 8),
+    KernelConfig(64, 32, 8),
+)
+
 
 @dataclass(frozen=True, order=True)
 class WorkloadKey:
@@ -138,6 +153,7 @@ class WorkloadKey:
     fp32_precision: str
     layout: KernelLayout = "padded"
     uses_padding_mask: bool = True
+    phase: KernelPhase = "inference"
 
     def __post_init__(self) -> None:
         for name in ("sequence_length", "head_dim", "batch_heads"):
@@ -170,6 +186,15 @@ class WorkloadKey:
             raise TypeError("uses_padding_mask must be a boolean")
         if self.layout == "packed" and self.uses_padding_mask:
             raise ValueError("packed workloads cannot use a padding mask")
+        if self.phase not in {
+            "inference",
+            "training_forward",
+            "backward_dq",
+            "backward_dkv",
+        }:
+            raise ValueError(
+                "phase must be inference, training_forward, backward_dq, or backward_dkv"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,6 +208,7 @@ class WorkloadKey:
             "fp32_precision": self.fp32_precision,
             "layout": self.layout,
             "uses_padding_mask": self.uses_padding_mask,
+            "phase": self.phase,
         }
 
     @classmethod
@@ -199,7 +225,9 @@ class WorkloadKey:
             "layout",
             "uses_padding_mask",
         }
-        _require_exact_keys(data, fields, set(), "workload key")
+        # ``phase`` was added compatibly to profile format 3.  Entries written
+        # before training tuning existed are inference entries by definition.
+        _require_exact_keys(data, fields, {"phase"}, "workload key")
         integer_fields = {"length_regime", "head_dim", "occupancy_regime", "slot_regime"}
         if any(
             isinstance(data[name], bool) or not isinstance(data[name], int)
@@ -225,6 +253,7 @@ class WorkloadKey:
             fp32_precision=data["fp32_precision"],
             layout=data["layout"],
             uses_padding_mask=data["uses_padding_mask"],
+            phase=data.get("phase", "inference"),
         )
 
 
@@ -694,6 +723,7 @@ def merge_profile_entry(
 
 
 __all__ = [
+    "DEFAULT_BACKWARD_KERNEL_CONFIGS",
     "DEFAULT_KERNEL_CONFIGS",
     "KERNEL_PROFILE_VERSION",
     "PROFILE_FORMAT_VERSION",

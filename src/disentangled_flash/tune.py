@@ -8,16 +8,18 @@ import json
 import statistics
 import sys
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from itertools import pairwise
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from . import kernel
 from .position import SharedPositionPlanCache
 from .tuning import (
+    DEFAULT_BACKWARD_KERNEL_CONFIGS,
     DEFAULT_KERNEL_CONFIGS,
     TUNING_BATCH_HEADS,
     TUNING_SEQUENCE_LENGTHS,
@@ -61,6 +63,7 @@ PRESETS = {
         "dtypes": ("float16",),
         "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
+        "passes": ("inference", "training"),
     },
     "standard": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
@@ -69,6 +72,7 @@ PRESETS = {
         "dtypes": ("float16", "bfloat16", "float32"),
         "relative_modes": ("none", "c2p", "p2c", "both"),
         "layouts": ("padded", "packed"),
+        "passes": ("inference", "training"),
     },
 }
 
@@ -153,8 +157,14 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
                                     )
 
 
-def _load_candidates(path: Path | None) -> tuple[KernelConfig, ...]:
+def _load_candidates(
+    path: Path | None,
+    *,
+    include_backward: bool = False,
+) -> tuple[KernelConfig, ...]:
     if path is None:
+        if include_backward:
+            return tuple(dict.fromkeys(DEFAULT_KERNEL_CONFIGS + DEFAULT_BACKWARD_KERNEL_CONFIGS))
         return DEFAULT_KERNEL_CONFIGS
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -326,6 +336,207 @@ def _make_inputs(
     return _make_padded_inputs(case, device, **position_options)
 
 
+@dataclass(frozen=True)
+class TrainingInputs:
+    query: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    pos_key: torch.Tensor | None
+    pos_query: torch.Tensor | None
+    delta_to_local: torch.Tensor
+    sequence_metadata: torch.Tensor
+    max_seqlen: int
+    score_scale: float
+
+    def grad_tensors(self) -> tuple[torch.Tensor, ...]:
+        tensors = [self.query, self.key, self.value]
+        if self.pos_key is not None:
+            tensors.append(self.pos_key)
+        if self.pos_query is not None:
+            tensors.append(self.pos_query)
+        return tuple(tensors)
+
+
+def _make_training_inputs(
+    case: TuningCase,
+    device: torch.device,
+    *,
+    position_buckets: int = 256,
+    max_relative_positions: int = 512,
+    position_embedding_size: int = 256,
+) -> tuple[TrainingInputs, WorkloadKey]:
+    dtype = _dtype(case.dtype)
+    if case.layout == "packed":
+        lengths = _packed_lengths(case.sequence_length, case.batch_heads)
+        if case.batch_heads % len(lengths):
+            raise ValueError("packed occupancy must be divisible by the sequence count")
+        num_heads = case.batch_heads // len(lengths)
+        boundaries = [0]
+        for length in lengths:
+            boundaries.append(boundaries[-1] + length)
+        total_tokens = boundaries[-1]
+        shape = (num_heads, total_tokens, case.head_dim)
+        sequence_metadata = torch.tensor(boundaries, device=device, dtype=torch.int32)
+    else:
+        num_heads = case.batch_heads
+        shape = (1, num_heads, case.sequence_length, case.head_dim)
+        sequence_metadata = torch.ones(
+            (1, case.sequence_length),
+            device=device,
+            dtype=torch.bool,
+        )
+    query = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+    key = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+    value = torch.randn(shape, device=device, dtype=dtype, requires_grad=True)
+    uses_positions = case.has_c2p or case.has_p2c
+    position_cache = SharedPositionPlanCache(
+        position_buckets=position_buckets,
+        max_relative_positions=max_relative_positions,
+        position_embedding_size=position_embedding_size,
+        uses_position_bias=uses_positions,
+    )
+    position_plan = position_cache.compact(case.sequence_length, device)
+    active_slots = position_plan.active_slots.numel()
+    position_shape = (num_heads, active_slots, case.head_dim)
+    pos_key = (
+        torch.randn(position_shape, device=device, dtype=dtype, requires_grad=True)
+        if case.has_c2p
+        else None
+    )
+    pos_query = (
+        torch.randn(position_shape, device=device, dtype=dtype, requires_grad=True)
+        if case.has_p2c
+        else None
+    )
+    scale_factor = 1 + int(case.has_c2p) + int(case.has_p2c)
+    inputs = TrainingInputs(
+        query=query,
+        key=key,
+        value=value,
+        pos_key=pos_key,
+        pos_query=pos_query,
+        delta_to_local=position_plan.delta_to_local,
+        sequence_metadata=sequence_metadata,
+        max_seqlen=case.sequence_length,
+        score_scale=(case.head_dim * scale_factor) ** -0.5,
+    )
+    workload = WorkloadKey(
+        sequence_length=case.sequence_length,
+        head_dim=case.head_dim,
+        batch_heads=case.batch_heads,
+        active_slots=active_slots,
+        dtype=case.dtype,
+        has_c2p=case.has_c2p,
+        has_p2c=case.has_p2c,
+        fp32_precision=case.fp32_precision,
+        layout=case.layout,
+        uses_padding_mask=case.uses_padding_mask,
+        phase="training_forward",
+    )
+    return inputs, workload
+
+
+def _run_training_forward(
+    inputs: TrainingInputs,
+    workload: WorkloadKey,
+    forward_config: KernelConfig,
+    dq_config: KernelConfig,
+    dkv_config: KernelConfig,
+) -> torch.Tensor:
+    from .training._kernels import training_attention, training_attention_packed
+
+    options = {
+        "score_scale": inputs.score_scale,
+        "strict_fp32": workload.fp32_precision == "strict",
+        "forward_config": forward_config,
+        "dq_config": dq_config,
+        "dkv_config": dkv_config,
+    }
+    if workload.layout == "packed":
+        return training_attention_packed(
+            inputs.query,
+            inputs.key,
+            inputs.value,
+            inputs.pos_key,
+            inputs.pos_query,
+            inputs.delta_to_local,
+            inputs.sequence_metadata,
+            max_seqlen=inputs.max_seqlen,
+            **options,
+        )
+    return training_attention(
+        inputs.query,
+        inputs.key,
+        inputs.value,
+        inputs.pos_key,
+        inputs.pos_query,
+        inputs.delta_to_local,
+        inputs.sequence_metadata,
+        has_padding=workload.uses_padding_mask,
+        **options,
+    )
+
+
+def _time_cuda(callable_: Any, *, warmup: int, repetitions: int) -> float:
+    for _ in range(warmup):
+        callable_()
+    torch.cuda.synchronize()
+    timings = []
+    for _ in range(repetitions):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        callable_()
+        end.record()
+        end.synchronize()
+        timings.append(start.elapsed_time(end))
+    return statistics.median(timings)
+
+
+def _run_training_config(
+    inputs: TrainingInputs,
+    workload: WorkloadKey,
+    grad_output: torch.Tensor,
+    *,
+    forward_config: KernelConfig,
+    dq_config: KernelConfig,
+    dkv_config: KernelConfig,
+    warmup: int,
+    repetitions: int,
+) -> tuple[float, float, torch.Tensor, tuple[torch.Tensor, ...]]:
+    output = _run_training_forward(
+        inputs,
+        workload,
+        forward_config,
+        dq_config,
+        dkv_config,
+    )
+    grad_tensors = inputs.grad_tensors()
+
+    def run_forward() -> torch.Tensor:
+        return _run_training_forward(
+            inputs,
+            workload,
+            forward_config,
+            dq_config,
+            dkv_config,
+        )
+
+    forward_ms = _time_cuda(run_forward, warmup=warmup, repetitions=repetitions)
+
+    def run_backward() -> tuple[torch.Tensor, ...]:
+        return torch.autograd.grad(
+            output,
+            grad_tensors,
+            grad_output,
+            retain_graph=True,
+        )
+
+    gradients = run_backward()
+    backward_ms = _time_cuda(run_backward, warmup=warmup, repetitions=repetitions)
+    return forward_ms, backward_ms, output, gradients
+
+
 def _reference(arguments: tuple[object, ...], *, query_chunk_size: int = 32) -> torch.Tensor:
     (
         query,
@@ -440,6 +651,64 @@ def _packed_reference(arguments: tuple[object, ...]) -> torch.Tensor:
     return output.squeeze(0)
 
 
+def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.Tensor:
+    def sequence_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        length = query.size(-2)
+        positions = torch.arange(length, device=query.device)
+        local = inputs.delta_to_local[
+            positions[:, None] - positions[None, :] + inputs.max_seqlen - 1
+        ].long()
+        scores = torch.matmul(query.float(), key.float().transpose(-1, -2))
+        if inputs.pos_key is not None:
+            c2p = torch.matmul(query.float(), inputs.pos_key.float().transpose(-1, -2))
+            scores = scores + torch.gather(
+                c2p,
+                -1,
+                local.expand(query.size(0), -1, -1),
+            )
+        if inputs.pos_query is not None:
+            p2c = torch.matmul(key.float(), inputs.pos_query.float().transpose(-1, -2))
+            scores = scores + torch.gather(
+                p2c.unsqueeze(-3).expand(-1, length, -1, -1),
+                -1,
+                local[None, :, :, None].expand(query.size(0), -1, -1, -1),
+            ).squeeze(-1)
+        scores = scores * inputs.score_scale
+        if mask is not None:
+            pair_mask = mask[:, None] & mask[None, :]
+            scores = scores.masked_fill(~pair_mask, float("-inf"))
+            scores = torch.where(~mask[:, None], torch.zeros_like(scores), scores)
+        context = torch.matmul(torch.softmax(scores, dim=-1), value.float()).to(query.dtype)
+        return context.transpose(0, 1).reshape(length, -1)
+
+    if workload.layout == "packed":
+        boundaries = inputs.sequence_metadata.detach().cpu().tolist()
+        return torch.cat(
+            [
+                sequence_attention(
+                    inputs.query[:, start:end],
+                    inputs.key[:, start:end],
+                    inputs.value[:, start:end],
+                    None,
+                )
+                for start, end in pairwise(boundaries)
+            ],
+            dim=0,
+        )
+    mask = inputs.sequence_metadata[0] if workload.uses_padding_mask else None
+    return sequence_attention(
+        inputs.query[0],
+        inputs.key[0],
+        inputs.value[0],
+        mask,
+    ).unsqueeze(0)
+
+
 def _reference_for_workload(arguments: tuple[object, ...], workload: WorkloadKey) -> torch.Tensor:
     return _packed_reference(arguments) if workload.layout == "packed" else _reference(arguments)
 
@@ -494,6 +763,18 @@ def _validate_output(
         torch.testing.assert_close(actual, expected, rtol=5e-3, atol=5e-3)
     else:
         torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+
+
+def _validate_gradients(
+    actual: tuple[torch.Tensor, ...],
+    expected: tuple[torch.Tensor, ...],
+    *,
+    strict_fp32: bool,
+) -> None:
+    if len(actual) != len(expected):
+        raise ValueError("training gradient tuple length mismatch")
+    for actual_gradient, expected_gradient in zip(actual, expected):
+        _validate_output(actual_gradient, expected_gradient, strict_fp32=strict_fp32)
 
 
 def _validation_metadata(workload: WorkloadKey) -> dict[str, str]:
@@ -569,12 +850,25 @@ def _profile_provenance(
         **current_provenance(args.seed),
         "preset": args.preset,
         "layouts": ",".join(args.layouts or PRESETS[args.preset]["layouts"]),
+        "passes": ",".join(args.passes or PRESETS[args.preset]["passes"]),
         "warmup": str(args.warmup),
         "repetitions": str(args.repetitions),
         "tie_margin": str(args.tie_margin),
         "candidate_sha256": hashlib.sha256(candidate_payload).hexdigest(),
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+def _choose_winner(
+    results: list[tuple[float, KernelConfig]],
+    candidates: tuple[KernelConfig, ...],
+    tie_margin: float,
+) -> tuple[float, KernelConfig]:
+    if not results:
+        raise RuntimeError("no correct kernel configuration survived")
+    best_latency = min(latency for latency, _config in results)
+    near_ties = [result for result in results if result[0] <= best_latency * (1 + tie_margin)]
+    return min(near_ties, key=lambda result: candidates.index(result[1]))
 
 
 def run(args: argparse.Namespace) -> None:
@@ -586,7 +880,11 @@ def run(args: argparse.Namespace) -> None:
     torch.cuda.manual_seed_all(args.seed)
     hardware = HardwareSpec.current(device)
     compiler = CompilerSpec.current()
-    candidates = _load_candidates(args.candidates)
+    passes = args.passes or PRESETS[args.preset]["passes"]
+    unknown_passes = set(passes) - {"inference", "training"}
+    if unknown_passes:
+        raise ValueError(f"unsupported tuning passes: {sorted(unknown_passes)}")
+    candidates = _load_candidates(args.candidates, include_backward="training" in passes)
     output_path = args.output.expanduser().resolve()
     profile: KernelProfile | None = load_profile(output_path) if output_path.exists() else None
     if profile is not None and not profile.hardware.matches(hardware):
@@ -601,8 +899,10 @@ def run(args: argparse.Namespace) -> None:
         cases = [case for case in cases if case.dtype != "bfloat16"]
         if skipped:
             print(f"Skipping {skipped} BF16 workloads unsupported by this GPU")
-    print(f"Tuning {len(cases)} workloads on {hardware.name}; {len(candidates)} candidates")
-    for index, case in enumerate(cases, start=1):
+    workload_count = len(cases) * (int("inference" in passes) + 3 * int("training" in passes))
+    print(f"Tuning {workload_count} workloads on {hardware.name}; {len(candidates)} candidates")
+    inference_cases = cases if "inference" in passes else []
+    for index, case in enumerate(inference_cases, start=1):
         arguments, workload = _make_inputs(
             case,
             device,
@@ -611,7 +911,7 @@ def run(args: argparse.Namespace) -> None:
             position_embedding_size=args.position_embedding_size,
         )
         if workload in completed and not args.retest:
-            print(f"[{index}/{len(cases)}] cached {workload}")
+            print(f"[{index}/{len(inference_cases)} inference] cached {workload}")
             continue
         expected = _reference_for_workload(arguments, workload)
         winners: list[tuple[float, KernelConfig]] = []
@@ -638,11 +938,7 @@ def run(args: argparse.Namespace) -> None:
                 torch.cuda.empty_cache()
         if not winners:
             raise RuntimeError(f"no correct configuration survived for {workload}")
-        best_latency = min(latency for latency, _config in winners)
-        near_ties = [
-            result for result in winners if result[0] <= best_latency * (1 + args.tie_margin)
-        ]
-        latency, winner = min(near_ties, key=lambda result: candidates.index(result[1]))
+        latency, winner = _choose_winner(winners, candidates, args.tie_margin)
         entry = ProfileEntry(
             workload=workload,
             config=winner,
@@ -658,7 +954,129 @@ def run(args: argparse.Namespace) -> None:
         )
         save_profile(profile, output_path)
         completed.add(workload)
-        print(f"[{index}/{len(cases)}] {latency:.4f} ms {winner} {workload}")
+        print(f"[{index}/{len(inference_cases)} inference] {latency:.4f} ms {winner} {workload}")
+
+    training_cases = cases if "training" in passes else []
+    for index, case in enumerate(training_cases, start=1):
+        inputs, base_workload = _make_training_inputs(
+            case,
+            device,
+            position_buckets=args.position_buckets,
+            max_relative_positions=args.max_relative_positions,
+            position_embedding_size=args.position_embedding_size,
+        )
+        phase_workloads = {
+            phase: replace(base_workload, phase=phase)
+            for phase in ("training_forward", "backward_dq", "backward_dkv")
+        }
+        if all(workload in completed for workload in phase_workloads.values()) and not args.retest:
+            print(f"[{index}/{len(training_cases)} training] cached {base_workload}")
+            continue
+        expected = _training_reference(inputs, base_workload)
+        grad_output = torch.randn_like(expected)
+        expected_gradients = torch.autograd.grad(
+            expected,
+            inputs.grad_tensors(),
+            grad_output,
+            retain_graph=True,
+        )
+        strict_fp32 = base_workload.dtype == "float32" and (
+            base_workload.fp32_precision == "strict"
+        )
+        baseline = candidates[0]
+
+        def measure(
+            forward_config: KernelConfig,
+            dq_config: KernelConfig,
+            dkv_config: KernelConfig,
+            *,
+            _inputs: TrainingInputs = inputs,
+            _workload: WorkloadKey = base_workload,
+            _grad_output: torch.Tensor = grad_output,
+            _expected: torch.Tensor = expected,
+            _expected_gradients: tuple[torch.Tensor, ...] = expected_gradients,
+            _strict_fp32: bool = strict_fp32,
+        ) -> tuple[float, float]:
+            forward_ms, backward_ms, actual, gradients = _run_training_config(
+                _inputs,
+                _workload,
+                _grad_output,
+                forward_config=forward_config,
+                dq_config=dq_config,
+                dkv_config=dkv_config,
+                warmup=args.warmup,
+                repetitions=args.repetitions,
+            )
+            _validate_output(actual, _expected, strict_fp32=_strict_fp32)
+            _validate_gradients(
+                gradients,
+                _expected_gradients,
+                strict_fp32=_strict_fp32,
+            )
+            return forward_ms, backward_ms
+
+        forward_results: list[tuple[float, KernelConfig]] = []
+        for config in candidates:
+            try:
+                forward_ms, _ = measure(config, baseline, baseline)
+                forward_results.append((forward_ms, config))
+            except Exception as error:  # noqa: BLE001
+                print(f"  rejected training forward {config}: {type(error).__name__}: {error}")
+                torch.cuda.empty_cache()
+        forward_latency, forward_winner = _choose_winner(
+            forward_results,
+            candidates,
+            args.tie_margin,
+        )
+
+        dq_results: list[tuple[float, KernelConfig]] = []
+        for config in candidates:
+            try:
+                _, backward_ms = measure(forward_winner, config, baseline)
+                dq_results.append((backward_ms, config))
+            except Exception as error:  # noqa: BLE001
+                print(f"  rejected dQ {config}: {type(error).__name__}: {error}")
+                torch.cuda.empty_cache()
+        dq_latency, dq_winner = _choose_winner(dq_results, candidates, args.tie_margin)
+
+        dkv_results: list[tuple[float, KernelConfig]] = []
+        for config in candidates:
+            try:
+                _, backward_ms = measure(forward_winner, dq_winner, config)
+                dkv_results.append((backward_ms, config))
+            except Exception as error:  # noqa: BLE001
+                print(f"  rejected dK/dV {config}: {type(error).__name__}: {error}")
+                torch.cuda.empty_cache()
+        dkv_latency, dkv_winner = _choose_winner(dkv_results, candidates, args.tie_margin)
+
+        training_results = (
+            ("training_forward", forward_latency, forward_winner),
+            ("backward_dq", dq_latency, dq_winner),
+            ("backward_dkv", dkv_latency, dkv_winner),
+        )
+        for phase, latency, winner in training_results:
+            workload = phase_workloads[phase]
+            entry = ProfileEntry(
+                workload=workload,
+                config=winner,
+                latency_ms=latency,
+                validation=_validation_metadata(workload),
+            )
+            profile = merge_profile_entry(
+                profile,
+                hardware=hardware,
+                compiler=compiler,
+                entry=entry,
+                provenance=_profile_provenance(args, candidates),
+            )
+            save_profile(profile, output_path)
+            completed.add(workload)
+        print(
+            f"[{index}/{len(training_cases)} training] "
+            f"fwd={forward_latency:.4f} ms {forward_winner}; "
+            f"dQ-total={dq_latency:.4f} ms {dq_winner}; "
+            f"dK/dV-total={dkv_latency:.4f} ms {dkv_winner} {base_workload}"
+        )
     print(f"Saved {len(profile.entries) if profile else 0} entries to {output_path}")
 
 
@@ -677,6 +1095,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--layouts",
         type=_csv_strings,
         help="comma-separated padded and/or packed layouts; padded tunes masked and unmasked",
+    )
+    parser.add_argument(
+        "--passes",
+        type=_csv_strings,
+        help="comma-separated inference and/or training passes",
     )
     parser.add_argument("--position-buckets", type=int, default=256)
     parser.add_argument("--max-relative-positions", type=int, default=512)

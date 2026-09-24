@@ -818,6 +818,33 @@ class TorchTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         )
         return output, None
 
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+        *,
+        rel_embeddings: torch.Tensor | None = None,
+        packed_info: PackedSequenceInfo | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Differentiable packed fallback evaluated one unpadded segment at a time."""
+
+        if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
+            raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
+        info = resolve_packed_info(
+            cu_seqlens,
+            hidden_states.size(0),
+            max_seqlen,
+            packed_info,
+        )
+        outputs = []
+        for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):
+            sequence = hidden_states[start:end].unsqueeze(0)
+            mask = torch.ones((1, length), dtype=torch.bool, device=hidden_states.device)
+            output, _ = self.forward(sequence, mask, rel_embeddings=rel_embeddings)
+            outputs.append(output.squeeze(0))
+        return torch.cat(outputs, dim=0), None
+
 
 __all__ = [
     "TorchInferenceDisentangledSelfAttention",

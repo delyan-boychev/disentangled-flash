@@ -457,6 +457,7 @@ if triton is not None:
         delta_to_local_slot,
         cu_seqlens,
         output,
+        lse_log2,
         stride_qh,
         stride_ql,
         stride_qd,
@@ -480,6 +481,7 @@ if triton is not None:
         IS_BF16: tl.constexpr,
         IS_FP32: tl.constexpr,
         STRICT_FP32: tl.constexpr,
+        STORE_LSE: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
     ):
@@ -650,8 +652,26 @@ if triton is not None:
             accumulator,
             mask=query_in_bounds[:, None],
         )
+        if STORE_LSE:
+            lse = row_max + tl.log(row_sum) * 1.4426950408889634
+            tl.store(
+                lse_log2 + head * TOTAL_TOKENS + query_tokens,
+                lse,
+                mask=query_in_bounds,
+            )
 
     _AUTOTUNE_KEY = list(AUTOTUNE_SPECIALIZATION_KEY)
+    _PACKED_AUTOTUNE_KEY = [
+        "LENGTH_REGIME",
+        "HEAD_DIM",
+        "HAS_C2P",
+        "HAS_P2C",
+        "HAS_PADDING",
+        "IS_BF16",
+        "IS_FP32",
+        "STRICT_FP32",
+        "STORE_LSE",
+    ]
 
     def _make_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
         autotune_kwargs: dict[str, Any] = {
@@ -668,7 +688,7 @@ if triton is not None:
     def _make_packed_autotuned_kernel(configs: tuple[KernelConfig, ...]) -> Any:
         autotune_kwargs: dict[str, Any] = {
             "configs": [_as_triton_config(config) for config in configs],
-            "key": _AUTOTUNE_KEY,
+            "key": _PACKED_AUTOTUNE_KEY,
             "prune_configs_by": {"early_config_prune": _prune_autotune_configs},
         }
         if "cache_results" in inspect.signature(triton.autotune).parameters:
@@ -924,6 +944,7 @@ if triton is not None:
             delta_to_local,
             cu_seqlens,
             output,
+            output,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -947,6 +968,7 @@ if triton is not None:
             IS_BF16=is_bf16,
             IS_FP32=is_fp32,
             STRICT_FP32=strict_fp32,
+            STORE_LSE=False,
         )
         return output
 
@@ -1030,6 +1052,7 @@ if triton is not None:
             delta_to_local,
             cu_seqlens,
             output,
+            output,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -1053,6 +1076,7 @@ if triton is not None:
             IS_BF16=is_bf16,
             IS_FP32=is_fp32,
             STRICT_FP32=strict_fp32,
+            STORE_LSE=False,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=num_warps,

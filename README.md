@@ -21,13 +21,13 @@ differentiable training paths.
 - head dimensions 32, 64, and 128
 - factorized 2-D padding masks
 - runtime sequence lengths through nine bounded kernel families up to 8192
-- FlashAttention-style packed, unpadded inference with `cu_seqlens`
+- FlashAttention-style packed, unpadded inference and training with `cu_seqlens`
 - **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
 The training Triton path currently requires self-attention, head dimensions 32,
 64, or 128, and `attention_probs_dropout_prob=0`. It does not yet support
-`output_attentions=True`, custom pairwise relative-position tensors, or packed
-training. CPU/MPS use the differentiable PyTorch backend rather than Triton.
+`output_attentions=True` or custom pairwise relative-position tensors. CPU/MPS
+use the differentiable PyTorch backend rather than Triton.
 
 > [!IMPORTANT]
 > The Triton kernel has been validated on NVIDIA RTX
@@ -78,9 +78,9 @@ optimize_deberta_training(model.deberta, backend="triton")
 ```
 
 This preserves the original parameter identities and keeps Q/K/V and relative
-position projections in the autograd graph. Inference tuning profiles apply to
-the inference forward kernels; the current training backward kernels use their
-own conservative schedules.
+position projections in the autograd graph. The same tuning policy applies to
+training, with independently selected entries for the LSE-producing forward,
+dQ, and dK/dV kernels.
 
 ## CUDA benchmark
 
@@ -112,10 +112,19 @@ Matching saved profiles are used automatically; otherwise Triton runs bounded
 autotuning on first use. Override this with:
 
 ```python
-from disentangled_flash import KernelConfig, KernelTuningOptions, optimize_deberta
+from disentangled_flash import (
+    KernelConfig,
+    KernelTuningOptions,
+    optimize_deberta,
+    optimize_deberta_training,
+)
 
 optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))
 optimize_deberta(
+    model,
+    tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
+)
+optimize_deberta_training(
     model,
     tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
 )
@@ -138,6 +147,7 @@ Generate a resumable profile on a CUDA machine with:
 ```bash
 python -m disentangled_flash.tune \
   --preset standard \
+  --passes inference,training \
   --output rtx-6000-ada.json
 ```
 
@@ -148,9 +158,11 @@ python -m disentangled_flash.tune inspect rtx-6000-ada.json
 The `standard` preset covers length families `64`, `128`, `384`, `512`, `768`,
 `1024`, `2048`, `4096`, and `8192`, supported dtypes, attention modes, occupancy
 regimes, and padded/packed layouts. Results are parity-checked and saved after
-each workload so tuning can resume.
+each workload so tuning can resume. `--passes inference` or `--passes training`
+can restrict a run. Training profiles record separate `training_forward`,
+`backward_dq`, and `backward_dkv` winners.
 
-### Packed unpadded inference
+### Packed unpadded inference and training
 
 `forward_packed(hidden_states, cu_seqlens, max_seqlen)` accepts
 FlashAttention-style `[total_tokens, hidden_size]` input. Convert right-padded
@@ -173,6 +185,10 @@ output, _ = unpack_packed(
     packed_info=info,
 )
 ```
+
+The same call is differentiable when the encoder was installed with
+`optimize_deberta_training`; no padded `[B, L, ...]` attention workspace is
+created by the packed Triton path.
 
 ## Pretrained GLUE/MNLI evaluation
 

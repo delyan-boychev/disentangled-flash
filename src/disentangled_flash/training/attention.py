@@ -9,8 +9,17 @@ import torch
 
 from .._reference import DebertaAttentionConfig
 from .._torch import TorchTrainingDisentangledSelfAttention
+from ..packed import PackedSequenceInfo, resolve_packed_info
 from ..position import SharedPositionPlanCache
-from ._kernels import training_attention
+from ..tuning import (
+    CompilerSpec,
+    HardwareSpec,
+    KernelConfig,
+    KernelTuningOptions,
+    ProfileRegistry,
+    WorkloadKey,
+)
+from ._kernels import training_attention, training_attention_packed
 
 
 class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAttention):
@@ -32,6 +41,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         *,
         position_plan_cache: SharedPositionPlanCache | None = None,
         fp32_precision: str = "strict",
+        tuning: KernelTuningOptions | None = None,
+        profile_registry: ProfileRegistry | None = None,
         assume_unpadded: bool = False,
     ) -> None:
         super().__init__(
@@ -42,7 +53,76 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         if fp32_precision not in {"strict", "fast"}:
             raise ValueError("fp32_precision must be 'strict' or 'fast'")
         self.fp32_precision = fp32_precision
+        self.tuning = tuning or KernelTuningOptions()
+        self._profile_registry = (
+            profile_registry
+            if profile_registry is not None
+            else (
+                ProfileRegistry.from_options(self.tuning)
+                if self.tuning.mode in {"auto", "profile_only"}
+                else ProfileRegistry()
+            )
+        )
+        self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
+
+    def _resolve_kernel_config(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        sequence_length: int,
+        batch_heads: int,
+        active_slots: int,
+        has_c2p: bool,
+        has_p2c: bool,
+        layout: str,
+        uses_padding_mask: bool,
+        phase: str,
+    ) -> KernelConfig | None:
+        if self.tuning.mode == "autotune":
+            return None
+        if self.tuning.mode == "fixed":
+            return self.tuning.fixed_config
+        if torch.compiler.is_compiling():
+            if self.tuning.mode == "profile_only":
+                raise RuntimeError(
+                    "profile_only training tuning cannot resolve a dynamic workload inside "
+                    "torch.compile; select the profile configuration with fixed mode"
+                )
+            return None
+        workload = WorkloadKey(
+            sequence_length=sequence_length,
+            head_dim=self.attention_head_size,
+            batch_heads=batch_heads,
+            active_slots=active_slots,
+            dtype=str(hidden_states.dtype).removeprefix("torch."),
+            has_c2p=has_c2p,
+            has_p2c=has_p2c,
+            fp32_precision=self.fp32_precision,
+            layout=layout,
+            uses_padding_mask=uses_padding_mask,
+            phase=phase,
+        )
+        device_index = hidden_states.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        cache_key = device_index, workload
+        if cache_key not in self._resolved_kernel_configs:
+            self._resolved_kernel_configs[cache_key] = self._profile_registry.resolve(
+                HardwareSpec.current(device_index),
+                CompilerSpec.current(),
+                workload,
+            )
+        config = self._resolved_kernel_configs[cache_key]
+        if config is None and self.tuning.mode == "profile_only":
+            raise RuntimeError(
+                self._profile_registry.explain_miss(
+                    HardwareSpec.current(device_index),
+                    CompilerSpec.current(),
+                    workload,
+                )
+            )
+        return config
 
     def _normalize_mask(
         self,
@@ -125,6 +205,26 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         has_p2c = self.relative_attention and "p2c" in self.pos_att_type
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
+        active_slots = int(plan.active_slots.numel())
+        config_options = {
+            "hidden_states": hidden_states,
+            "sequence_length": sequence_length,
+            "batch_heads": batch_size * self.num_attention_heads,
+            "active_slots": active_slots,
+            "has_c2p": has_c2p,
+            "has_p2c": has_p2c,
+            "layout": "padded",
+            "uses_padding_mask": has_padding,
+        }
+        forward_config = self._resolve_kernel_config(
+            **config_options,
+            phase="training_forward",
+        )
+        dq_config = None
+        dkv_config = None
+        if torch.is_grad_enabled():
+            dq_config = self._resolve_kernel_config(**config_options, phase="backward_dq")
+            dkv_config = self._resolve_kernel_config(**config_options, phase="backward_dkv")
 
         output = training_attention(
             query_layer,
@@ -137,6 +237,95 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             score_scale=score_scale,
             has_padding=has_padding,
             strict_fp32=self.fp32_precision == "strict",
+            forward_config=forward_config,
+            dq_config=dq_config,
+            dkv_config=dkv_config,
+            autotune_candidates=self.tuning.candidates,
+        )
+        return output, None
+
+    def forward_packed(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int | None = None,
+        *,
+        rel_embeddings: torch.Tensor | None = None,
+        packed_info: PackedSequenceInfo | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Run differentiable unpadded attention without materializing padding."""
+
+        if hidden_states.device.type != "cuda":
+            raise RuntimeError("packed Triton training attention requires CUDA")
+        if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
+            raise ValueError("packed hidden_states must have shape [total_tokens, hidden_size]")
+        if self.training and self.attention_probability_dropout != 0.0:
+            raise NotImplementedError(
+                "attention_probs_dropout_prob must be 0 for packed training attention"
+            )
+        info = resolve_packed_info(
+            cu_seqlens,
+            hidden_states.size(0),
+            max_seqlen,
+            packed_info,
+        )
+        total_tokens = hidden_states.size(0)
+
+        def packed_heads(tensor: torch.Tensor) -> torch.Tensor:
+            return tensor.view(
+                total_tokens,
+                self.num_attention_heads,
+                self.attention_head_size,
+            ).permute(1, 0, 2)
+
+        query_layer = packed_heads(self.query_proj(hidden_states))
+        key_layer = packed_heads(self.key_proj(hidden_states))
+        value_layer = packed_heads(self.value_proj(hidden_states))
+        plan = self.position_plan_cache.compact(info.max_seqlen, hidden_states.device)
+        pos_key = None
+        pos_query = None
+        if self.relative_attention and {"c2p", "p2c"}.intersection(self.pos_att_type):
+            if rel_embeddings is None:
+                raise ValueError("rel_embeddings is required for relative attention")
+            pos_key, pos_query = self._project_active_positions(rel_embeddings, plan.active_slots)
+        has_c2p = self.relative_attention and "c2p" in self.pos_att_type
+        has_p2c = self.relative_attention and "p2c" in self.pos_att_type
+        scale_factor = 1 + int(has_c2p) + int(has_p2c)
+        score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
+        config_options = {
+            "hidden_states": hidden_states,
+            "sequence_length": info.max_seqlen,
+            "batch_heads": len(info.lengths) * self.num_attention_heads,
+            "active_slots": int(plan.active_slots.numel()),
+            "has_c2p": has_c2p,
+            "has_p2c": has_p2c,
+            "layout": "packed",
+            "uses_padding_mask": False,
+        }
+        forward_config = self._resolve_kernel_config(
+            **config_options,
+            phase="training_forward",
+        )
+        dq_config = None
+        dkv_config = None
+        if torch.is_grad_enabled():
+            dq_config = self._resolve_kernel_config(**config_options, phase="backward_dq")
+            dkv_config = self._resolve_kernel_config(**config_options, phase="backward_dkv")
+        output = training_attention_packed(
+            query_layer,
+            key_layer,
+            value_layer,
+            pos_key,
+            pos_query,
+            plan.delta_to_local,
+            cu_seqlens,
+            max_seqlen=info.max_seqlen,
+            score_scale=score_scale,
+            strict_fp32=self.fp32_precision == "strict",
+            forward_config=forward_config,
+            dq_config=dq_config,
+            dkv_config=dkv_config,
+            autotune_candidates=self.tuning.candidates,
         )
         return output, None
 

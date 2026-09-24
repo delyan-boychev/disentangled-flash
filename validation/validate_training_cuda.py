@@ -13,6 +13,7 @@ from disentangled_flash._reference import (
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
 )
+from disentangled_flash.packed import pack_padded_with_info
 from disentangled_flash.training import TritonTrainingDisentangledSelfAttention
 
 DTYPES = {
@@ -85,6 +86,7 @@ def run_case(
     mask_pattern: str,
     fp32_precision: str,
     assume_unpadded: bool,
+    layout: str,
     seed: int,
 ) -> dict[str, object]:
     device = torch.device("cuda")
@@ -125,7 +127,7 @@ def run_case(
     probe_cpu.normal_(mean=0.0, std=0.2, generator=generator)
 
     hidden_ref = hidden_cpu.to(device=device, dtype=dtype).requires_grad_(True)
-    hidden_candidate = hidden_cpu.to(device=device, dtype=dtype).requires_grad_(True)
+    hidden_candidate_padded = hidden_cpu.to(device=device, dtype=dtype)
     relative_ref = relative_cpu.to(device=device, dtype=dtype).requires_grad_(True)
     relative_candidate = relative_cpu.to(device=device, dtype=dtype).requires_grad_(True)
     probe = probe_cpu.to(device=device, dtype=torch.float32)
@@ -136,14 +138,33 @@ def run_case(
         _prepare_attention_mask(mask, length, length),
         rel_embeddings=relative_ref,
     )[0]
-    candidate_output = candidate(
-        hidden_candidate,
-        mask,
-        rel_embeddings=relative_candidate,
-    )[0]
+    if layout == "packed":
+        hidden_candidate, cu_seqlens, packed_info = pack_padded_with_info(
+            hidden_candidate_padded,
+            mask,
+        )
+        hidden_candidate = hidden_candidate.detach().requires_grad_(True)
+        candidate_output = candidate.forward_packed(
+            hidden_candidate,
+            cu_seqlens,
+            packed_info.max_seqlen,
+            rel_embeddings=relative_candidate,
+            packed_info=packed_info,
+        )[0]
+        reference_for_loss = reference_output[mask]
+        probe_for_loss = probe[mask]
+    else:
+        hidden_candidate = hidden_candidate_padded.requires_grad_(True)
+        candidate_output = candidate(
+            hidden_candidate,
+            mask,
+            rel_embeddings=relative_candidate,
+        )[0]
+        reference_for_loss = reference_output
+        probe_for_loss = probe
 
-    reference_loss = (reference_output.float() * probe).sum()
-    candidate_loss = (candidate_output.float() * probe).sum()
+    reference_loss = (reference_for_loss.float() * probe_for_loss).sum()
+    candidate_loss = (candidate_output.float() * probe_for_loss).sum()
     reference_loss.backward()
     candidate_loss.backward()
     torch.cuda.synchronize()
@@ -177,9 +198,13 @@ def run_case(
         "batch_size": batch_size,
         "dtype": dtype_name,
         "mask_pattern": mask_pattern,
+        "layout": layout,
         "assume_unpadded": assume_unpadded,
-        "output": error_stats(reference_output, candidate_output),
-        "hidden_grad": error_stats(hidden_ref.grad, hidden_candidate.grad),
+        "output": error_stats(reference_for_loss, candidate_output),
+        "hidden_grad": error_stats(
+            hidden_ref.grad[mask] if layout == "packed" else hidden_ref.grad,
+            hidden_candidate.grad,
+        ),
         "relative_grad": error_stats(relative_ref.grad, relative_candidate.grad),
         "worst_parameter": worst_parameter[0],
         "worst_parameter_error": worst_parameter[1],
@@ -198,6 +223,7 @@ def main() -> None:
     parser.add_argument("--mask-pattern", choices=("none", "right"), default="none")
     parser.add_argument("--fp32-precision", choices=("strict", "fast"), default="strict")
     parser.add_argument("--assume-unpadded", action="store_true")
+    parser.add_argument("--layouts", nargs="+", choices=("padded", "packed"), default=["padded", "packed"])
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--output", default="training_cuda_validation.json")
     args = parser.parse_args()
@@ -210,32 +236,36 @@ def main() -> None:
     rows = []
     for length in args.lengths:
         for batch_size in args.batches:
-            row = run_case(
-                length=length,
-                batch_size=batch_size,
-                dtype=DTYPES[args.dtype],
-                dtype_name=args.dtype,
-                mask_pattern=args.mask_pattern,
-                fp32_precision=args.fp32_precision,
-                assume_unpadded=args.assume_unpadded,
-                seed=args.seed,
-            )
-            rows.append(row)
-            print(
-                f"L={length:>4} B={batch_size} {args.dtype:>4} {args.mask_pattern:>5} "
-                f"out={row['output']['max_abs']:.7g} "
-                f"dX={row['hidden_grad']['max_abs']:.7g} "
-                f"dXrel={row['hidden_grad']['relative_l2']:.3e} "
-                f"dXcos={row['hidden_grad']['cosine']:.8f} "
-                f"dRel={row['relative_grad']['max_abs']:.7g} "
-                f"worst={row['worst_parameter']}:{row['worst_parameter_error']['max_abs']:.7g} "
-                f"rel={row['worst_parameter_error']['relative_l2']:.3e} "
-                f"cos={row['worst_parameter_error']['cosine']:.8f} "
-                f"worstRel={row['worst_relative_parameter']}:"
-                f"{row['worst_relative_parameter_error']['relative_l2']:.3e}",
-                flush=True,
-            )
-            torch.cuda.empty_cache()
+            for layout in args.layouts:
+                row = run_case(
+                    length=length,
+                    batch_size=batch_size,
+                    dtype=DTYPES[args.dtype],
+                    dtype_name=args.dtype,
+                    mask_pattern=args.mask_pattern,
+                    fp32_precision=args.fp32_precision,
+                    assume_unpadded=args.assume_unpadded,
+                    layout=layout,
+                    seed=args.seed,
+                )
+                rows.append(row)
+                print(
+                    f"L={length:>4} B={batch_size} {layout:>6} "
+                    f"{args.dtype:>4} {args.mask_pattern:>5} "
+                    f"out={row['output']['max_abs']:.7g} "
+                    f"dX={row['hidden_grad']['max_abs']:.7g} "
+                    f"dXrel={row['hidden_grad']['relative_l2']:.3e} "
+                    f"dXcos={row['hidden_grad']['cosine']:.8f} "
+                    f"dRel={row['relative_grad']['max_abs']:.7g} "
+                    f"worst={row['worst_parameter']}:"
+                    f"{row['worst_parameter_error']['max_abs']:.7g} "
+                    f"rel={row['worst_parameter_error']['relative_l2']:.3e} "
+                    f"cos={row['worst_parameter_error']['cosine']:.8f} "
+                    f"worstRel={row['worst_relative_parameter']}:"
+                    f"{row['worst_relative_parameter_error']['relative_l2']:.3e}",
+                    flush=True,
+                )
+                torch.cuda.empty_cache()
 
     output = Path(args.output).resolve()
     output.write_text(

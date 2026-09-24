@@ -13,6 +13,7 @@ from disentangled_flash._reference import (
 from disentangled_flash._torch import TorchTrainingDisentangledSelfAttention
 from disentangled_flash.deberta import DebertaV2OptimizedEncoder
 from disentangled_flash.training import TritonTrainingDisentangledSelfAttention
+from disentangled_flash.tuning import KernelConfig, KernelTuningOptions
 
 
 def make_config() -> DebertaAttentionConfig:
@@ -36,6 +37,16 @@ def test_training_attention_preserves_parameter_layout() -> None:
     target = TritonTrainingDisentangledSelfAttention(config)
     assert tuple(reference.state_dict()) == tuple(target.state_dict())
     target.load_state_dict(reference.state_dict(), strict=True)
+
+
+def test_training_attention_accepts_shared_tuning_options() -> None:
+    tuning = KernelTuningOptions(
+        mode="fixed",
+        fixed_config=KernelConfig(32, 64, 4),
+    )
+    target = TritonTrainingDisentangledSelfAttention(make_config(), tuning=tuning)
+
+    assert target.tuning is tuning
 
 
 def test_training_public_api_is_exported() -> None:

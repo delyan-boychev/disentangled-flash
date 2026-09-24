@@ -3,7 +3,10 @@ import torch
 
 from disentangled_flash import kernel
 from disentangled_flash._reference import DebertaAttentionConfig
-from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
+from disentangled_flash._torch import (
+    TorchInferenceDisentangledSelfAttention,
+    TorchTrainingDisentangledSelfAttention,
+)
 from disentangled_flash.kernel import InferenceDisentangledSelfAttention
 from disentangled_flash.packed import (
     pack_padded,
@@ -91,6 +94,52 @@ def test_packed_attention_matches_independent_unpadded_sequences():
         )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_packed_training_fallback_preserves_autograd():
+    config = DebertaAttentionConfig(
+        hidden_size=32,
+        num_attention_heads=1,
+        attention_head_size=32,
+        hidden_dropout_prob=0.0,
+        attention_probs_dropout_prob=0.0,
+        relative_attention=True,
+        max_relative_positions=16,
+        max_position_embeddings=16,
+        position_buckets=-1,
+        share_att_key=True,
+        pos_att_type=("c2p", "p2c"),
+        norm_rel_ebd="none",
+    )
+    module = TorchTrainingDisentangledSelfAttention(config)
+    relative = torch.randn(32, 32)
+    lengths = (3, 5, 2)
+    expected_input = torch.randn(sum(lengths), 32, requires_grad=True)
+    packed_input = expected_input.detach().clone().requires_grad_(True)
+    cu_seqlens = torch.tensor([0, 3, 8, 10], dtype=torch.int32)
+
+    expected_parts = []
+    start = 0
+    for length in lengths:
+        output, _ = module(
+            expected_input[start : start + length].unsqueeze(0),
+            torch.ones(1, length, dtype=torch.bool),
+            rel_embeddings=relative,
+        )
+        expected_parts.append(output.squeeze(0))
+        start += length
+    expected = torch.cat(expected_parts)
+    actual, _ = module.forward_packed(
+        packed_input,
+        cu_seqlens,
+        max_seqlen=5,
+        rel_embeddings=relative,
+    )
+
+    torch.testing.assert_close(actual, expected)
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(packed_input.grad, expected_input.grad)
 
 
 def test_cu_seqlens_validation_rejects_bad_boundaries():

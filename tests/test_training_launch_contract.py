@@ -26,7 +26,7 @@ def test_training_forward_matches_shared_kernel_signature():
     ]
     assert len(calls) == 1
     signature = {arg.arg for arg in forward.args.args}
-    keywords = {keyword.arg for keyword in calls[0].keywords}
+    keywords = {keyword.arg for keyword in calls[0].keywords if keyword.arg is not None}
     assert "USE_PADDING_MASK" in signature
     assert "USE_PADDING_MASK" in keywords
     assert {"POSITION_OFFSET", "LENGTH_REGIME"} <= signature

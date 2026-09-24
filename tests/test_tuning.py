@@ -8,8 +8,10 @@ from disentangled_flash.tune import (
     PRESETS,
     TuningCase,
     _make_inputs,
+    _make_training_inputs,
     _packed_reference,
     _reference,
+    _training_reference,
     build_parser,
     inspect_profile,
 )
@@ -47,6 +49,7 @@ def make_workload(
     *,
     layout: str = "padded",
     uses_padding_mask: bool = True,
+    phase: str = "inference",
 ) -> WorkloadKey:
     return WorkloadKey(
         sequence_length=length,
@@ -59,6 +62,7 @@ def make_workload(
         fp32_precision="strict",
         layout=layout,
         uses_padding_mask=uses_padding_mask,
+        phase=phase,
     )
 
 
@@ -87,7 +91,36 @@ def test_profile_json_round_trip(tmp_path):
     assert payload["compiler"]["triton_key"] == "triton-test-key"
     assert payload["entries"][0]["workload"]["length_regime"] == 128
     assert payload["entries"][0]["workload"]["layout"] == "padded"
+    assert payload["entries"][0]["workload"]["phase"] == "inference"
     assert "sequence_length" not in payload["entries"][0]["workload"]
+
+
+def test_profile_phase_separates_training_forward_and_backward_winners():
+    entries = (
+        ProfileEntry(make_workload(phase="training_forward"), KernelConfig(64, 32, 4), 0.1),
+        ProfileEntry(make_workload(phase="backward_dq"), KernelConfig(32, 64, 4), 0.2),
+        ProfileEntry(make_workload(phase="backward_dkv"), KernelConfig(64, 64, 8), 0.3),
+    )
+    registry = ProfileRegistry(
+        (KernelProfile(make_hardware(), make_compiler(), entries=entries),)
+    )
+
+    assert registry.resolve(
+        make_hardware(), make_compiler(), make_workload(phase="training_forward")
+    ) == KernelConfig(64, 32, 4)
+    assert registry.resolve(
+        make_hardware(), make_compiler(), make_workload(phase="backward_dq")
+    ) == KernelConfig(32, 64, 4)
+    assert registry.resolve(
+        make_hardware(), make_compiler(), make_workload(phase="backward_dkv")
+    ) == KernelConfig(64, 64, 8)
+
+
+def test_legacy_format_three_workload_defaults_to_inference_phase():
+    payload = make_workload().to_dict()
+    payload.pop("phase")
+
+    assert WorkloadKey.from_dict(payload).phase == "inference"
 
 
 def test_bundled_profiles_are_parseable_and_fully_validated():
@@ -131,8 +164,11 @@ def test_standard_is_the_broadest_supported_preset():
     assert set(PRESETS) == {"quick", "standard"}
     assert PRESETS["standard"]["relative_modes"] == ("none", "c2p", "p2c", "both")
     assert PRESETS["standard"]["layouts"] == ("padded", "packed")
+    assert PRESETS["standard"]["passes"] == ("inference", "training")
     assert PRESETS["standard"]["lengths"][-1] == 8192
-    assert build_parser().parse_args(["--output", "profile.json"]).preset == "standard"
+    args = build_parser().parse_args(["--output", "profile.json"])
+    assert args.preset == "standard"
+    assert args.passes is None
 
 
 def test_packed_tuning_case_uses_mixed_boundaries_and_separate_workload():
@@ -153,6 +189,28 @@ def test_packed_tuning_case_uses_mixed_boundaries_and_separate_workload():
     assert workload.layout == "packed"
     assert workload.uses_padding_mask is False
     assert _packed_reference(arguments).shape == (22, 64)
+
+
+def test_packed_training_tuning_case_builds_differentiable_reference():
+    case = TuningCase(
+        8,
+        32,
+        8,
+        "float32",
+        True,
+        True,
+        "strict",
+        layout="packed",
+        uses_padding_mask=False,
+    )
+    inputs, workload = _make_training_inputs(case, torch.device("cpu"))
+
+    output = _training_reference(inputs, workload)
+    gradients = torch.autograd.grad(output.square().mean(), inputs.grad_tensors())
+
+    assert output.shape == (22, 64)
+    assert workload.phase == "training_forward"
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
 def test_profile_for_384_resolves_runtime_length_383():
