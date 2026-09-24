@@ -1241,12 +1241,10 @@ def run(args: argparse.Namespace) -> None:
             continue
         expected = _training_reference(inputs, base_workload)
         grad_output = torch.randn_like(expected)
-        expected_gradients = torch.autograd.grad(
-            expected,
-            inputs.grad_tensors(),
-            grad_output,
-            retain_graph=True,
-        )
+        # Free the reference graph right away: at long lengths its saved
+        # L x L activations would otherwise stay alive for the whole search.
+        expected_gradients = torch.autograd.grad(expected, inputs.grad_tensors(), grad_output)
+        expected = expected.detach()
         strict_fp32 = base_workload.dtype == "float32" and (
             base_workload.fp32_precision == "strict"
         )
