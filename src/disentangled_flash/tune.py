@@ -755,11 +755,14 @@ def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.
             )
         if inputs.pos_query is not None:
             p2c = torch.matmul(key.float(), inputs.pos_query.float().transpose(-1, -2))
+            # scores[h, i, j] += p2c[h, j, local[i, j]].  Gathering from p2c
+            # itself keeps the backward scatter at [H, L, R]; gathering from an
+            # expanded [H, L, L, R] view would allocate that view in backward.
             scores = scores + torch.gather(
-                p2c.unsqueeze(-3).expand(-1, length, -1, -1),
+                p2c,
                 -1,
-                local[None, :, :, None].expand(query.size(0), -1, -1, -1),
-            ).squeeze(-1)
+                local.transpose(0, 1).expand(query.size(0), -1, -1),
+            ).transpose(-1, -2)
         scores = scores * inputs.score_scale
         if mask is not None:
             pair_mask = mask[:, None] & mask[None, :]
