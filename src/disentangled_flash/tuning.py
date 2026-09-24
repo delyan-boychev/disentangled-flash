@@ -579,7 +579,9 @@ def _load_profile_directory(path: Path) -> list[KernelProfile]:
 
 def load_bundled_profiles() -> tuple[KernelProfile, ...]:
     loaded: list[KernelProfile] = []
-    root = resources.files("disentangled_flash.profiles")
+    root = resources.files(__package__).joinpath("profiles")
+    if not root.is_dir():
+        return ()
     for item in sorted(root.iterdir(), key=lambda entry: entry.name):
         if item.name.endswith(".json"):
             with resources.as_file(item) as profile_path:

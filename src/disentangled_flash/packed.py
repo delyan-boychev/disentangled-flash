@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from itertools import accumulate, pairwise
+# NOTE: this module is vendored into the DisentangledFlash Hub kernel, which
+# must stay importable on Python 3.9 (torch 2.8 still supports it). Avoid
+# itertools.pairwise and other 3.10-only constructs here; the RUF007 hints
+# below are suppressed for that reason.
+from itertools import accumulate
 from typing import NamedTuple
 
 import torch
@@ -41,7 +45,7 @@ def validate_cu_seqlens(
     offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
     if offsets[0] != 0 or offsets[-1] != total_tokens:
         raise ValueError("cu_seqlens must start at 0 and end at the packed token count")
-    lengths = tuple(end - start for start, end in pairwise(offsets))
+    lengths = tuple(end - start for start, end in zip(offsets, offsets[1:]))  # noqa: RUF007
     if any(length <= 0 for length in lengths):
         raise ValueError("cu_seqlens must be strictly increasing; empty sequences are unsupported")
     actual_max = max(lengths)
@@ -75,7 +79,9 @@ def resolve_packed_info(
         raise ValueError("packed_info does not match the packed token count")
     if len(packed_info.lengths) + 1 != len(packed_info.offsets):
         raise ValueError("packed_info has inconsistent offsets and lengths")
-    derived_lengths = tuple(end - start for start, end in pairwise(packed_info.offsets))
+    derived_lengths = tuple(
+        end - start for start, end in zip(packed_info.offsets, packed_info.offsets[1:])
+    )
     if derived_lengths != packed_info.lengths:
         raise ValueError("packed_info lengths do not match its offsets")
     if any(length <= 0 for length in packed_info.lengths):

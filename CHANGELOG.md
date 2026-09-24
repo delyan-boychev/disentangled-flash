@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-09-17
+
+### Bug Fixes
+
+- Support tuning on Python 3.10 ([28f1e05](https://github.com/delyan-boychev/disentangled-flash/commit/28f1e05ad212a1ecee4eb4582838c13fee4fdbb4))
+- Make CUDA benchmark parity capacity safe ([2f236ad](https://github.com/delyan-boychev/disentangled-flash/commit/2f236adbb48f6e7f180a921b50c9071f5eea6f69))
+- Benchmark the 4096 sequence family ([04f52ba](https://github.com/delyan-boychev/disentangled-flash/commit/04f52ba48945ed7cc9989d6f7130a3f5690d78ac))
+
+### Features
+
+- Tune bounded kernels through 8192 ([3d4db57](https://github.com/delyan-boychev/disentangled-flash/commit/3d4db575f3573fc19f409371931d6319e93541f3))
+- Make tuning profiles compiler safe ([6a44316](https://github.com/delyan-boychev/disentangled-flash/commit/6a44316ba10f05ac9d920291706e192845528d26))
+
+### Miscellaneous Tasks
+
+- Add reproducible DeBERTa encoder matrix ([31afb88](https://github.com/delyan-boychev/disentangled-flash/commit/31afb8882efd54389b564127cb338bdffba9e046))
+- Define MNLI parity by classification decisions ([f67c41a](https://github.com/delyan-boychev/disentangled-flash/commit/f67c41a833f747cf5420ae63c13f7e3ed8167d77))
+
+### Performance
+
+- Reduce packed encoder overhead ([3056c53](https://github.com/delyan-boychev/disentangled-flash/commit/3056c53c3226963523fe568a65a6eb8eb75de9a1))
+
+### Bench
+
+- Distinguish supported encoder layouts ([be2d297](https://github.com/delyan-boychev/disentangled-flash/commit/be2d297f08ac3ca4b7c197558916fd33cc30ead6))
+- Publish H200 results and FlashDeBERTa MNLI ([3082ac6](https://github.com/delyan-boychev/disentangled-flash/commit/3082ac64de0d98efcc6cfaa6164d9be2b0b1a19d))
+- Expose strict profile-only MNLI runs ([e5245cc](https://github.com/delyan-boychev/disentangled-flash/commit/e5245cc341bfb7787d805efa26847037164bdf91))
+- Evaluate real GLUE MNLI matrix ([a4b2801](https://github.com/delyan-boychev/disentangled-flash/commit/a4b280145245456185614acbc5dc31e85e9429d9))
+
 ## [0.1.4] - 2026-09-15
 
 ### Bug Fixes
