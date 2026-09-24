@@ -1,16 +1,8 @@
-"""Isolated CUDA benchmark for DeBERTa-v3-base encoder backends.
+"""CUDA benchmark for DeBERTa-v3-base encoder backends.
 
-By default this benchmarks the reference, PyTorch, Triton, and FlashDeBERTa
-implementations under the four requested execution configurations:
-
-* FP16 eager
-* FP16 ``torch.compile``
-* FP32 eager
-* FP32 ``torch.compile``
-
-Each implementation/dtype/execution combination runs in a fresh process.  All
-implementations receive identically seeded embedding-derived inputs, while each
-measured iteration receives a different token batch and padding pattern.
+Compares the reference, PyTorch, Triton, and FlashDeBERTa encoders in FP16 and
+FP32, eager and compiled. Each combination runs in its own process with the
+same seeded inputs.
 """
 
 from __future__ import annotations
@@ -375,13 +367,7 @@ def compile_isolated(
     fullgraph: bool,
     dynamic: bool,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    """Compile one bucket without sharing Dynamo's per-code-object budget.
-
-    PyTorch 2.13 added ``isolate_recompiles=True`` for this exact factory
-    pattern.  Older releases use the officially documented code-object cloning
-    workaround so separate length buckets cannot exhaust one another's default
-    eight-entry recompile limit.
-    """
+    """Compile one length bucket with its own recompile budget."""
 
     compile_kwargs: dict[str, Any] = {
         "mode": mode,
@@ -465,8 +451,7 @@ def make_inputs(
         token_ids.masked_fill_(~mask_cpu, 0)
 
         token_ids = token_ids.to(device=embedding_table.device)
-        # Match tokenizer output. DeBERTa's convolution computes
-        # ``1 - input_mask`` and therefore requires an integer mask.
+        # DeBERTa's convolution computes 1 - mask, so keep it integer.
         mask = mask_cpu.to(device=embedding_table.device, dtype=torch.long)
         hidden_states = embedding_table[token_ids].contiguous()
         batches.append((hidden_states, mask))
@@ -873,8 +858,7 @@ def run_worker(args: argparse.Namespace) -> dict[str, Any]:
         write_json(args.worker_output, payload)
         return payload
     if args.implementation == "triton":
-        # Triton documents this switch as the supported way to report tuning
-        # time and the winning configuration for every new tuning key.
+        # Print Triton's autotune time and winners.
         os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "1")
 
     configure_fp32(args.fp32_precision)

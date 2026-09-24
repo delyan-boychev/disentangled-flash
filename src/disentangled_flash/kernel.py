@@ -1,10 +1,8 @@
-"""CUDA Triton implementation of exact DeBERTa disentangled attention.
+"""Triton kernels for exact DeBERTa disentangled attention.
 
-QK, relative-score lookup, a factorized padding mask, online softmax, and PV
-are fused without constructing ``[B, H, L, L]`` scores/probabilities.  C2P and
-P2C remain regular GEMMs over the pruned active relative-position slots.  The
-same forward kernel serves inference and training; training enables the
-compile-time ``STORE_LSE`` specialization needed by the custom backward.
+Scores are never materialized as [B, H, L, L]. C2P and P2C stay regular GEMMs
+over the active relative-position slots. Training reuses the same forward with
+STORE_LSE enabled.
 """
 
 from __future__ import annotations
@@ -52,18 +50,8 @@ AUTOTUNE_SPECIALIZATION_KEY = (
 
 
 if triton is not None:
-    # Conservative schedules for this DeBERTa kernel.
-    #
-    # This kernel carries more live state than vanilla FlashAttention:
-    #   * Q/K/V tiles
-    #   * FP32 online-softmax accumulator
-    #   * score tile
-    #   * C2P/P2C lookup state
-    #   * relative-position indices and masks
-    #
-    # Keep all schedules at one pipeline stage. Most candidates stay within
-    # 64x64; a pair of asymmetric larger tiles is retained for FP16/BF16 and
-    # pruned out for heavier FP32/head-dim workloads.
+    # This kernel keeps more live state than plain FlashAttention (C2P/P2C
+    # lookups, position indices, masks), so schedules stay small.
     def _as_triton_config(config: KernelConfig) -> Any:
         return triton.Config(
             {"BLOCK_M": config.block_m, "BLOCK_N": config.block_n},
@@ -129,9 +117,7 @@ if triton is not None:
                 (64, 64),
             }
 
-            # Larger tiles are worth testing for FP16/BF16 with normal head sizes.
-            # They use only one pipeline stage, and safe configurations above remain
-            # available if Triton rejects one for resource usage.
+            # Larger tiles only pay off for FP16/BF16 with normal head sizes.
             if not is_fp32 and head_dim <= 64:
                 allowed_shapes.update(
                     {
@@ -152,14 +138,12 @@ if triton is not None:
             and not (config.num_stages > 2 and (sequence_length < 384 or head_dim != 64))
         ]
 
-        # 32x32 is deliberately present as a conservative fallback for every
-        # non-tiny sequence class.
+        # 32x32 is always allowed as a safe fallback.
         return kept or configs[:1]
 
-    # Counter-based attention-dropout mask shared by forward and backward. Each
-    # (batch or sequence, head) stream uses its own Philox key and each
-    # in-sequence (row, column) pair its own 32-bit counter, so the backward
-    # kernels regenerate exactly the forward mask without storing it.
+    # Dropout mask shared by forward and backward: one Philox key per
+    # (batch or sequence, head), one counter per (row, col). Backward
+    # regenerates it instead of storing it.
     @triton.jit
     def _dropout_keep(dropout_seed, stream, rows, cols, DROPOUT_P):
         seed = tl.load(dropout_seed) + stream
@@ -343,8 +327,7 @@ if triton is not None:
                     -float("inf"),
                 )
 
-            # Keep the unused rows of the final partial BLOCK_M numerically
-            # well-defined. They are never written to output.
+            # Keep out-of-range rows finite; they are never stored.
             scores = tl.where(
                 ~query_in_bounds[:, None] & (key_offsets[None, :] == 0),
                 0.0,
@@ -359,15 +342,12 @@ if triton is not None:
                 other=0.0,
             )
 
-            # Every runtime length in this regime fits when its representative
-            # fits in one tile. Both regime and tile size are constexpr, so
-            # Triton removes the unused branch at compile time.
+            # Single-tile rows skip the online-softmax rescaling.
             if LENGTH_REGIME <= BLOCK_N:
                 new_row_max = tl.max(scores, axis=1)
                 probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = tl.sum(probabilities, axis=1)
-                # The softmax denominator and LSE stay undropped; only the
-                # value accumulation sees the mask, as in FlashAttention.
+                # Row sums and LSE stay undropped, as in FlashAttention.
                 if HAS_DROPOUT:
                     keep = _dropout_keep(
                         dropout_seed, batch_head, query_offsets, key_offsets, DROPOUT_P
@@ -400,9 +380,7 @@ if triton is not None:
             else:
                 new_row_max = tl.maximum(row_max, tl.max(scores, axis=1))
                 if USE_PADDING_MASK:
-                    # A left-padded sequence can produce a completely masked
-                    # first K/V tile. Avoid -inf - -inf in the online-softmax
-                    # recurrence until the first kept key is encountered.
+                    # Left padding can mask a whole K/V tile; avoid -inf - -inf.
                     row_has_scores = new_row_max != -float("inf")
                     normalization_center = tl.where(row_has_scores, new_row_max, 0.0)
                     correction = tl.where(
@@ -412,8 +390,6 @@ if triton is not None:
                     )
                     probabilities = tl.math.exp2(scores - normalization_center[:, None])
                 else:
-                    # Keep the no-padding specialization free of mask-related
-                    # normalization work.
                     correction = tl.math.exp2(row_max - new_row_max)
                     probabilities = tl.math.exp2(scores - new_row_max[:, None])
                 new_row_sum = row_sum * correction + tl.sum(probabilities, axis=1)
@@ -1213,8 +1189,7 @@ if triton is not None:
                 strict_fp32,
             )
 
-        # Custom candidate sets remain eager-only on older torch versions. On
-        # current torch, register a stable operator so torch.compile can trace it.
+        # Register an operator so torch.compile can trace custom candidates.
         if hasattr(torch.library, "triton_op") and hasattr(torch.library, "wrap_triton"):
             suffix = abs(hash(configs))
             return torch.library.triton_op(
@@ -1331,13 +1306,7 @@ class TritonPreparedPositionPlan(NamedTuple):
 
 
 class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention):
-    """Cached DeBERTa-v2/v3 inference attention with Torch/Triton dispatch.
-
-    One module owns the original DeBERTa parameters and inference caches.  The
-    selected backend only changes the prepared position representation and the
-    attention execution: ``torch`` uses the optimized PyTorch implementation,
-    while ``triton`` uses the compact O(L) position plan and fused CUDA kernel.
-    """
+    """DeBERTa-v2/v3 inference attention with a PyTorch or Triton backend."""
 
     def __init__(
         self,
@@ -1445,8 +1414,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
                     "profile_only tuning cannot resolve a dynamic workload inside "
                     "torch.compile; select the profile's configuration with fixed mode"
                 )
-            # Triton's own key-based autotuner supports symbolic/dynamic batch
-            # sizes without introducing Python profile lookups into the graph.
+            # Let Triton's autotuner handle dynamic shapes inside the graph.
             return None, workload
         device_index = hidden_states.device.index
         if device_index is None:
@@ -1692,8 +1660,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
                 f"{sequence_length}"
             )
         if self.assume_unpadded:
-            # The kernel will compile away every mask load. Validate only the
-            # external API contract; do not allocate a bool/contiguous copy.
+            # The mask is unused here, so only check its shape.
             _validate_2d_padding_mask(
                 attention_mask,
                 batch_size,

@@ -8,9 +8,7 @@ from disentangled_flash import kernel
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
 @pytest.mark.skipif(kernel.triton is None, reason="Triton is not installed")
 def test_online_softmax_handles_completely_masked_first_tile():
-    # FP32 pruning limits BLOCK_N to 64 here.  With only the final token kept,
-    # every candidate must process at least one all-masked tile before it sees
-    # the valid key.
+    # Only the last token is kept, so every schedule hits a fully masked tile first.
     sequence_length = 65
     head_dim = 32
     query = torch.randn(1, 1, sequence_length, head_dim, device="cuda")

@@ -25,17 +25,11 @@ from ._kernels import training_attention, training_attention_packed
 
 
 class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAttention):
-    """Trainable exact disentangled self-attention for CUDA.
+    """Trainable disentangled self-attention on CUDA.
 
-    Parameter-derived inference caches are deliberately absent. Q/K/V and the
-    projected relative-position tables are rebuilt through ordinary PyTorch
-    operators on every forward so gradients flow through all original DeBERTa
-    parameters. Only immutable relative-position geometry is cached.
-
-    Attention-probability dropout runs inside the fused kernels in training
-    mode: the Philox mask is regenerated in backward rather than stored, as in
-    FlashAttention. Hidden-state dropout and positional-embedding dropout stay
-    ordinary PyTorch modules.
+    Projections are recomputed every forward so gradients reach all DeBERTa
+    parameters; only position geometry is cached. Attention dropout runs in the
+    kernels in training mode.
     """
 
     def __init__(
@@ -67,8 +61,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             )
         )
         self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
-        # Training-forward workloads whose saved schedules failed to compile or
-        # launch; every phase of such a workload falls back to bounded autotuning.
+        # Workloads whose saved schedule failed; these fall back to autotuning.
         self._failed_profile_workloads: set[WorkloadKey] = set()
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
 

@@ -1,7 +1,6 @@
-"""Hostile numerical validation for prepared DeBERTa attention on CUDA.
+"""Numerical validation for DeBERTa attention on CUDA.
 
-This is deliberately separate from the throughput distribution benchmark.  It
-reports raw max/mean absolute errors without imposing pass/fail tolerances.
+Reports max and mean absolute errors; it doesn't apply pass/fail tolerances.
 """
 
 from __future__ import annotations

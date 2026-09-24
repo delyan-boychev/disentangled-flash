@@ -1,10 +1,7 @@
-"""Unified encoder-level DeBERTa-v2/v3 optimization integration.
+"""Drop-in DeBERTa-v2/v3 encoder that swaps in the optimized attention.
 
-Hugging Face's regular encoder expands a 2-D padding mask to ``[B, 1, L, L]``
-and builds an ``[L, L]`` relative-position tensor before entering its layer
-loop.  This wrapper preserves the original layer output, FFN, convolution, and
-state-dict layout while selecting either the Triton or optimized PyTorch
-attention backend for inference or differentiable training.
+Unlike the Hugging Face encoder, it never expands the padding mask to
+[B, 1, L, L] or builds an [L, L] position tensor. Checkpoint keys are unchanged.
 """
 
 from __future__ import annotations
@@ -82,17 +79,10 @@ def _invalidate_encoder_cache_after_load(
 
 
 class DebertaV2OptimizedEncoder(nn.Module):
-    """Single optimized replacement for a Hugging Face ``DebertaV2Encoder``.
+    """Optimized replacement for Hugging Face's DebertaV2Encoder.
 
-    This module is a drop-in replacement for the Hugging Face encoder in DeBERTa-v2
-    and DeBERTa-v3 models. It uses the fast, exact, Triton-fused or PyTorch-optimized
-    disentangled self-attention mechanisms under the hood.
-
-    ``inference=True`` enables the parameter-derived packed/cached path and is
-    therefore intended for inference-only models.  ``inference=False`` keeps
-    parameter identities stable and projections differentiable.  In the latter
-    mode, ``model.eval()`` still permits backward; only ``no_grad()`` or
-    ``inference_mode()`` disables the Triton LSE/autograd state.
+    inference=True caches parameter-derived tensors and is inference-only.
+    inference=False keeps everything differentiable for training.
     """
 
     def __init__(
@@ -162,8 +152,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
         if self.inference:
             attention_class = InferenceDisentangledSelfAttention
         elif self.backend == "triton":
-            # Lazy import avoids a package-level cycle: training._kernels imports
-            # the canonical forward kernel from kernel.py.
+            # Lazy import to avoid a cycle with kernel.py.
             from .training.attention import TritonTrainingDisentangledSelfAttention
 
             attention_class = TritonTrainingDisentangledSelfAttention
@@ -272,8 +261,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
         if not lengths or any(length < 1 for length in lengths):
             raise ValueError("sequence_lengths must contain positive integers")
 
-        # Full projected position tables are layer-dependent.  The length plans
-        # below share their index tensors through one encoder-owned cache.
+        # Projected tables are per layer; index plans are shared.
         self.clear_inference_cache()
         rel_embeddings = self.get_rel_embedding()
         attentions = self._attention_modules()
@@ -286,9 +274,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
                 attention.prepare_shape(length, device) for attention in attentions
             )
 
-        # Every prepared shape now owns its compact projected position tensors.
-        # The full per-layer projected position tables were only preparation
-        # workspace and need not remain resident during inference.
+        # Prepared shapes own their position tables, so free the full ones.
         for attention in attentions:
             attention.release_position_projection_workspace()
 
@@ -364,9 +350,8 @@ class DebertaV2OptimizedEncoder(nn.Module):
         next_kv = hidden_states
         input_mask = attention_mask
 
-        # Normalize a real padding mask only once for the complete encoder.
-        # With assume_unpadded=True the Triton kernel never reads the mask, so
-        # preserve the original tensor without allocating a bool copy.
+        # Normalize the mask once per encoder. With assume_unpadded=True it is
+        # never read, so skip the copy.
         layer_attention_mask = attention_mask
 
         if (
@@ -690,11 +675,9 @@ def enable_deberta_inference(
     tuning: KernelTuningOptions | None = None,
     assume_unpadded: bool = False,
 ) -> nn.Module:
-    """Replace a HF DeBERTa-v2/v3 encoder without changing checkpoint keys.
+    """Swap the encoder of a Hugging Face DeBERTa backbone in place, for inference.
 
-    ``model`` must be the Hugging Face backbone (the object with ``embeddings``
-    and ``encoder``), not the outer GLiNER2 model.  The operation is in-place
-    and inference-only.
+    Pass the backbone (the module with embeddings and encoder), not a wrapper model.
     """
 
     return _enable_deberta(
@@ -717,13 +700,10 @@ def compile_deberta_buckets(
     dynamic_batch: bool = True,
     examples: Mapping[int, tuple[torch.Tensor, torch.Tensor]] | None = None,
 ) -> dict[int, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]:
-    """Create isolated compiled encoder callables for prepared length buckets.
+    """Compile one encoder callable per prepared length bucket.
 
-    PyTorch 2.13+'s ``isolate_recompiles`` prevents bucket factories from
-    sharing one code object's recompile budget.  On older PyTorch releases, a
-    distinct cloned code object provides the documented compatibility
-    workaround.  Supplying ``examples`` executes one example per bucket so
-    Dynamo, Inductor, and Triton autotuning finish during startup.
+    Each bucket gets its own recompile budget. Pass examples to warm up
+    compilation and autotuning at startup.
     """
     if not encoder.inference:
         raise ValueError(
@@ -803,15 +783,11 @@ def optimize_deberta(
     tuning: KernelTuningOptions | None = None,
     assume_unpadded: bool = False,
 ) -> nn.Module:
-    """Enable the unified optimized DeBERTa backend.
+    """Enable the optimized DeBERTa encoder.
 
-    ``inference=True`` is the default production mode and may install packed,
-    parameter-derived caches during inference preparation.  Set
-    ``inference=False`` before constructing an optimizer or training so
-    parameter identities remain stable and all projections stay differentiable.
-    ``backend='triton'`` falls back when the Triton runtime/model configuration
-    is unsupported. ``backend='auto'`` additionally considers the model's
-    current device and dtype before choosing Triton.
+    Use inference=False before building an optimizer so parameters stay
+    trainable. backend="triton" falls back to PyTorch when Triton can't run the
+    model; backend="auto" also checks device and dtype.
     """
 
     return _enable_deberta(

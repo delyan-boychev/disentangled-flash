@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -27,16 +28,44 @@ TUNING_SEQUENCE_LENGTHS = (64, 128, 384, 512, 768, 1024, 2048, 4096, 8192)
 TUNING_BATCH_HEADS = (8, 32)
 
 
+def _canonical_code(node: Any) -> str:
+    # Unlike ast.dump, skip empty fields so new Python versions hash the same.
+    if isinstance(node, ast.AST):
+        fields = ",".join(
+            f"{name}={_canonical_code(value)}"
+            for name, value in ast.iter_fields(node)
+            if value is not None and value != []
+        )
+        return f"{type(node).__name__}({fields})"
+    if isinstance(node, list):
+        return "[" + ",".join(_canonical_code(item) for item in node) + "]"
+    return repr(node)
+
+
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    return tree
+
+
 def _kernel_source_digest() -> str:
-    """Fingerprint launch-relevant sources without tying profiles to comments elsewhere."""
+    """Fingerprint the kernel code, ignoring comments, docstrings, and formatting."""
 
     package = Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for relative in (Path("kernel.py"), Path("training") / "_kernels.py"):
-        path = package / relative
+        tree = _strip_docstrings(ast.parse((package / relative).read_text(encoding="utf-8")))
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
-        digest.update(path.read_bytes())
+        digest.update(_canonical_code(tree).encode("utf-8"))
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -45,13 +74,7 @@ KERNEL_SOURCE_DIGEST = _kernel_source_digest()
 
 
 def tuning_dtype(dtype: str) -> str:
-    """Map a tensor dtype to its tuning precision family.
-
-    FP16 and BF16 have the same element size and tensor-core throughput, so
-    FlashAttention compiles one tile set for both and FlexAttention selects the
-    same default blocks for both.  FP32 keeps its own family; its strict (IEEE)
-    and fast (TF32) paths are separated by ``fp32_precision``.
-    """
+    """Map a dtype to its tuning family: FP16 and BF16 share "half", like FlashAttention."""
 
     if dtype in {"float16", "bfloat16", "half"}:
         return "half"
@@ -70,9 +93,7 @@ def tuning_sequence_length(sequence_length: int) -> int:
     for representative in TUNING_SEQUENCE_LENGTHS:
         if sequence_length <= representative:
             return representative
-    # Keep the profile family bounded. The 8192 schedule remains a valid
-    # conservative dispatch choice for longer inputs, even though the kernel
-    # still receives and masks the exact runtime length.
+    # Longer inputs reuse the 8192 schedule.
     return TUNING_SEQUENCE_LENGTHS[-1]
 
 
@@ -159,9 +180,7 @@ BASE_FORWARD_KERNEL_CONFIGS = (
     KernelConfig(128, 64, 4),
 )
 
-# First choose a tile/warp shape at one stage, then refine the strongest shapes
-# with deeper software pipelines.  Stage three is deliberately limited to the
-# normal DeBERTa head size; resource pruning removes it for FP32 and short rows.
+# Deeper pipelines are only tried on the best one-stage shapes.
 DEFAULT_KERNEL_CONFIGS = BASE_FORWARD_KERNEL_CONFIGS + (
     KernelConfig(32, 32, 2, 2),
     KernelConfig(32, 32, 4, 2),
@@ -172,10 +191,8 @@ DEFAULT_KERNEL_CONFIGS = BASE_FORWARD_KERNEL_CONFIGS + (
     KernelConfig(64, 32, 4, 3),
 )
 
-# Backward carries substantially more live state than forward.  Keep its
-# default search deliberately smaller and include the 8-warp schedules that
-# are often important at head dimension 128.  dQ and dK/dV are profiled as
-# separate phases because their optimal tile orientations need not match.
+# Backward holds more live state, so its search is smaller. 8 warps help at
+# head dim 128.
 BASE_BACKWARD_KERNEL_CONFIGS = (
     KernelConfig(16, 16, 4),
     KernelConfig(32, 32, 4),
@@ -193,8 +210,7 @@ DEFAULT_DQ_KERNEL_CONFIGS = BASE_BACKWARD_KERNEL_CONFIGS + (
     KernelConfig(32, 64, 8, 2),
 )
 
-# dK/dV launches across the key dimension, so prefer N-oriented schedules when
-# otherwise tied.  It still owns an independent winner and stage depth.
+# dK/dV iterates over keys, so N-oriented tiles come first on ties.
 DEFAULT_DKV_KERNEL_CONFIGS = (
     KernelConfig(16, 16, 4),
     KernelConfig(32, 32, 4),
@@ -209,18 +225,14 @@ DEFAULT_DKV_KERNEL_CONFIGS = (
     KernelConfig(64, 32, 8, 2),
 )
 
-# Backward runtime autotuning historically imported this name.  Keep it as the
-# stable union while the tuner and training bundle use the phase-specific lists.
+# Kept for backwards compatibility.
 DEFAULT_BACKWARD_KERNEL_CONFIGS = tuple(
     dict.fromkeys(DEFAULT_DQ_KERNEL_CONFIGS + DEFAULT_DKV_KERNEL_CONFIGS)
 )
 
 
-# FP32 tiles are twice as large in registers and shared memory, so FP32 keeps a
-# conservative FlexAttention-style search: one pipeline stage, forward tiles up
-# to 64x64, and backward tiles up to 2048 elements.  These limits mirror the
-# runtime autotune pruning, so the tuner never selects a schedule that bounded
-# autotuning would reject.
+# FP32 tiles use twice the registers, so FP32 only searches one-stage schedules
+# with small tiles. Same limits as the runtime autotune pruning.
 FP32_MAX_FORWARD_TILE = 64 * 64
 FP32_MAX_BACKWARD_TILE = 2048
 
@@ -341,9 +353,7 @@ class WorkloadKey:
             "layout",
             "uses_padding_mask",
         }
-        # ``phase`` was added compatibly to profile format 3 and ``has_dropout``
-        # to format 4.  Older entries are inference or dropout-free by
-        # definition, and their float16/bfloat16 dtypes map to ``half``.
+        # Older profiles may lack phase and has_dropout.
         _require_exact_keys(data, fields, {"phase", "has_dropout"}, "workload key")
         integer_fields = {"length_regime", "head_dim", "occupancy_regime", "slot_regime"}
         if any(
@@ -591,12 +601,7 @@ class ProfileEntry:
 
 
 def _load_entries(items: Any) -> tuple[ProfileEntry, ...]:
-    """Parse saved entries, merging legacy FP16/BF16 twins into one half entry.
-
-    Profiles written before precision families kept separate float16 and
-    bfloat16 winners.  Both now map to the same workload, so the first saved
-    winner is kept as the seed; retargeting revalidates it.
-    """
+    """Parse saved entries. Old separate FP16/BF16 entries collapse to the first one."""
 
     if not isinstance(items, list):
         raise TypeError("profile entries must be a JSON array")
@@ -937,7 +942,7 @@ def prepare_profile_retarget(
     if compatibility == "incompatible":
         raise ValueError("cannot retarget a profile with different hardware or launch schema")
     if compatibility == "exact":
-        # A resumed retarget already carries revalidated winners and pending seeds.
+        # Resuming a retarget; keep the progress.
         return profile
     source_compiler = json.dumps(profile.compiler.to_dict(), sort_keys=True, separators=(",", ":"))
     pending = tuple(

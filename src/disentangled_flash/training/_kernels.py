@@ -1,10 +1,7 @@
-"""Autograd integration and Triton backward kernels for disentangled attention.
+"""Autograd wiring and Triton backward kernels for disentangled attention.
 
-The canonical tiled forward lives in :mod:`disentangled_flash.kernel` and is
-shared by inference and training.  This module enables its ``STORE_LSE``
-specialization when gradients are enabled and owns the recompute-based
-backward.  Under ``no_grad()``/``inference_mode()`` it launches the same forward
-with ``STORE_LSE=False`` and allocates no LSE tensor.
+The forward kernel lives in disentangled_flash.kernel. With gradients enabled it
+also stores the LSE that the backward pass recomputes from.
 """
 
 from __future__ import annotations
@@ -966,11 +963,9 @@ def dropout_keep_mask(
     length: int,
     dropout_p: float,
 ) -> torch.Tensor:
-    """Materialize the kernels' attention-dropout keep mask for validation.
+    """Return the kernels' dropout keep mask as [streams, length, length], for testing.
 
-    Streams are ``batch * heads + head`` for padded attention and
-    ``sequence * heads + head`` for packed attention.  Returns a bool tensor of
-    shape ``[streams, length, length]``.
+    A stream is batch * heads + head (padded) or sequence * heads + head (packed).
     """
 
     _require_training_runtime()
@@ -1075,7 +1070,7 @@ if triton is not None:
             autotune_kwargs["cache_results"] = True
         return triton.autotune(**autotune_kwargs)(kernel)
 
-    # Dropout changes register pressure, so it keys its own autotuned schedule.
+    # Dropout changes register pressure, so it gets its own schedules.
     _TRAINING_FORWARD_EXTRA_KEY = ("HAS_DROPOUT",)
 
     @cache
@@ -1164,11 +1159,7 @@ def _resolve_dropout_seed(
     dropout_p: float,
     dropout_seed: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Draw a fresh device-side Philox seed per call unless one is supplied.
-
-    Keeping the seed on the device avoids a host synchronization, respects the
-    CUDA generator state, and traces cleanly under torch.compile.
-    """
+    """Draw a fresh seed on the device, which avoids a host sync and works with compile."""
 
     if dropout_p == 0.0:
         return torch.empty((0,), device=reference.device, dtype=torch.int64)
@@ -2106,18 +2097,11 @@ def training_attention(
     dropout_p: float = 0.0,
     dropout_seed: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Differentiable fused attention entry point.
+    """Differentiable fused attention.
 
-    ``query``, ``key`` and ``value`` are BHLD views.  ``pos_key`` and
-    ``pos_query`` are HRD compact projected relative-position tables.  The
-    grad-enabled custom operator saves Q/K/V/O/LSE and the tiny position tables,
-    but not the BHLR C2P/P2C intermediates; those are recomputed in backward.
-    Under ``no_grad()`` the shared forward runs with ``STORE_LSE=False``.
-
-    ``dropout_p`` applies attention-probability dropout inside the kernels.
-    The mask is regenerated in backward from a one-element int64 Philox seed;
-    a fresh seed is drawn from the CUDA generator unless ``dropout_seed`` is
-    given.
+    query, key and value are [B, H, L, D]; pos_key and pos_query are [H, R, D].
+    Backward recomputes C2P/P2C instead of saving them. dropout_p applies
+    attention dropout in the kernels; pass dropout_seed to fix the mask.
     """
 
     _require_training_runtime()

@@ -40,8 +40,7 @@ from .tuning import (
     tuning_dtype,
 )
 
-# DeBERTa-v2/v3 checkpoints ship attention_probs_dropout_prob=0.1.  The rate is
-# a runtime scalar, so any non-zero rate shares the dropout schedule.
+# DeBERTa's default attention dropout. Any non-zero rate uses the same schedule.
 TUNING_DROPOUT_P = 0.1
 
 
@@ -77,18 +76,15 @@ PRESETS = {
     },
     "standard": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
-        # Official DeBERTa-v2/v3 variants keep a 64-wide attention head.  Both
-        # occupancy families are needed: xsmall can land in the <=8 family,
-        # while base and larger variants land in the <=32 family.
+        # All DeBERTa-v2/v3 sizes use head dim 64. xsmall can fall in the <=8
+        # occupancy family, larger models in <=32.
         "head_dims": (64,),
         "batch_heads": TUNING_BATCH_HEADS,
-        # FP16 and BF16 share one ``half`` precision family, as in
-        # FlashAttention and FlexAttention; BF16 is the measured representative.
+        # BF16 stands in for the whole half-precision family.
         "dtypes": ("bfloat16", "float32"),
         "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
-        # Dropout changes register pressure, so training tunes both variants.
         "dropout": ("off", "on"),
     },
 }
@@ -148,7 +144,7 @@ def _cases(args: argparse.Namespace) -> Iterable[TuningCase]:
     unsupported_head_dims = set(head_dims) - {32, 64, 128}
     if unsupported_head_dims:
         raise ValueError(f"unsupported head dimensions: {sorted(unsupported_head_dims)}")
-    # One measured dtype per precision family; the first requested one wins.
+    # Measure one dtype per family.
     families: dict[str, str] = {}
     for dtype_name in dtypes:
         families.setdefault(tuning_dtype(dtype_name), dtype_name)
@@ -203,11 +199,7 @@ def _load_candidates(
     tuple[KernelConfig, ...],
     tuple[KernelConfig, ...],
 ]:
-    """Return forward, dQ, and dK/dV candidates.
-
-    A JSON array applies to every phase; an object with ``forward``, ``dq``, and
-    ``dkv`` arrays gives each phase its own search space.
-    """
+    """Return forward, dQ, and dK/dV candidates from a list or a per-phase object."""
 
     if path is None:
         return (
@@ -478,7 +470,7 @@ def _make_training_inputs(
         max_seqlen=case.sequence_length,
         score_scale=(case.head_dim * scale_factor) ** -0.5,
         dropout_p=dropout_p,
-        # A fixed seed makes every candidate see the same mask as the reference.
+        # Fixed seed so every candidate sees the reference's mask.
         dropout_seed=(
             torch.tensor([0x1BF52], device=device, dtype=torch.int64) if dropout_p else None
         ),
@@ -755,9 +747,8 @@ def _training_reference(inputs: TrainingInputs, workload: WorkloadKey) -> torch.
             )
         if inputs.pos_query is not None:
             p2c = torch.matmul(key.float(), inputs.pos_query.float().transpose(-1, -2))
-            # scores[h, i, j] += p2c[h, j, local[i, j]].  Gathering from p2c
-            # itself keeps the backward scatter at [H, L, R]; gathering from an
-            # expanded [H, L, L, R] view would allocate that view in backward.
+            # scores[h, i, j] += p2c[h, j, local[i, j]]. Gathering from an
+            # expanded [H, L, L, R] view would allocate all of it in backward.
             scores = scores + torch.gather(
                 p2c,
                 -1,
@@ -1024,8 +1015,7 @@ def _search_configs(
         for config in configs:
             try:
                 results.append((evaluate(config), config))
-            # Backends report compile/resource failures through several exception
-            # families, so one bad candidate must not abort the complete run.
+            # Compile and resource failures raise different exception types.
             except Exception as error:  # noqa: BLE001
                 print(f"  rejected {label} {config}: {type(error).__name__}: {error}")
                 rejected.append(f"{_format_config(config)}:{type(error).__name__}")
@@ -1095,7 +1085,7 @@ def run(args: argparse.Namespace) -> None:
             (config,), dtype=workload.dtype, phase=workload.phase
         )
 
-    # Saved winners outside the conservative FP32 space are re-tuned on resume.
+    # Re-tune saved winners that break the FP32 limits.
     completed = {
         workload
         for workload, entry in seed_entries.items()
@@ -1118,7 +1108,6 @@ def run(args: argparse.Namespace) -> None:
             assert seed is not None
             return SearchResult(seed.latency_ms, seed.config), "cached"
         candidates = conservative_candidates(candidates, dtype=workload.dtype, phase=workload.phase)
-        # A saved seed outside the conservative space is searched from scratch.
         if seed is not None and not is_allowed(workload, seed.config):
             seed = None
         pending = seed is not None and not seed.validated
@@ -1159,7 +1148,6 @@ def run(args: argparse.Namespace) -> None:
 
     cases = list(_cases(args))
     if not torch.cuda.is_bf16_supported() and any(case.dtype == "bfloat16" for case in cases):
-        # FP16 measures the same half-precision family on GPUs without BF16.
         cases = [
             replace(case, dtype="float16") if case.dtype == "bfloat16" else case for case in cases
         ]
@@ -1241,8 +1229,7 @@ def run(args: argparse.Namespace) -> None:
             continue
         expected = _training_reference(inputs, base_workload)
         grad_output = torch.randn_like(expected)
-        # Free the reference graph right away: at long lengths its saved
-        # L x L activations would otherwise stay alive for the whole search.
+        # Drop the reference graph now; it holds L x L activations.
         expected_gradients = torch.autograd.grad(expected, inputs.grad_tensors(), grad_output)
         expected = expected.detach()
         strict_fp32 = base_workload.dtype == "float32" and (
@@ -1310,13 +1297,11 @@ def run(args: argparse.Namespace) -> None:
             "dK/dV",
         )
 
-        # Confirm numerical parity and end-to-end behavior with the three
-        # independently selected winners rather than trusting coordinate timings.
+        # Check the three winners together.
         combined_forward_ms, combined_backward_ms = measure(forward.config, dq.config, dkv.config)
         refined = False
-        # dQ was measured against the baseline dK/dV schedule.  If the final
-        # combination regresses past that measurement, re-tune dQ once with the
-        # selected dK/dV winner instead of iterating coordinate descent.
+        # dQ was timed with the baseline dK/dV. If the final pair is slower,
+        # re-tune dQ once against the chosen dK/dV.
         if dq_search != "cached" and combined_backward_ms > dq.latency_ms * (1 + args.tie_margin):
             retuned = _search_configs(
                 conservative_candidates(

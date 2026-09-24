@@ -1,16 +1,8 @@
-"""Multi-step full-model training parity: legacy HF DeBERTa vs DisentangledFlash.
+"""Multi-step training parity: Hugging Face DeBERTa vs DisentangledFlash.
 
-This is an integration/trajectory test on top of the kernel-level gradient parity
-suite. It seeds ordinary RNGs for reproducibility but intentionally does not
-force deterministic CUDA algorithms, so the execution remains representative
-of normal training.
-
-The training data is a small deterministic structured task rather than fresh
-random targets. Each sequence contains a sequence-level anchor plus local
-symbols. Every valid output position is trained toward a fixed mixture of the
-local-symbol target and the sequence-anchor target. Reusing a finite dataset
-therefore produces a meaningful decreasing loss curve while still exercising
-contextual attention.
+Trains both on a small structured task (each target mixes a local symbol with a
+sequence-level anchor) so the loss actually falls. RNGs are seeded, but CUDA
+algorithms are left non-deterministic, as in normal training.
 """
 
 from __future__ import annotations

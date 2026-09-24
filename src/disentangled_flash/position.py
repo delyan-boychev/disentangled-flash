@@ -1,8 +1,7 @@
-"""Model-wide relative-position index plans for DeBERTa attention.
+"""Relative-position index plans for DeBERTa attention.
 
-The tensors in this module depend only on the DeBERTa position-bucketing
-configuration, sequence length, and device.  They do not depend on layer
-weights, so one cache can be shared by every attention layer in an encoder.
+They depend only on the bucketing config, length, and device, so every layer
+can share one cache.
 """
 
 from __future__ import annotations
@@ -50,11 +49,10 @@ def canonical_device(
 
 
 class SharedPositionPlanCache:
-    """Cache immutable position-index tensors shared across encoder layers.
+    """Position-index tensors shared by all encoder layers.
 
-    ``compact()`` never constructs an ``L x L`` tensor.  ``dense()`` adds one
-    int64 gather map for the reference prepared-PyTorch path; crucially that map
-    is shared by all layers instead of being duplicated per layer.
+    compact() never builds an L x L tensor. dense() builds one int64 map for the
+    PyTorch path, shared across layers.
     """
 
     def __init__(
@@ -129,12 +127,7 @@ class SharedPositionPlanCache:
 
     @torch.no_grad()
     def physical(self, position_ids: torch.Tensor) -> SharedPositionIndexPlan:
-        """Exact batch-specific packed pair map; never infer distances from rank.
-
-        Unlike contiguous plans this depends on example contents and is not cached.
-        The map is O(B*N*N) int32, shared across heads. Only used embedding slots
-        are projected. Forward and backward consume this identical map.
-        """
+        """Build a per-example [B, N, N] slot map from position_ids. Not cached."""
         if position_ids.ndim != 2 or not all(position_ids.shape):
             raise ValueError("position_ids must have nonempty shape [B, N]")
         if position_ids.dtype not in (torch.int32, torch.int64):

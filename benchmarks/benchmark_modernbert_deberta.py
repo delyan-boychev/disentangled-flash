@@ -117,8 +117,7 @@ def make_deberta_config(max_length: int, intermediate_size: int):
         initializer_range=0.02,
         layer_norm_eps=1e-7,
         relative_attention=True,
-        # Keep DeBERTa-v3-base relative-position geometry while extending the
-        # sequence length itself.
+        # Keep base's position geometry at longer lengths.
         max_relative_positions=MAX_RELATIVE_POSITIONS,
         position_buckets=POSITION_BUCKETS,
         norm_rel_ebd="layer_norm",
@@ -226,8 +225,7 @@ def build_model(
             raise RuntimeError(
                 "deberta_flash requires FlashDeBERTa. Install it with: pip install flashdeberta -U"
             ) from exc
-        # Direct construction keeps the exact same synthetic DeBERTa config as
-        # the HF and DisentangledFlash variants.
+        # Same synthetic config as the other DeBERTa variants.
         model = FlashDebertaV2Model(config)
     else:
         config = make_deberta_config(max_length, deberta_intermediate)

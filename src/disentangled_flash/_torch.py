@@ -1,11 +1,7 @@
-"""Optimized PyTorch DeBERTa-v2/v3 disentangled attention backends.
+"""PyTorch DeBERTa-v2/v3 disentangled attention.
 
-The hot path keeps the exact eager attention equation, while moving relative
-projection and position-index work into explicit preparation.  Position-index
-plans can be shared across every layer of an encoder; only the projected
-relative keys/queries remain layer-specific.  Inference may additionally cache
-parameter-derived projections, while the training fallback keeps every
-projection differentiable and preserves parameter identities.
+Same math as eager attention, with position-index work moved into plans that
+every encoder layer can share.
 """
 
 from __future__ import annotations
@@ -115,12 +111,10 @@ def _invalidate_attention_cache_after_load(
 
 
 class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention):
-    """Cached, active-slot-pruned DeBERTa attention for inference only.
+    """Cached DeBERTa attention for inference.
 
-    ``forward_prepared`` performs no cache lookup or mutation and is the entry
-    point intended for ``torch.compile(..., fullgraph=True)``.  Pass the same
-    :class:`SharedPositionPlanCache` to every encoder layer to avoid duplicating
-    the sequence-specific gather map.
+    Use forward_prepared under torch.compile(fullgraph=True), and share one
+    SharedPositionPlanCache across layers.
     """
 
     def __init__(
@@ -152,9 +146,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
         self._position_projection_cache: dict[tuple[int, str], TorchPositionPlan] = {}
 
-        # Multiple sequence lengths often use the exact same contiguous set of
-        # DeBERTa relative-position slots. Cache the compact projected tables by
-        # active-slot range so 1K/2K/4K/8K plans can share the same storage.
+        # Long sequences often use the same slot range, so key the cache by range.
         self._compact_position_projection_cache: dict[
             tuple[int, int, str],
             tuple[torch.Tensor | None, torch.Tensor | None],
@@ -195,11 +187,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
     @torch.no_grad()
     def _prepare_fused_qkv(self) -> None:
-        """Pack Q/K/V once and rebind the original parameters as storage views.
-
-        This preserves the original query_proj/key_proj/value_proj state-dict
-        keys while avoiding a second resident copy of all QKV weights.
-        """
+        """Pack Q/K/V into one weight and keep the original parameters as views of it."""
         weight_requires_grad = (
             self.query_proj.weight.requires_grad,
             self.key_proj.weight.requires_grad,
@@ -325,10 +313,8 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         if slot_count == 0:
             return None, None
 
-        # DeBERTa's monotonic log bucketing maps the complete symmetric delta
-        # interval to one contiguous range of embedding slots. Assert that
-        # invariant here because it lets different sequence lengths reuse one
-        # compact projected tensor.
+        # Log bucketing maps every delta to one contiguous slot range, which
+        # lets different lengths share a projected table.
         slot_start = int(active_slots[0].item())
 
         if slot_count > 1:
@@ -392,9 +378,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         plan = TorchPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
-            # For square self-attention DeBERTa's post-transpose p2c lookup is
-            # exactly the same delta map as c2p.  Both fields deliberately
-            # reference one shared tensor rather than allocating two maps.
+            # Self-attention uses the same map for c2p and p2c.
             c2p_local=indices.pair_to_local,
             p2c_local=indices.pair_to_local,
             pos_key=pos_key,
@@ -557,13 +541,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         rel_embeddings: torch.Tensor | None = None,
         packed_info: PackedSequenceInfo | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Run an unpadded ``[total_tokens, D]`` batch described by boundaries.
-
-        The public layout matches FlashAttention's variable-length convention.
-        Sequences are dispatched independently to the existing exact attention
-        kernel, so tokens never attend across a boundary and no padded
-        ``[B, L, D]`` allocation is introduced.
-        """
+        """Run an unpadded [total_tokens, D] batch split by cu_seqlens, like FlashAttention."""
 
         self._validate_inference_call()
         if hidden_states.ndim != 2 or hidden_states.size(-1) != self.all_head_size:
@@ -621,9 +599,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
         sequence_length = hidden_states.size(1)
 
-        # A prepared plan remains completely valid after the full projected
-        # position workspace has been released. Use it directly rather than
-        # interpreting _cached_pos_key/_cached_pos_query == None as "unprepared".
+        # A prepared plan stays valid after the position cache is released.
         if relative_pos is None:
             cached_plan = self._get_cached_shape_plan(
                 sequence_length,

@@ -145,8 +145,7 @@ def test_released_position_workspace_keeps_prepared_plan_usable():
             plan,
         )[0]
 
-        # Must reuse the cached plan rather than trying to regenerate projected
-        # positions from the released workspace.
+        # Must reuse the cached plan; the workspace is already freed.
         lazy_output = module(
             hidden,
             mask,

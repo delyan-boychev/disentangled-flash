@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-# NOTE: this module is vendored into the DisentangledFlash Hub kernel, which
-# must stay importable on Python 3.9 (torch 2.8 still supports it). Avoid
-# itertools.pairwise and other 3.10-only constructs here; the RUF007 hints
-# below are suppressed for that reason.
+# Vendored into the Hub kernel, which still supports Python 3.9, so no
+# itertools.pairwise here (hence the RUF007 suppressions).
 from itertools import accumulate
 from typing import NamedTuple
 
@@ -34,12 +32,7 @@ def validate_cu_seqlens(
     total_tokens: int,
     max_seqlen: int | None = None,
 ) -> PackedSequenceInfo:
-    """Validate cumulative sequence boundaries used by packed attention.
-
-    Validation is intentionally a setup operation: boundaries are copied to the
-    host once so the inference wrapper can dispatch each unpadded sequence
-    without ever constructing a dense padded batch.
-    """
+    """Validate cu_seqlens. Copies the boundaries to the host once."""
 
     _validate_cu_seqlens_tensor(cu_seqlens)
     offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
@@ -62,11 +55,9 @@ def resolve_packed_info(
     max_seqlen: int | None = None,
     packed_info: PackedSequenceInfo | None = None,
 ) -> PackedSequenceInfo:
-    """Use trusted host metadata or validate device boundaries once.
+    """Reuse already-validated packed_info, or validate cu_seqlens.
 
-    ``packed_info`` is intended for nested encoder calls after the public entry
-    point has already validated ``cu_seqlens``. Structural checks remain on the
-    hot path, but the CUDA-to-host boundary copy is not repeated for each layer.
+    Encoder layers pass packed_info to skip the device-to-host copy.
     """
 
     if packed_info is None:
