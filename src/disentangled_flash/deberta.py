@@ -637,6 +637,7 @@ def _enable_deberta(
     inference: bool,
     sequence_lengths: Iterable[int] | int | None,
     fp32_precision: str,
+    tuning: KernelTuningOptions | None = None,
     assume_unpadded: bool,
 ) -> nn.Module:
     if not hasattr(model, "encoder") or not hasattr(model, "embeddings"):
@@ -658,6 +659,7 @@ def _enable_deberta(
         backend=backend,
         inference=inference,
         fp32_precision=fp32_precision,
+        tuning=tuning,
         assume_unpadded=assume_unpadded,
     )
     model.train(was_training)
