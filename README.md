@@ -213,7 +213,7 @@ To require the bundled H200 configuration and prohibit Triton autotuning:
 ```bash
 python -m benchmarks.evaluate_mnli \
   --tuning-mode profile_only \
-  --profile src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json
+  --profile src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json
 ```
 
 ## CUDA validation
@@ -296,9 +296,10 @@ complete all three precisions.
 ### Bundled H200 tuning profile
 
 The package automatically discovers the reviewed
-[`h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json`](src/disentangled_flash/profiles/h200-sm90-deberta-v3-base-torch-2.14-cu130-triton-3.8.json)
-profile. Its 108 winners cover the DeBERTa-v3-base layouts, precisions, and
-bounded lengths through 8192. They require H200 SM 9.0, PyTorch 2.14.0+cu130,
+[`h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json`](src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json)
+profile. Its 1,134 winners cover inference, training forward, and both backward
+phases across the standard DeBERTa-v2/v3 workload families through length 8192.
+They require H200 SM 9.0, PyTorch 2.14.0+cu130,
 CUDA 13.0, and the recorded Triton 3.8.0 compiler fingerprint; otherwise `auto`
 mode uses bounded autotuning.
 
