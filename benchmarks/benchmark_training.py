@@ -51,7 +51,15 @@ def make_config(max_length: int, intermediate_size: int):
     )
 
 
-def build_model(variant: str, length: int, dtype: torch.dtype, device: str):
+def build_model(
+    variant: str,
+    length: int,
+    dtype: torch.dtype,
+    device: str,
+    *,
+    tuning_mode: str = "auto",
+    profile_paths: tuple[str, ...] = (),
+):
     from transformers import DebertaV2Model
 
     config = make_config(length, 3200)
@@ -66,12 +74,16 @@ def build_model(variant: str, length: int, dtype: torch.dtype, device: str):
 
     model.to(device=device, dtype=dtype).train()
     if variant == "deberta_df":
-        from disentangled_flash import enable_deberta_training
+        from disentangled_flash import KernelTuningOptions, enable_deberta_training
 
         enable_deberta_training(
             model,
             assume_unpadded=True,
             fp32_precision="strict",
+            tuning=KernelTuningOptions(
+                mode=tuning_mode,
+                profile_paths=profile_paths,
+            ),
         )
     return model
 
@@ -100,7 +112,14 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
 
     gc.collect()
     torch.cuda.empty_cache()
-    model = build_model(args.variant, args.length, dtype, device_name)
+    model = build_model(
+        args.variant,
+        args.length,
+        dtype,
+        device_name,
+        tuning_mode=args.tuning_mode,
+        profile_paths=tuple(args.profile),
+    )
     input_ids = torch.randint(
         10,
         30_000,
@@ -138,6 +157,8 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
         "length": args.length,
         "batch_size": args.batch_size,
         "dtype": args.dtype,
+        "tuning_mode": args.tuning_mode,
+        "profiles": list(args.profile),
         "status": "ok",
         "median_fwd_bwd_ms": median_ms,
         "mean_fwd_bwd_ms": statistics.fmean(timings),
@@ -169,7 +190,11 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
         str(args.iters),
         "--device",
         args.device,
+        "--tuning-mode",
+        args.tuning_mode,
     ]
+    for profile in args.profile:
+        cmd.extend(("--profile", profile))
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
     marker = None
     for line in proc.stdout.splitlines():
@@ -182,13 +207,15 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
             "length": length,
             "batch_size": args.batch_size,
             "dtype": args.dtype,
+            "tuning_mode": args.tuning_mode,
+            "profiles": list(args.profile),
             "status": status,
             "error": (proc.stderr or proc.stdout)[-4000:],
         }
     return json.loads(marker)
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lengths", type=int, nargs="+", default=[512, 1024, 2048, 4096, 8192])
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
@@ -198,10 +225,30 @@ def main() -> None:
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", default="deberta_training_scaling.json")
+    parser.add_argument(
+        "--tuning-mode",
+        choices=("auto", "autotune", "profile_only"),
+        default="auto",
+        help="DisentangledFlash tuning policy (default: auto)",
+    )
+    parser.add_argument(
+        "--profile",
+        action="append",
+        default=[],
+        help="Kernel profile for DisentangledFlash; repeat to provide multiple profiles",
+    )
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--variant", choices=VARIANTS, default="deberta_df", help=argparse.SUPPRESS)
     parser.add_argument("--length", type=int, default=512, help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    args.profile = [str(Path(profile).expanduser().resolve()) for profile in args.profile]
+    missing_profiles = [profile for profile in args.profile if not Path(profile).is_file()]
+    if missing_profiles:
+        raise SystemExit(f"profile does not exist: {missing_profiles[0]}")
 
     if args.worker:
         try:
@@ -212,6 +259,8 @@ def main() -> None:
                 "length": args.length,
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
+                "tuning_mode": args.tuning_mode,
+                "profiles": list(args.profile),
                 "status": "oom",
                 "error": str(exc),
             }
@@ -221,12 +270,18 @@ def main() -> None:
                 "length": args.length,
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
+                "tuning_mode": args.tuning_mode,
+                "profiles": list(args.profile),
                 "status": "error",
                 "error": f"{type(exc).__name__}: {exc}",
             }
         print(RESULT_PREFIX + json.dumps(result))
         return
 
+    print(f"DisentangledFlash tuning mode: {args.tuning_mode}")
+    if args.profile:
+        for profile in args.profile:
+            print(f"DisentangledFlash profile: {profile}")
     results = []
     total = len(args.variants) * len(args.lengths)
     count = 0
@@ -246,7 +301,26 @@ def main() -> None:
             else:
                 print(f"  {result['status']}: {result.get('error', '')[:300]}")
 
-    Path(args.output).write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
+    Path(args.output).write_text(
+        json.dumps(
+            {
+                "configuration": {
+                    "lengths": args.lengths,
+                    "variants": args.variants,
+                    "batch_size": args.batch_size,
+                    "dtype": args.dtype,
+                    "warmup": args.warmup,
+                    "iters": args.iters,
+                    "device": args.device,
+                    "tuning_mode": args.tuning_mode,
+                    "profiles": args.profile,
+                },
+                "results": results,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(f"Wrote {args.output}")
 
 

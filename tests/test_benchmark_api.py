@@ -8,6 +8,7 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_cuda.py"
+TRAINING_BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_training.py"
 MNLI_EVALUATION_PATH = ROOT / "benchmarks" / "evaluate_mnli.py"
 
 
@@ -23,6 +24,18 @@ def load_benchmark_module():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
+    return module
+
+
+def load_training_benchmark_module():
+    spec = importlib.util.spec_from_file_location(
+        "benchmark_training",
+        TRAINING_BENCHMARK_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module
 
 
@@ -132,6 +145,17 @@ def test_make_models_accepts_unpadded_mode():
     benchmark = load_benchmark_module()
     signature = inspect.signature(benchmark.make_models)
     assert "assume_unpadded" in signature.parameters
+
+
+def test_training_benchmark_exposes_strict_profile_only_mode():
+    benchmark = load_training_benchmark_module()
+
+    args = benchmark.build_parser().parse_args(
+        ["--tuning-mode", "profile_only", "--profile", "h200.json"]
+    )
+
+    assert args.tuning_mode == "profile_only"
+    assert args.profile == ["h200.json"]
 
 
 def load_mnli_evaluation_module():
