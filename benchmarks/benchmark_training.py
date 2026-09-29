@@ -278,7 +278,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="deberta_training_scaling.json")
     parser.add_argument(
         "--tuning-mode",
-        choices=("auto", "autotune", "profile_only"),
+        choices=("auto", "heuristic", "autotune", "profile_only"),
         default="auto",
         help="DisentangledFlash tuning policy (default: auto)",
     )

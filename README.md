@@ -163,8 +163,14 @@ forward+backward allocation is lower by about 93%.
 
 ### Kernel tuning profiles
 
-Matching saved profiles are used automatically; otherwise Triton runs bounded
-autotuning on first use. Override this with:
+A matching saved profile is used automatically. Otherwise a deterministic
+heuristic picks the config from the workload (length, head dim, phase,
+precision) and the GPU's own limits: it reads the shared memory per block and SM
+count from the device, so large tiles are never tried on GPUs they don't fit.
+If a config still fails to launch, that workload falls back to Triton
+autotuning. Under `torch.compile` the config is picked once while tracing, so a
+graph recompiles only when the length family changes. Choose a different policy
+with:
 
 ```python
 from disentangled_flash import (
@@ -174,7 +180,8 @@ from disentangled_flash import (
     optimize_deberta_training,
 )
 
-optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))
+optimize_deberta(model, tuning=KernelTuningOptions(mode="heuristic"))  # ignore profiles
+optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))  # benchmark at runtime
 optimize_deberta(
     model,
     tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
@@ -197,7 +204,7 @@ the package. Compatibility is keyed by GPU/compiler stack and workload; the
 driver is diagnostic only. Exact length, batch size, head count, and active-slot
 count are runtime values rather than autotune keys.
 
-Generate a resumable profile on a CUDA machine with:
+Generate a profile for your GPU with:
 
 ```bash
 python -m disentangled_flash.tune \
@@ -208,20 +215,24 @@ python -m disentangled_flash.tune \
 python -m disentangled_flash.tune inspect rtx-6000-ada.json
 ```
 
-The default `standard` preset covers all supported DeBERTa-v2/v3 variants: length
-families `64`, `128`, `384`, `512`, `768`, `1024`, `2048`, `4096`, and `8192`,
-head dimension 64, both launch-occupancy regimes, C2P+P2C relative attention,
-and padded/packed layouts. Like FlashAttention and FlexAttention, FP16 and BF16
-share one half-precision schedule family (measured with BF16), while strict FP32
-and fast FP32/TF32 are tuned separately over a conservative search: one pipeline
-stage, forward tiles up to 64x64, and backward tiles up to 2048 elements. Training phases are tuned with and
-without attention dropout, because the in-kernel mask changes register pressure.
-That is 162 workload shapes, giving 162 `inference` workloads plus 972 training
-workloads (`training_forward`, `backward_dq`, and `backward_dkv` for both dropout
-variants), 1134 phase workloads in total. Results are parity-checked and saved after each workload so tuning can
-resume. `--passes inference`, `--passes training`, or `--dropout off|on` can
-restrict a run; the shape and attention options remain available for custom
-architectures.
+The default `standard` preset is cheap: lengths 128, 512, 2048, and 8192 in BF16
+over padded and packed layouts, 84 phase workloads in total. Each one measures
+only the heuristic config and its three closest candidates. Shapes it doesn't
+cover use the heuristic at runtime.
+
+`--preset exhaustive` is what the bundled profiles use: every length family
+(`64` through `8192`), both launch-occupancy regimes, half precision plus strict
+and fast FP32, and the full candidate lists, for 1134 phase workloads. Like
+FlashAttention and FlexAttention, FP16 and BF16 share one half-precision family,
+and FP32 searches only single-stage schedules with small tiles. Training is
+tuned with and without attention dropout.
+
+Either way, configs that don't fit the GPU's shared memory are skipped before
+compiling, results are parity-checked, and each workload is saved as soon as it
+finishes, so tuning can resume. `--passes`, `--dropout off|on`, and the shape
+options restrict a run; `--verbose` prints every measured candidate, which is
+handy for comparing configs at one exact shape, e.g.
+`--preset exhaustive --lengths 128 --batch-heads 1536 --verbose`.
 
 ### Packed unpadded inference and training
 

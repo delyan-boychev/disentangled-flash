@@ -14,12 +14,14 @@ from .._torch import TorchTrainingDisentangledSelfAttention
 from ..packed import PackedSequenceInfo, resolve_packed_info
 from ..position import SharedPositionPlanCache
 from ..tuning import (
-    CompilerSpec,
-    HardwareSpec,
     KernelConfig,
     KernelTuningOptions,
     ProfileRegistry,
     WorkloadKey,
+    length_family,
+    occupancy_family,
+    register_profile_registry,
+    resolve_launch_config,
 )
 from ._kernels import training_attention, training_attention_packed
 
@@ -60,7 +62,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 else ProfileRegistry()
             )
         )
-        self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
+        self._profile_registry_key = register_profile_registry(self._profile_registry)
         # Workloads whose saved schedule failed; these fall back to autotuning.
         self._failed_profile_workloads: set[WorkloadKey] = set()
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
@@ -83,49 +85,37 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             return None
         if self.tuning.mode == "fixed":
             return self.tuning.fixed_config
-        if torch.compiler.is_compiling():
-            if self.tuning.mode == "profile_only":
-                raise RuntimeError(
-                    "profile_only training tuning cannot resolve a dynamic workload inside "
-                    "torch.compile; select the profile configuration with fixed mode"
-                )
-            return None
-        workload = WorkloadKey(
-            sequence_length=sequence_length,
-            head_dim=self.attention_head_size,
-            batch_heads=batch_heads,
-            active_slots=active_slots,
-            dtype=str(hidden_states.dtype).removeprefix("torch."),
-            has_c2p=has_c2p,
-            has_p2c=has_p2c,
-            fp32_precision=self.fp32_precision,
-            layout=layout,
-            uses_padding_mask=uses_padding_mask,
-            phase=phase,
-            has_dropout=has_dropout,
+        # Families, not exact sizes, so the fields stay constant under torch.compile.
+        fields = (
+            length_family(sequence_length),
+            self.attention_head_size,
+            occupancy_family(batch_heads),
+            active_slots,
+            str(hidden_states.dtype).removeprefix("torch."),
+            has_c2p,
+            has_p2c,
+            self.fp32_precision,
+            layout,
+            uses_padding_mask,
+            phase,
+            has_dropout,
         )
+        compiling = torch.compiler.is_compiling()
+        if not compiling:
+            workload = WorkloadKey(*fields)
+            if replace(workload, phase="training_forward") in self._failed_profile_workloads:
+                return None
         device_index = hidden_states.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        cache_key = device_index, workload
-        if cache_key not in self._resolved_kernel_configs:
-            self._resolved_kernel_configs[cache_key] = self._profile_registry.resolve(
-                HardwareSpec.current(device_index),
-                CompilerSpec.current(),
-                workload,
-            )
-        config = self._resolved_kernel_configs[cache_key]
-        if replace(workload, phase="training_forward") in self._failed_profile_workloads:
-            config = None
-        if config is None and self.tuning.mode == "profile_only":
-            raise RuntimeError(
-                self._profile_registry.explain_miss(
-                    HardwareSpec.current(device_index),
-                    CompilerSpec.current(),
-                    workload,
-                )
-            )
-        return config
+        config = resolve_launch_config(
+            self._profile_registry_key,
+            self.tuning.mode,
+            device_index,
+            fields,
+            None if compiling else batch_heads,
+        )
+        return KernelConfig(*config)
 
     def _launch_with_profile_fallback(
         self,
@@ -214,9 +204,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             sequence_length,
         )
 
-        query = self.query_proj(hidden_states)
-        key = self.key_proj(hidden_states)
-        value = self.value_proj(hidden_states)
+        query, key, value = self._project_qkv(hidden_states)
         query_layer = self._reshape_heads(query, batch_size, sequence_length)
         key_layer = self._reshape_heads(key, batch_size, sequence_length)
         value_layer = self._reshape_heads(value, batch_size, sequence_length)
@@ -308,9 +296,10 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 self.attention_head_size,
             ).permute(1, 0, 2)
 
-        query_layer = packed_heads(self.query_proj(hidden_states))
-        key_layer = packed_heads(self.key_proj(hidden_states))
-        value_layer = packed_heads(self.value_proj(hidden_states))
+        query, key, value = self._project_qkv(hidden_states)
+        query_layer = packed_heads(query)
+        key_layer = packed_heads(key)
+        value_layer = packed_heads(value)
         plan = self.position_plan_cache.compact(info.max_seqlen, hidden_states.device)
         pos_key = None
         pos_query = None

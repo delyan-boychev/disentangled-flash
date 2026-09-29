@@ -18,12 +18,14 @@ from .packed import PackedSequenceInfo, resolve_packed_info
 from .position import canonical_device
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
-    CompilerSpec,
-    HardwareSpec,
     KernelConfig,
     KernelTuningOptions,
     ProfileRegistry,
     WorkloadKey,
+    length_family,
+    occupancy_family,
+    register_profile_registry,
+    resolve_launch_config,
     tuning_sequence_length,
 )
 
@@ -1344,7 +1346,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
                 else ProfileRegistry()
             )
         )
-        self._resolved_kernel_configs: dict[tuple[int, WorkloadKey], KernelConfig | None] = {}
+        self._profile_registry_key = register_profile_registry(self._profile_registry)
         self._failed_profile_workloads: set[WorkloadKey] = set()
         if triton is not None:
             candidates = self.tuning.candidates or DEFAULT_KERNEL_CONFIGS
@@ -1370,8 +1372,6 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
 
     def clear_inference_cache(self) -> None:
         super().clear_inference_cache()
-        if hasattr(self, "_resolved_kernel_configs"):
-            self._resolved_kernel_configs.clear()
         if hasattr(self, "_failed_profile_workloads"):
             self._failed_profile_workloads.clear()
         if hasattr(self, "_triton_position_projection_cache"):
@@ -1391,54 +1391,43 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
     ) -> tuple[KernelConfig | None, WorkloadKey]:
         """Return a direct-launch config plus its finite workload identity."""
 
-        workload = WorkloadKey(
-            sequence_length=(hidden_states.size(1) if sequence_length is None else sequence_length),
-            head_dim=self.attention_head_size,
-            batch_heads=(hidden_states.size(0) if batch_size is None else batch_size)
-            * self.num_attention_heads,
-            active_slots=active_slots,
-            dtype=str(hidden_states.dtype).removeprefix("torch."),
-            has_c2p=has_c2p,
-            has_p2c=has_p2c,
-            fp32_precision=self.fp32_precision,
-            layout=layout,
-            uses_padding_mask=uses_padding_mask,
+        batch_heads = (
+            hidden_states.size(0) if batch_size is None else batch_size
+        ) * self.num_attention_heads
+        # Families, not exact sizes, so the fields stay constant under torch.compile.
+        fields = (
+            length_family(hidden_states.size(1) if sequence_length is None else sequence_length),
+            self.attention_head_size,
+            occupancy_family(batch_heads),
+            active_slots,
+            str(hidden_states.dtype).removeprefix("torch."),
+            has_c2p,
+            has_p2c,
+            self.fp32_precision,
+            layout,
+            uses_padding_mask,
+            "inference",
+            False,
         )
+        workload = WorkloadKey(*fields)
         if self.tuning.mode == "autotune":
             return None, workload
         if self.tuning.mode == "fixed":
             return self.tuning.fixed_config, workload
-        if torch.compiler.is_compiling():
-            if self.tuning.mode == "profile_only":
-                raise RuntimeError(
-                    "profile_only tuning cannot resolve a dynamic workload inside "
-                    "torch.compile; select the profile's configuration with fixed mode"
-                )
-            # Let Triton's autotuner handle dynamic shapes inside the graph.
+        compiling = torch.compiler.is_compiling()
+        if not compiling and workload in self._failed_profile_workloads:
             return None, workload
         device_index = hidden_states.device.index
         if device_index is None:
             device_index = torch.cuda.current_device()
-        cache_key = device_index, workload
-        if cache_key not in self._resolved_kernel_configs:
-            hardware = HardwareSpec.current(device_index)
-            compiler = CompilerSpec.current()
-            self._resolved_kernel_configs[cache_key] = self._profile_registry.resolve(
-                hardware, compiler, workload
-            )
-        config = self._resolved_kernel_configs[cache_key]
-        if workload in self._failed_profile_workloads:
-            config = None
-        if config is None and self.tuning.mode == "profile_only":
-            hardware = HardwareSpec.current(device_index)
-            raise RuntimeError(
-                self._profile_registry.explain_miss(
-                    hardware,
-                    CompilerSpec.current(),
-                    workload,
-                )
-            )
-        return config, workload
+        config = resolve_launch_config(
+            self._profile_registry_key,
+            self.tuning.mode,
+            device_index,
+            fields,
+            None if compiling else batch_heads,
+        )
+        return KernelConfig(*config), workload
 
     def forward_packed(
         self,

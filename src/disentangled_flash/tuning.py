@@ -11,7 +11,8 @@ import platform
 import tempfile
 import warnings
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from functools import cache, lru_cache
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
@@ -20,7 +21,7 @@ import torch
 
 PROFILE_FORMAT_VERSION = 4
 KERNEL_PROFILE_VERSION = "deberta-attention-launch-schema-v1"
-TuningMode = Literal["auto", "autotune", "profile_only", "fixed"]
+TuningMode = Literal["auto", "heuristic", "autotune", "profile_only", "fixed"]
 KernelLayout = Literal["padded", "packed"]
 KernelPhase = Literal["inference", "training_forward", "backward_dq", "backward_dkv"]
 ProfileCompatibility = Literal["exact", "retargetable", "incompatible"]
@@ -56,13 +57,29 @@ def _strip_docstrings(tree: ast.AST) -> ast.AST:
     return tree
 
 
+class _DropDispatchCode(ast.NodeTransformer):
+    # Module classes only choose configs, so they don't affect saved winners.
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        return None
+
+    def visit_Import(self, node: ast.Import) -> None:
+        return None
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        return None
+
+
+def _launch_code(source: str) -> ast.AST:
+    return _DropDispatchCode().visit(_strip_docstrings(ast.parse(source)))
+
+
 def _kernel_source_digest() -> str:
-    """Fingerprint the kernel code, ignoring comments, docstrings, and formatting."""
+    """Fingerprint the kernel and launch code, ignoring comments, imports and classes."""
 
     package = Path(__file__).resolve().parent
     digest = hashlib.sha256()
     for relative in (Path("kernel.py"), Path("training") / "_kernels.py"):
-        tree = _strip_docstrings(ast.parse((package / relative).read_text(encoding="utf-8")))
+        tree = _launch_code((package / relative).read_text(encoding="utf-8"))
         digest.update(relative.as_posix().encode("utf-8"))
         digest.update(b"\0")
         digest.update(_canonical_code(tree).encode("utf-8"))
@@ -258,6 +275,191 @@ def conservative_candidates(
         if config.num_stages == 1 and config.block_m * config.block_n <= limit
     )
     return kept or (KernelConfig(32, 32, 4),)
+
+
+FORWARD_PHASES = frozenset({"inference", "training_forward"})
+# Rough per-thread register budget; the heuristic avoids configs that would spill.
+REGISTER_BUDGET = 160
+
+
+@dataclass(frozen=True)
+class DeviceResources:
+    """Per-block limits reported by the GPU."""
+
+    shared_memory_per_block: int
+    multiprocessor_count: int
+
+    @classmethod
+    def current(cls, device: torch.device | str | int | None = None) -> DeviceResources:
+        return _device_resources(_device_index(device))
+
+
+def _device_index(device: torch.device | str | int | None) -> int:
+    if isinstance(device, int):
+        return device
+    resolved = torch.device(device or "cuda")
+    return resolved.index if resolved.index is not None else torch.cuda.current_device()
+
+
+@cache
+def _device_resources(index: int) -> DeviceResources:
+    properties = torch.cuda.get_device_properties(index)
+    shared_memory = getattr(properties, "shared_memory_per_block_optin", 0)
+    if not shared_memory:
+        # 48 KiB is always available if torch doesn't report the opt-in limit.
+        shared_memory = getattr(properties, "shared_memory_per_block", 48 * 1024)
+    return DeviceResources(
+        shared_memory_per_block=int(shared_memory),
+        multiprocessor_count=int(properties.multi_processor_count),
+    )
+
+
+def _element_size(dtype: str) -> int:
+    return 4 if tuning_dtype(dtype) == "float32" else 2
+
+
+def estimate_shared_memory(
+    config: KernelConfig,
+    *,
+    phase: str,
+    head_dim: int,
+    dtype: str,
+) -> int:
+    """Estimate shared memory in bytes; streamed tiles are buffered once per stage."""
+
+    m, n, d, stages = config.block_m, config.block_n, head_dim, config.num_stages
+    if phase in FORWARD_PHASES:
+        elements = m * d + m * n + stages * 2 * n * d
+    elif phase == "backward_dq":
+        elements = 2 * m * d + m * n + stages * 2 * n * d
+    else:
+        elements = 2 * n * d + 2 * m * n + stages * 2 * m * d
+    return elements * _element_size(dtype)
+
+
+def estimate_registers(config: KernelConfig, *, phase: str, head_dim: int) -> float:
+    """Estimate FP32 values held per thread."""
+
+    m, n, d = config.block_m, config.block_n, head_dim
+    if phase in FORWARD_PHASES:
+        values = m * d + 2 * m * n
+    elif phase == "backward_dq":
+        values = m * d + 4 * m * n
+    else:
+        values = 2 * n * d + 4 * m * n
+    return values / (32 * config.num_warps)
+
+
+def fits_device(
+    config: KernelConfig,
+    *,
+    phase: str,
+    head_dim: int,
+    dtype: str,
+    resources: DeviceResources,
+) -> bool:
+    # Leave headroom for Triton's own shared memory.
+    budget = int(resources.shared_memory_per_block * 0.9)
+    return estimate_shared_memory(config, phase=phase, head_dim=head_dim, dtype=dtype) <= budget
+
+
+def hardware_safe_candidates(
+    configs: tuple[KernelConfig, ...],
+    *,
+    phase: str,
+    head_dim: int,
+    dtype: str,
+    resources: DeviceResources,
+) -> tuple[KernelConfig, ...]:
+    """Drop configs that won't fit on this GPU."""
+
+    kept = tuple(
+        config
+        for config in conservative_candidates(configs, dtype=dtype, phase=phase)
+        if fits_device(config, phase=phase, head_dim=head_dim, dtype=dtype, resources=resources)
+    )
+    return kept or (KernelConfig(16, 16, 4),)
+
+
+def _base_heuristic(phase: str, sequence_length: int, dtype: str) -> KernelConfig:
+    # Defaults from the most common H200 winners; the caller fits them to the device.
+    fp32 = tuning_dtype(dtype) == "float32"
+    if phase in FORWARD_PHASES:
+        if sequence_length <= 128:
+            return KernelConfig(16, 32, 2)
+        if sequence_length <= 1024:
+            return KernelConfig(32, 64, 4)
+        return KernelConfig(64, 64, 4)
+    if phase == "backward_dq":
+        if fp32:
+            return KernelConfig(32, 32, 4)
+        if 512 <= sequence_length <= 2048:
+            return KernelConfig(32, 64, 4)
+        return KernelConfig(16, 16, 4)
+    return KernelConfig(16, 16, 4)
+
+
+def _shrink(config: KernelConfig) -> KernelConfig:
+    if config.block_m >= config.block_n and config.block_m > 16:
+        return replace(config, block_m=config.block_m // 2)
+    if config.block_n > 16:
+        return replace(config, block_n=config.block_n // 2)
+    return config
+
+
+@lru_cache(maxsize=4096)
+def heuristic_config(
+    *,
+    phase: str,
+    sequence_length: int,
+    head_dim: int,
+    dtype: str,
+    batch_heads: int | None,
+    resources: DeviceResources,
+) -> KernelConfig:
+    """Pick a config without benchmarking: shrink to fit, then split tiles if SMs sit idle.
+
+    batch_heads=None (a symbolic batch under torch.compile) skips the split.
+    """
+
+    config = _base_heuristic(phase, tuning_sequence_length(sequence_length), dtype)
+    while config != _shrink(config) and not (
+        fits_device(config, phase=phase, head_dim=head_dim, dtype=dtype, resources=resources)
+        and estimate_registers(config, phase=phase, head_dim=head_dim) <= REGISTER_BUDGET
+    ):
+        config = _shrink(config)
+
+    # dK/dV launches one program per key tile, the others one per query tile.
+    parallel = "block_n" if phase == "backward_dkv" else "block_m"
+    while batch_heads is not None and getattr(config, parallel) > 16:
+        programs = -(-sequence_length // getattr(config, parallel)) * batch_heads
+        if programs >= resources.multiprocessor_count:
+            break
+        config = replace(config, **{parallel: getattr(config, parallel) // 2})
+    return config
+
+
+def search_neighborhood(
+    center: KernelConfig,
+    candidates: tuple[KernelConfig, ...],
+    *,
+    size: int = 4,
+) -> tuple[KernelConfig, ...]:
+    """Return the center config plus its closest candidates."""
+
+    def distance(config: KernelConfig) -> float:
+        return (
+            abs(math.log2(config.block_m / center.block_m))
+            + abs(math.log2(config.block_n / center.block_n))
+            + abs(math.log2(config.num_warps / center.num_warps))
+            + abs(config.num_stages - center.num_stages)
+        )
+
+    others = sorted(
+        (config for config in candidates if config != center),
+        key=lambda config: (distance(config), candidates.index(config)),
+    )
+    return (center, *others[: size - 1])
 
 
 @dataclass(frozen=True, order=True)
@@ -814,7 +1016,11 @@ def load_bundled_profiles() -> tuple[KernelProfile, ...]:
 
 @dataclass(frozen=True)
 class KernelTuningOptions:
-    """Policy controlling saved profiles and Triton autotuning."""
+    """How launch configs are picked.
+
+    auto: saved profile, else heuristic. heuristic: never profiles. autotune:
+    benchmark at runtime. profile_only: fail on a miss. fixed: fixed_config.
+    """
 
     mode: TuningMode = "auto"
     profile_paths: tuple[str | os.PathLike[str], ...] = ()
@@ -827,13 +1033,15 @@ class KernelTuningOptions:
         object.__setattr__(self, "profile_paths", tuple(self.profile_paths))
         if self.candidates is not None:
             object.__setattr__(self, "candidates", tuple(self.candidates))
-        if self.mode not in {"auto", "autotune", "profile_only", "fixed"}:
-            raise ValueError("tuning mode must be auto, autotune, profile_only, or fixed")
+        if self.mode not in {"auto", "heuristic", "autotune", "profile_only", "fixed"}:
+            raise ValueError(
+                "tuning mode must be auto, heuristic, autotune, profile_only, or fixed"
+            )
         if self.mode == "fixed" and self.fixed_config is None:
             raise ValueError("fixed tuning mode requires fixed_config")
         if self.mode != "fixed" and self.fixed_config is not None:
             raise ValueError("fixed_config is only valid in fixed tuning mode")
-        if self.mode in {"fixed", "profile_only"} and self.candidates is not None:
+        if self.mode in {"fixed", "profile_only", "heuristic"} and self.candidates is not None:
             raise ValueError("candidates are only valid in auto or autotune mode")
         if self.candidates is not None:
             if not self.candidates:
@@ -901,6 +1109,90 @@ class ProfileRegistry:
                 return f"profile requires local retargeting{suffix}"
             return "profile launch schema is incompatible"
         return f"no validated profile entry matches workload {workload}"
+
+
+def length_family(sequence_length: Any) -> int:
+    """Like tuning_sequence_length, but also works on a symbolic length under compile."""
+
+    for representative in TUNING_SEQUENCE_LENGTHS:
+        if sequence_length <= representative:
+            return representative
+    return TUNING_SEQUENCE_LENGTHS[-1]
+
+
+def occupancy_family(batch_heads: Any) -> int:
+    # A symbolic batch would add a guard and recompile per family, so under
+    # compile assume the batch fills the GPU.
+    if torch.compiler.is_compiling():
+        return TUNING_BATCH_HEADS[-1]
+    for representative in TUNING_BATCH_HEADS:
+        if batch_heads <= representative:
+            return representative
+    return TUNING_BATCH_HEADS[-1]
+
+
+# Registries are looked up by id so the resolver below only takes constants.
+_REGISTRIES: dict[int, ProfileRegistry] = {}
+
+
+def register_profile_registry(registry: ProfileRegistry) -> int:
+    _REGISTRIES[id(registry)] = registry
+    return id(registry)
+
+
+def _constant_under_compile(function: Any) -> Any:
+    marker = getattr(torch.compiler, "assume_constant_result", None)
+    return marker(function) if marker is not None else function
+
+
+@_constant_under_compile
+def resolve_launch_config(
+    registry_key: int,
+    mode: str,
+    device_index: int,
+    workload_fields: tuple[Any, ...],
+    batch_heads: int | None,
+) -> tuple[int, int, int, int] | None:
+    """Pick a config from the profiles or the heuristic.
+
+    Takes only constants, so torch.compile runs it once while tracing and bakes
+    the result into the graph. workload_fields are WorkloadKey's fields in order.
+    """
+
+    return _resolve_launch_config(registry_key, mode, device_index, workload_fields, batch_heads)
+
+
+@lru_cache(maxsize=4096)
+def _resolve_launch_config(
+    registry_key: int,
+    mode: str,
+    device_index: int,
+    workload_fields: tuple[Any, ...],
+    batch_heads: int | None,
+) -> tuple[int, int, int, int] | None:
+    workload = WorkloadKey(*workload_fields)
+    registry = _REGISTRIES[registry_key]
+    config = None
+    if mode != "heuristic":
+        config = registry.resolve(
+            HardwareSpec.current(device_index), CompilerSpec.current(), workload
+        )
+    if config is None and mode == "profile_only":
+        raise RuntimeError(
+            registry.explain_miss(
+                HardwareSpec.current(device_index), CompilerSpec.current(), workload
+            )
+        )
+    if config is None:
+        config = heuristic_config(
+            phase=workload.phase,
+            sequence_length=workload.sequence_length,
+            head_dim=workload.head_dim,
+            dtype=workload.dtype,
+            batch_heads=batch_heads,
+            resources=DeviceResources.current(device_index),
+        )
+    return config.block_m, config.block_n, config.num_warps, config.num_stages
 
 
 def merge_profile_entry(

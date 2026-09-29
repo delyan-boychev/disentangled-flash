@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 
 import pytest
 import torch
@@ -176,3 +177,99 @@ def test_unified_training_encoder_auto_falls_back_to_torch_on_cpu() -> None:
             output_hidden_states=False,
         ).last_hidden_state
     assert not no_grad_output.requires_grad
+
+
+def _qkv_parameters(module):
+    return [getattr(module, name).weight for name in ("query_proj", "key_proj", "value_proj")] + [
+        getattr(module, name).bias for name in ("query_proj", "key_proj", "value_proj")
+    ]
+
+
+@pytest.mark.parametrize("share_att_key", [True, False])
+def test_fused_training_qkv_matches_reference_outputs_and_parameter_gradients(share_att_key):
+    torch.manual_seed(0)
+    config = dataclasses.replace(make_config(), share_att_key=share_att_key)
+    reference = OriginalDisentangledSelfAttention(config).double()
+    target = TorchTrainingDisentangledSelfAttention(config).double()
+    target.load_state_dict(reference.state_dict(), strict=True)
+    parameter_ids = [id(parameter) for parameter in target.parameters()]
+
+    hidden = torch.randn(2, 11, config.hidden_size, dtype=torch.float64)
+    mask = torch.tensor([[1] * 11, [1] * 7 + [0] * 4])
+    relative = torch.randn(config.position_buckets * 2, config.hidden_size, dtype=torch.float64)
+    expanded = mask[:, None, None, :] * mask[:, None, :, None]
+
+    expected, _ = reference(hidden, expanded, rel_embeddings=relative)
+    actual, _ = target(hidden, mask, rel_embeddings=relative)
+    torch.testing.assert_close(actual, expected)
+
+    grad_output = torch.randn_like(expected) * mask[..., None]
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+    for actual_parameter, expected_parameter in zip(
+        _qkv_parameters(target), _qkv_parameters(reference)
+    ):
+        torch.testing.assert_close(actual_parameter.grad, expected_parameter.grad)
+    assert [id(parameter) for parameter in target.parameters()] == parameter_ids
+    assert tuple(target.state_dict()) == tuple(reference.state_dict())
+
+
+def test_fused_training_qkv_packed_matches_padded_gradients():
+    torch.manual_seed(0)
+    config = make_config()
+    padded = TorchTrainingDisentangledSelfAttention(config).double()
+    packed = copy.deepcopy(padded)
+    lengths = (5, 9)
+    hidden = torch.randn(sum(lengths), config.hidden_size, dtype=torch.float64)
+    relative = torch.randn(config.position_buckets * 2, config.hidden_size, dtype=torch.float64)
+    cu_seqlens = torch.tensor([0, lengths[0], sum(lengths)], dtype=torch.int32)
+
+    packed_output, _ = packed.forward_packed(hidden, cu_seqlens, rel_embeddings=relative)
+    padded_output = torch.cat(
+        [
+            padded(
+                hidden[start:end].unsqueeze(0),
+                torch.ones(1, end - start, dtype=torch.bool),
+                rel_embeddings=relative,
+            )[0].squeeze(0)
+            for start, end in ((0, lengths[0]), (lengths[0], sum(lengths)))
+        ]
+    )
+    torch.testing.assert_close(packed_output, padded_output)
+    packed_output.square().sum().backward()
+    padded_output.square().sum().backward()
+    for actual, expected in zip(_qkv_parameters(packed), _qkv_parameters(padded)):
+        torch.testing.assert_close(actual.grad, expected.grad)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(disentangled_flash.kernel.triton is None, reason="Triton is not installed")
+def test_triton_training_fused_qkv_matches_reference_parameter_gradients():
+    torch.manual_seed(0)
+    config = make_config()
+    reference = OriginalDisentangledSelfAttention(config).cuda()
+    target = TritonTrainingDisentangledSelfAttention(
+        config,
+        tuning=KernelTuningOptions(mode="autotune"),
+    ).cuda()
+    target.load_state_dict(reference.state_dict(), strict=True)
+    hidden = torch.randn(2, 64, config.hidden_size, device="cuda")
+    mask = torch.ones(2, 64, dtype=torch.long, device="cuda")
+    mask[1, 40:] = 0
+    relative = torch.randn(config.position_buckets * 2, config.hidden_size, device="cuda")
+    expanded = mask[:, None, None, :] * mask[:, None, :, None]
+
+    expected, _ = reference(hidden, expanded, rel_embeddings=relative)
+    actual, _ = target(hidden, mask, rel_embeddings=relative)
+    grad_output = torch.randn_like(expected) * mask[..., None]
+    expected.backward(grad_output)
+    actual.backward(grad_output)
+
+    torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-4)
+    for actual_parameter, expected_parameter in zip(
+        _qkv_parameters(target), _qkv_parameters(reference)
+    ):
+        torch.testing.assert_close(
+            actual_parameter.grad, expected_parameter.grad, rtol=2e-3, atol=2e-3
+        )

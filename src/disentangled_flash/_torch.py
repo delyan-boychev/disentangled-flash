@@ -696,6 +696,28 @@ class TorchTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention):
             self.attention_head_size,
         ).permute(0, 2, 1, 3)
 
+    def _project_qkv(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Project Q, K and V with one GEMM while keeping the three original parameters."""
+
+        projections = (self.query_proj, self.key_proj, self.value_proj)
+        # Concatenating the live weights keeps them trainable; autograd splits the
+        # gradient back to each one.
+        weight = torch.cat([projection.weight for projection in projections])
+        bias = None
+        if any(projection.bias is not None for projection in projections):
+            bias = torch.cat(
+                [
+                    projection.bias
+                    if projection.bias is not None
+                    else projection.weight.new_zeros(projection.out_features)
+                    for projection in projections
+                ]
+            )
+        return F.linear(hidden_states, weight, bias).split(self.all_head_size, dim=-1)
+
     def _project_active_positions(
         self,
         rel_embeddings: torch.Tensor,
@@ -742,21 +764,10 @@ class TorchTrainingDisentangledSelfAttention(OriginalDisentangledSelfAttention):
         if attention_mask.shape != (batch_size, sequence_length):
             raise ValueError("attention_mask must have shape [B, L]")
 
-        query_layer = self._reshape_heads(
-            self.query_proj(hidden_states),
-            batch_size,
-            sequence_length,
-        )
-        key_layer = self._reshape_heads(
-            self.key_proj(hidden_states),
-            batch_size,
-            sequence_length,
-        )
-        value_layer = self._reshape_heads(
-            self.value_proj(hidden_states),
-            batch_size,
-            sequence_length,
-        )
+        query, key, value = self._project_qkv(hidden_states)
+        query_layer = self._reshape_heads(query, batch_size, sequence_length)
+        key_layer = self._reshape_heads(key, batch_size, sequence_length)
+        value_layer = self._reshape_heads(value, batch_size, sequence_length)
 
         indices = self.position_plan_cache.dense(sequence_length, hidden_states.device)
         pos_key = None

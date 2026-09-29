@@ -26,17 +26,20 @@ from .tuning import (
     TUNING_BATCH_HEADS,
     TUNING_SEQUENCE_LENGTHS,
     CompilerSpec,
+    DeviceResources,
     HardwareSpec,
     KernelConfig,
     KernelProfile,
     ProfileEntry,
     WorkloadKey,
-    conservative_candidates,
     current_provenance,
+    hardware_safe_candidates,
+    heuristic_config,
     load_profile,
     merge_profile_entry,
     prepare_profile_retarget,
     save_profile,
+    search_neighborhood,
     tuning_dtype,
 )
 
@@ -73,8 +76,23 @@ PRESETS = {
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
         "dropout": ("off",),
+        "search": "full",
     },
+    # A few representative shapes, measuring only the heuristic config and its
+    # neighbors. Uncovered shapes use the heuristic at runtime.
     "standard": {
+        "lengths": (128, 512, 2048, 8192),
+        "head_dims": (64,),
+        "batch_heads": (32,),
+        "dtypes": ("bfloat16",),
+        "relative_modes": ("both",),
+        "layouts": ("padded", "packed"),
+        "passes": ("inference", "training"),
+        "dropout": ("off", "on"),
+        "search": "neighborhood",
+    },
+    # Full candidate lists over every family; for release profiles.
+    "exhaustive": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
         # All DeBERTa-v2/v3 sizes use head dim 64. xsmall can fall in the <=8
         # occupancy family, larger models in <=32.
@@ -86,6 +104,7 @@ PRESETS = {
         "layouts": ("padded", "packed"),
         "passes": ("inference", "training"),
         "dropout": ("off", "on"),
+        "search": "full",
     },
 }
 
@@ -997,6 +1016,7 @@ def _search_configs(
     label: str,
     seed: KernelConfig | None = None,
     retarget: bool = False,
+    verbose: bool = False,
 ) -> SearchResult:
     """Tune tile/warps first and pipeline depth around the strongest shapes."""
 
@@ -1015,6 +1035,8 @@ def _search_configs(
         for config in configs:
             try:
                 results.append((evaluate(config), config))
+                if verbose:
+                    print(f"  {label} {_format_config(config)}: {results[-1][0]:.4f} ms")
             # Compile and resource failures raise different exception types.
             except Exception as error:  # noqa: BLE001
                 print(f"  rejected {label} {config}: {type(error).__name__}: {error}")
@@ -1080,12 +1102,47 @@ def run(args: argparse.Namespace) -> None:
             )
     seed_entries = {} if profile is None else {entry.workload: entry for entry in profile.entries}
 
+    resources = DeviceResources.current(device)
+    search_mode = PRESETS[args.preset]["search"]
+
     def is_allowed(workload: WorkloadKey, config: KernelConfig) -> bool:
-        return config in conservative_candidates(
-            (config,), dtype=workload.dtype, phase=workload.phase
+        return config in hardware_safe_candidates(
+            (config,),
+            phase=workload.phase,
+            head_dim=workload.head_dim,
+            dtype=workload.dtype,
+            resources=resources,
         )
 
-    # Re-tune saved winners that break the FP32 limits.
+    def heuristic_for(workload: WorkloadKey, batch_heads: int) -> KernelConfig:
+        return heuristic_config(
+            phase=workload.phase,
+            sequence_length=workload.sequence_length,
+            head_dim=workload.head_dim,
+            dtype=workload.dtype,
+            batch_heads=batch_heads,
+            resources=resources,
+        )
+
+    def phase_candidates(
+        workload: WorkloadKey,
+        candidates: tuple[KernelConfig, ...],
+        batch_heads: int,
+    ) -> tuple[KernelConfig, ...]:
+        """Configs this GPU can run, narrowed to the heuristic's neighbors for standard."""
+
+        safe = hardware_safe_candidates(
+            candidates,
+            phase=workload.phase,
+            head_dim=workload.head_dim,
+            dtype=workload.dtype,
+            resources=resources,
+        )
+        if search_mode == "neighborhood":
+            return search_neighborhood(heuristic_for(workload, batch_heads), safe)
+        return safe
+
+    # Re-tune saved winners this GPU can't run.
     completed = {
         workload
         for workload, entry in seed_entries.items()
@@ -1100,6 +1157,7 @@ def run(args: argparse.Namespace) -> None:
         candidates: tuple[KernelConfig, ...],
         evaluate: Callable[[KernelConfig], float],
         label: str,
+        batch_heads: int,
     ) -> tuple[SearchResult, str]:
         """Reuse a validated winner, revalidate a pending seed, or search from scratch."""
 
@@ -1107,7 +1165,7 @@ def run(args: argparse.Namespace) -> None:
         if is_cached(workload):
             assert seed is not None
             return SearchResult(seed.latency_ms, seed.config), "cached"
-        candidates = conservative_candidates(candidates, dtype=workload.dtype, phase=workload.phase)
+        candidates = phase_candidates(workload, candidates, batch_heads)
         if seed is not None and not is_allowed(workload, seed.config):
             seed = None
         pending = seed is not None and not seed.validated
@@ -1118,6 +1176,7 @@ def run(args: argparse.Namespace) -> None:
             label=label,
             seed=None if seed is None else seed.config,
             retarget=pending,
+            verbose=args.verbose,
         )
         return result, "retarget" if pending else "hierarchical"
 
@@ -1202,7 +1261,9 @@ def run(args: argparse.Namespace) -> None:
                 _validate_mask_patterns(_arguments, config)
             return latency
 
-        result, search = search_phase(workload, forward_candidates, evaluate_inference, "inference")
+        result, search = search_phase(
+            workload, forward_candidates, evaluate_inference, "inference", case.batch_heads
+        )
         record(workload, result, search)
         print(
             f"[{index}/{len(inference_cases)} inference] "
@@ -1236,17 +1297,14 @@ def run(args: argparse.Namespace) -> None:
             base_workload.fp32_precision == "strict"
         )
 
-        def baseline(workload: WorkloadKey, candidates: tuple[KernelConfig, ...]) -> KernelConfig:
-            allowed = conservative_candidates(
-                candidates, dtype=workload.dtype, phase=workload.phase
-            )
+        def baseline(workload: WorkloadKey, batch_heads: int = case.batch_heads) -> KernelConfig:
             seed = seed_entries.get(workload)
             if seed is not None and is_allowed(workload, seed.config):
                 return seed.config
-            return next(config for config in allowed if config.num_stages == 1)
+            return heuristic_for(workload, batch_heads)
 
-        dq_baseline = baseline(phase_workloads["backward_dq"], dq_candidates)
-        dkv_baseline = baseline(phase_workloads["backward_dkv"], dkv_candidates)
+        dq_baseline = baseline(phase_workloads["backward_dq"])
+        dkv_baseline = baseline(phase_workloads["backward_dkv"])
 
         def measure(
             forward_config: KernelConfig,
@@ -1283,18 +1341,21 @@ def run(args: argparse.Namespace) -> None:
             forward_candidates,
             lambda config, _dq=dq_baseline, _dkv=dkv_baseline: measure(config, _dq, _dkv)[0],
             "training forward",
+            case.batch_heads,
         )
         dq, dq_search = search_phase(
             phase_workloads["backward_dq"],
             dq_candidates,
             lambda config, _fwd=forward.config, _dkv=dkv_baseline: measure(_fwd, config, _dkv)[1],
             "dQ",
+            case.batch_heads,
         )
         dkv, dkv_search = search_phase(
             phase_workloads["backward_dkv"],
             dkv_candidates,
             lambda config, _fwd=forward.config, _dq=dq.config: measure(_fwd, _dq, config)[1],
             "dK/dV",
+            case.batch_heads,
         )
 
         # Check the three winners together.
@@ -1304,15 +1365,12 @@ def run(args: argparse.Namespace) -> None:
         # re-tune dQ once against the chosen dK/dV.
         if dq_search != "cached" and combined_backward_ms > dq.latency_ms * (1 + args.tie_margin):
             retuned = _search_configs(
-                conservative_candidates(
-                    dq_candidates,
-                    dtype=base_workload.dtype,
-                    phase="backward_dq",
-                ),
+                phase_candidates(phase_workloads["backward_dq"], dq_candidates, case.batch_heads),
                 lambda config, _fwd=forward.config, _dkv=dkv.config: measure(_fwd, config, _dkv)[1],
                 tie_margin=args.tie_margin,
                 label="dQ refinement",
                 seed=dq.config,
+                verbose=args.verbose,
             )
             dq = replace(retuned, rejected=dq.rejected + retuned.rejected)
             combined_forward_ms, combined_backward_ms = measure(
@@ -1348,7 +1406,12 @@ def run(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preset", choices=tuple(PRESETS), default="standard")
+    parser.add_argument(
+        "--preset",
+        choices=tuple(PRESETS),
+        default="standard",
+        help="standard: a few shapes around the heuristic; exhaustive: release profiles",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--seed", type=int, default=0)
@@ -1385,6 +1448,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="prefer an earlier conservative candidate when it is within this fraction",
     )
     parser.add_argument("--retest", action="store_true")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="print every measured candidate, e.g. to compare configs at one shape",
+    )
     return parser
 
 

@@ -26,6 +26,7 @@ from disentangled_flash.tuning import (
     DEFAULT_KERNEL_CONFIGS,
     KERNEL_SOURCE_DIGEST,
     CompilerSpec,
+    DeviceResources,
     HardwareSpec,
     KernelConfig,
     KernelProfile,
@@ -34,11 +35,15 @@ from disentangled_flash.tuning import (
     ProfileRegistry,
     WorkloadKey,
     conservative_candidates,
+    fits_device,
+    hardware_safe_candidates,
+    heuristic_config,
     load_bundled_profiles,
     load_profile,
     merge_profile_entry,
     prepare_profile_retarget,
     save_profile,
+    search_neighborhood,
     tuning_dtype,
     tuning_sequence_length,
 )
@@ -171,24 +176,29 @@ def test_tuning_sequence_lengths_use_bounded_families(length, representative):
     assert tuning_sequence_length(length) == representative
 
 
-def test_standard_covers_supported_deberta_variants_and_all_kernel_phases():
-    assert set(PRESETS) == {"quick", "standard"}
-    assert PRESETS["standard"]["head_dims"] == (64,)
-    assert PRESETS["standard"]["batch_heads"] == (8, 32)
-    assert PRESETS["standard"]["relative_modes"] == ("both",)
-    assert PRESETS["standard"]["layouts"] == ("padded", "packed")
-    assert PRESETS["standard"]["passes"] == ("inference", "training")
-    assert PRESETS["standard"]["lengths"][-1] == 8192
+def test_exhaustive_covers_supported_deberta_variants_and_all_kernel_phases():
+    assert set(PRESETS) == {"quick", "standard", "exhaustive"}
+    exhaustive = PRESETS["exhaustive"]
+    assert exhaustive["head_dims"] == (64,)
+    assert exhaustive["batch_heads"] == (8, 32)
+    assert exhaustive["layouts"] == ("padded", "packed")
+    assert exhaustive["lengths"][-1] == 8192
+    assert exhaustive["search"] == "full"
+    args = build_parser().parse_args(["--output", "profile.json", "--preset", "exhaustive"])
+    cases = list(_cases(args))
+    # 9 lengths x 2 occupancies x (half, FP32 strict, FP32 fast) x 3 layouts.
+    assert len(cases) == 162
+    assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 1134
+
+
+def test_standard_is_the_default_and_stays_small():
     args = build_parser().parse_args(["--output", "profile.json"])
     assert args.preset == "standard"
-    assert args.passes is None
+    assert PRESETS["standard"]["search"] == "neighborhood"
     cases = list(_cases(args))
-    # FP16/BF16 share the half family: 9 lengths x 2 occupancies x
-    # (half, FP32 strict, FP32 fast) x (masked, unmasked, packed).
-    assert len(cases) == 162
-    assert {case.dtype for case in cases} == {"bfloat16", "float32"}
-    assert _dropout_modes(args) == (False, True)
-    assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 1134
+    # 4 lengths x 3 layouts, BF16 only.
+    assert len(cases) == 12
+    assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 84
 
 
 def test_packed_tuning_case_uses_mixed_boundaries_and_separate_workload():
@@ -793,3 +803,211 @@ def test_fp32_searches_only_conservative_single_stage_schedules():
     assert conservative_candidates(
         (KernelConfig(128, 64, 4),), dtype="float32", phase="inference"
     ) == (KernelConfig(32, 32, 4),)
+
+
+H200 = DeviceResources(shared_memory_per_block=232448, multiprocessor_count=132)
+SMALL_GPU = DeviceResources(shared_memory_per_block=65536, multiprocessor_count=40)
+
+
+def test_shared_memory_filter_drops_large_tiles_on_small_gpus():
+    large = KernelConfig(128, 64, 4)
+    options = {"phase": "inference", "head_dim": 128, "dtype": "bfloat16"}
+
+    assert fits_device(large, resources=H200, **options)
+    assert not fits_device(large, resources=SMALL_GPU, **options)
+    safe = hardware_safe_candidates(DEFAULT_KERNEL_CONFIGS, resources=SMALL_GPU, **options)
+    assert large not in safe
+    assert all(fits_device(config, resources=SMALL_GPU, **options) for config in safe)
+
+
+def test_bundled_profile_winners_all_fit_the_h200_estimate():
+    profile = load_bundled_profiles()[0]
+
+    assert all(
+        fits_device(
+            entry.config,
+            phase=entry.workload.phase,
+            head_dim=entry.workload.head_dim,
+            dtype=entry.workload.dtype,
+            resources=H200,
+        )
+        for entry in profile.entries
+    )
+
+
+@pytest.mark.parametrize("resources", [H200, SMALL_GPU])
+@pytest.mark.parametrize("phase", ["inference", "training_forward", "backward_dq", "backward_dkv"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("length", [64, 128, 512, 2048, 8192])
+def test_heuristic_always_returns_a_safe_config(resources, phase, dtype, length):
+    for head_dim in (32, 64, 128):
+        config = heuristic_config(
+            phase=phase,
+            sequence_length=length,
+            head_dim=head_dim,
+            dtype=dtype,
+            batch_heads=384,
+            resources=resources,
+        )
+        assert config in hardware_safe_candidates(
+            (config,), phase=phase, head_dim=head_dim, dtype=dtype, resources=resources
+        )
+        assert config.num_stages == 1
+
+
+def test_heuristic_splits_tiles_when_the_launch_underfills_the_gpu():
+    options = {
+        "phase": "inference",
+        "sequence_length": 8192,
+        "head_dim": 64,
+        "dtype": "bfloat16",
+        "resources": H200,
+    }
+    saturated = heuristic_config(batch_heads=24, **options)
+    underfilled = heuristic_config(batch_heads=1, **options)
+
+    assert saturated == KernelConfig(64, 64, 4)
+    assert underfilled.block_m < saturated.block_m
+
+
+def test_search_neighborhood_starts_at_the_center():
+    center = KernelConfig(32, 64, 4)
+    neighborhood = search_neighborhood(center, DEFAULT_KERNEL_CONFIGS)
+
+    assert neighborhood[0] == center
+    assert len(neighborhood) == 4
+    assert KernelConfig(32, 64, 4, 2) in neighborhood
+    assert KernelConfig(128, 64, 4) not in neighborhood
+
+
+def test_heuristic_mode_rejects_candidate_lists():
+    with pytest.raises(ValueError, match="candidates are only valid"):
+        KernelTuningOptions(mode="heuristic", candidates=(KernelConfig(32, 32, 4),))
+    assert KernelTuningOptions(mode="heuristic").mode == "heuristic"
+
+
+def test_fingerprint_ignores_module_classes_and_imports():
+    from disentangled_flash.tuning import _canonical_code, _launch_code
+
+    base = "import torch\n\ndef launch(x):\n    return x + 1\n"
+    edited = (
+        "import torch\nimport math\n\nclass Wrapper:\n    pass\n\n"
+        "def launch(x):\n    # tweak\n    return x + 1\n"
+    )
+    changed = "def launch(x):\n    return x + 2\n"
+
+    assert _canonical_code(_launch_code(base)) == _canonical_code(_launch_code(edited))
+    assert _canonical_code(_launch_code(base)) != _canonical_code(_launch_code(changed))
+
+
+def _fake_device(monkeypatch, resources=H200):
+    from disentangled_flash import tuning
+
+    monkeypatch.setattr(
+        tuning.DeviceResources, "current", classmethod(lambda cls, d=None: resources)
+    )
+    monkeypatch.setattr(
+        tuning.HardwareSpec, "current", classmethod(lambda cls, d=None: make_hardware())
+    )
+    monkeypatch.setattr(tuning.CompilerSpec, "current", classmethod(lambda cls: make_compiler()))
+    tuning._resolve_launch_config.cache_clear()
+
+
+def _fields(workload):
+    return (
+        workload.sequence_length,
+        workload.head_dim,
+        workload.batch_heads,
+        workload.active_slots,
+        workload.dtype,
+        workload.has_c2p,
+        workload.has_p2c,
+        workload.fp32_precision,
+        workload.layout,
+        workload.uses_padding_mask,
+        workload.phase,
+        workload.has_dropout,
+    )
+
+
+def test_resolver_prefers_profiles_and_falls_back_to_the_heuristic(monkeypatch):
+    from disentangled_flash.tuning import register_profile_registry, resolve_launch_config
+
+    _fake_device(monkeypatch)
+    saved = KernelConfig(64, 64, 4)
+    key = register_profile_registry(ProfileRegistry((make_profile(saved),)))
+    hit = _fields(make_workload())
+    miss = _fields(make_workload(512))
+
+    assert resolve_launch_config(key, "auto", 0, hit, 12) == (64, 64, 4, 1)
+    heuristic = heuristic_config(
+        phase="inference",
+        sequence_length=512,
+        head_dim=64,
+        dtype="float16",
+        batch_heads=12,
+        resources=H200,
+    )
+    expected = (heuristic.block_m, heuristic.block_n, heuristic.num_warps, heuristic.num_stages)
+    assert resolve_launch_config(key, "auto", 0, miss, 12) == expected
+    assert resolve_launch_config(key, "heuristic", 0, hit, 12) != (64, 64, 4, 1)
+    with pytest.raises(RuntimeError, match="no validated profile entry"):
+        resolve_launch_config(key, "profile_only", 0, miss, 12)
+
+
+def test_length_family_matches_the_profile_families():
+    from disentangled_flash.tuning import length_family, occupancy_family
+
+    for length in (1, 64, 65, 383, 384, 8192, 20000):
+        assert length_family(length) == tuning_sequence_length(length)
+    assert occupancy_family(8) == 8
+    assert occupancy_family(1536) == 32
+
+
+def test_config_resolution_compiles_with_fullgraph_and_one_graph_per_family(monkeypatch):
+    from torch._dynamo.testing import CompileCounter
+
+    from disentangled_flash.tuning import (
+        length_family,
+        occupancy_family,
+        register_profile_registry,
+        resolve_launch_config,
+    )
+
+    _fake_device(monkeypatch)
+
+    class Launcher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.registry_key = register_profile_registry(ProfileRegistry())
+
+        def forward(self, hidden):
+            fields = (
+                length_family(hidden.size(1)),
+                64,
+                occupancy_family(hidden.size(0) * 12),
+                128,
+                "float16",
+                True,
+                True,
+                "strict",
+                "padded",
+                True,
+                "inference",
+                False,
+            )
+            block_m, block_n, _, _ = resolve_launch_config(
+                self.registry_key, "auto", 0, fields, None
+            )
+            return hidden * block_m + block_n
+
+    launcher = Launcher()
+    counter = CompileCounter()
+    torch._dynamo.reset()
+    compiled = torch.compile(launcher, backend=counter, fullgraph=True, dynamic=True)
+    for batch, length in ((2, 100), (3, 120), (4, 700)):
+        expected = launcher(torch.ones(batch, length))
+        torch.testing.assert_close(compiled(torch.ones(batch, length)), expected)
+
+    # 100 and 120 share the 128 family and the batch never recompiles; 700 is new.
+    assert counter.frame_count == 2

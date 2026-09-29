@@ -85,7 +85,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--tuning-mode",
-        choices=("auto", "autotune", "profile_only"),
+        choices=("auto", "heuristic", "autotune", "profile_only"),
         default="auto",
     )
     parser.add_argument("--profile", action="append", default=[])
