@@ -119,8 +119,8 @@ python -m benchmarks.plot_cuda_results \
 
 Measured on one NVIDIA H200 (SM90), BF16, PyTorch 2.14.0+cu130, Triton 3.8.0,
 CUDA 13.0, and FlashDeBERTa 0.0.7, using the bundled profile in `profile_only`
-mode. The benchmark commit was `bfd3e11`. Plots show all six sequence lengths
-and the constant-token batch schedule:
+mode. Plots show effective attention throughput and incremental peak memory
+across the six sequence lengths at a fixed total of 16,384 tokens per batch:
 
 ![Attention kernel effective throughput on H200](docs/figures/kernel_throughput_h200.png)
 
@@ -145,6 +145,20 @@ work. Timings include each implementation's attention path and are not a
 comparison to plain, no-relative-bias FlashAttention. At short training lengths
 the Triton path is not always fastest (for example, it is slower than the eager
 baseline at lengths 128 and 512).
+
+Incremental peak allocated memory at length 8192 was:
+
+| Implementation | Forward | Forward + backward |
+| --- | ---: | ---: |
+| Hugging Face eager | 19.70 GiB | 20.10 GiB |
+| DF PyTorch | 9.52 GiB | 12.52 GiB |
+| DF Triton | 0.47 GiB | 1.36 GiB |
+| FlashDeBERTa | 0.49 GiB | 0.97 GiB |
+
+This is allocated tensor memory above the process's pre-measurement CUDA
+allocation, not total device usage. At this length DF Triton reduces incremental
+forward peak allocation by about 98% versus Hugging Face eager; its
+forward+backward allocation is lower by about 93%.
 
 ### Kernel tuning profiles
 
@@ -263,17 +277,20 @@ was evaluated in FP16 at batch size 16 using the bundled H200 profile. All
 implementations and layouts had the same accuracy (91.74%) and zero
 classification-decision mismatches against Hugging Face:
 
-| Variant | Decision mismatches | Maximum absolute logit difference |
-| --- | ---: | ---: |
-| DF PyTorch, padded | 0 / 9,815 | 0.1094 |
-| DF PyTorch, packed | 0 / 9,815 | 0.1074 |
-| DF Triton, padded | 0 / 9,815 | 0.0742 |
-| DF Triton, packed | 0 / 9,815 | 0.0508 |
-| FlashDeBERTa, packed | 0 / 9,815 | 0.0801 |
+| Variant | Full-split time | Speedup vs. HF eager | Decision mismatches | Maximum absolute logit difference |
+| --- | ---: | ---: | ---: | ---: |
+| Hugging Face eager, padded | 53.01 s | 1.00× | Reference | 0 |
+| DF PyTorch, padded | 55.34 s | 0.96× | 0 / 9,815 | 0.1094 |
+| DF PyTorch, packed | 52.71 s | 1.01× | 0 / 9,815 | 0.1074 |
+| DF Triton, padded | 30.53 s | 1.74× | 0 / 9,815 | 0.0742 |
+| DF Triton, packed | 6.18 s | 8.58× | 0 / 9,815 | 0.0508 |
+| FlashDeBERTa, packed | 22.38 s | 2.37× | 0 / 9,815 | 0.0801 |
 
 This is decision parity, not bitwise or elementwise logit parity: the maximum
 logit differences are nonzero. The recorded BF16 run did not meet full decision
-parity, so the FP16 result above is the release parity claim.
+parity, so the FP16 result above is the release parity claim. Full-split times
+are from one evaluation run on the H200 at batch size 16, and include the
+benchmark's end-to-end MNLI evaluation path; they are not kernel-only timings.
 
 ## CUDA validation
 
