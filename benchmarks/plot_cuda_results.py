@@ -25,6 +25,7 @@ SERIES = (
 )
 PASS_TITLES = {
     "forward": "Forward",
+    "backward": "Backward",
     "forward_backward": "Forward + backward",
 }
 
@@ -39,7 +40,6 @@ def load_results(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "status",
         "implementation",
         "pass",
-        "dropout",
         "sequence_length",
         "p50_ms",
         "effective_attention_tflops",
@@ -113,17 +113,23 @@ def _make_metric_figure(
     output_dir: Path,
     dpi: int,
 ) -> tuple[Path, Path]:
-    figure, axes = plt.subplots(1, 2, figsize=(12.0, 4.85), sharey=metric == "peak_memory_gib")
+    passes = [mode for mode in PASS_TITLES if usable["pass"].eq(mode).any()]
+    figure, axes = plt.subplots(
+        1,
+        len(passes),
+        figsize=(6.0 * len(passes), 4.85),
+        sharey=metric == "peak_memory_gib",
+        squeeze=False,
+    )
+    axes = axes[0]
     figure.subplots_adjust(left=0.085, right=0.985, top=0.70, bottom=0.24, wspace=0.23)
 
     lengths = sorted(int(value) for value in usable["sequence_length"].unique())
     tick_labels = [_length_label(length) for length in lengths]
 
-    for index, pass_mode in enumerate(("forward", "forward_backward")):
+    for index, pass_mode in enumerate(passes):
         axis = axes[index]
         panel = usable[usable["pass"].eq(pass_mode)]
-        if panel.empty:
-            continue
         _plot_series(axis, panel, metric)
         _style_axis(axis, lengths, tick_labels)
         axis.set_title(f"({chr(97 + index)})  {PASS_TITLES[pass_mode]}", loc="left", pad=11)
@@ -157,9 +163,10 @@ def _make_metric_figure(
         0.045,
         (
             f"{configuration.get('dtype', 'bf16').upper()}   ·   head dimension "
-            f"{configuration.get('head_dim', 64)}   ·   dropout 0   ·   "
+            f"{configuration.get('head_dim', 64)}   ·   "
             f"batch × length = {configuration.get('total_tokens', 16384):,} tokens   ·   "
-            f"median of {configuration.get('iters', 25)} iterations"
+            f"{configuration.get('timer', 'do_bench')} timer, median of "
+            f"{configuration.get('repeats', 1)} runs"
         ),
         ha="center",
         fontsize=9.5,
@@ -180,9 +187,9 @@ def make_release_figures(
     output_dir: Path,
     dpi: int,
 ) -> tuple[Path, ...]:
-    usable = frame[frame["status"].eq("ok") & frame["dropout"].eq(0.0)].copy()
+    usable = frame[frame["status"].eq("ok")].copy()
     if usable.empty:
-        raise ValueError("no successful dropout-zero benchmark rows to plot")
+        raise ValueError("no successful benchmark rows to plot")
     # Memory above the pre-measurement allocation (weights and inputs excluded).
     usable["peak_memory_gib"] = usable["incremental_peak_allocated_bytes"] / GIB
 

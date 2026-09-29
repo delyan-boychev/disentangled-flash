@@ -60,17 +60,17 @@ def test_cuda_benchmark_defaults_to_constant_token_kernel_matrix():
 
     assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
     assert "flex" not in args.implementations
-    assert args.passes == ["forward", "forward_backward"]
+    assert args.passes == ["forward", "backward", "forward_backward"]
     assert args.lengths == [128, 512, 1024, 2048, 4096, 8192]
     assert args.total_tokens == 16_384
     assert args.head_dim == 64
     assert args.dtype == "bf16"
-    assert args.training_dropouts == [0.0]
+    assert args.timer == "do_bench"
 
 
 def test_flashdeberta_config_uses_transformers_compatible_position_types():
     benchmark = load_benchmark_module()
-    config = benchmark.make_config(64, 0.0)
+    config = benchmark.make_config(64)
 
     values = benchmark._flashdeberta_config_kwargs(config)
 
@@ -86,11 +86,13 @@ def test_cuda_benchmark_uses_constant_token_batches_and_reports_effective_flops(
     forward = benchmark.effective_attention_flops(2, 12, 512, 64, "forward")
     combined = benchmark.effective_attention_flops(2, 12, 512, 64, "forward_backward")
     assert combined == int(forward * 3.5)
+    backward = benchmark.effective_attention_flops(2, 12, 512, 64, "backward")
+    assert backward == int(forward * 2.5)
 
 
 def test_torch_kernel_backend_runs_active_tokens_without_layout_axis():
     benchmark = load_benchmark_module()
-    config = benchmark.make_config(64, 0.0)
+    config = benchmark.make_config(64)
     reference = benchmark.OriginalDisentangledSelfAttention(config)
     module = benchmark.make_module(
         "torch",
@@ -113,7 +115,7 @@ def test_torch_kernel_backend_runs_active_tokens_without_layout_axis():
 
 def test_kernel_benchmark_selects_inference_and_training_triton_paths():
     benchmark = load_benchmark_module()
-    config = benchmark.make_config(64, 0.0)
+    config = benchmark.make_config(64)
     reference = benchmark.OriginalDisentangledSelfAttention(config)
     options = {
         "implementation": "triton",
@@ -366,7 +368,7 @@ def test_mnli_packed_path_runs_classifier_without_padding_attention():
 
 def test_kernel_benchmark_builds_hugging_face_setup_outside_timing():
     benchmark = load_benchmark_module()
-    config = benchmark.make_config(64, 0.0)
+    config = benchmark.make_config(64)
     reference = benchmark.OriginalDisentangledSelfAttention(config)
     call = benchmark.make_module(
         "base",
@@ -406,7 +408,6 @@ def test_memory_plot_uses_incremental_peak(tmp_path):
             "status": "ok",
             "implementation": "triton",
             "pass": pass_mode,
-            "dropout": 0.0,
             "sequence_length": length,
             "p50_ms": 1.0,
             "effective_attention_tflops": 1.0,
@@ -414,7 +415,7 @@ def test_memory_plot_uses_incremental_peak(tmp_path):
             "incremental_peak_allocated_bytes": plot.GIB // 4,
             "gpu": "GPU",
         }
-        for pass_mode in ("forward", "forward_backward")
+        for pass_mode in ("forward", "backward", "forward_backward")
         for length in (128, 512)
     ]
     report = tmp_path / "results.json"
@@ -442,7 +443,8 @@ def test_cuda_benchmark_defaults_to_do_bench_with_repeats():
     args = benchmark.build_parser().parse_args([])
 
     assert args.timer == "do_bench"
-    assert (args.warmup, args.iters, args.rep_ms, args.repeats) == (20, 100, 500.0, 3)
+    assert (args.warmup, args.rep_ms, args.repeats, args.cooldown_s) == (20, 500.0, 3, 1.0)
+    assert benchmark.build_parser().parse_args(["--timer", "cudagraph"]).timer == "cudagraph"
 
 
 def test_each_configuration_runs_in_its_own_process(monkeypatch):
@@ -459,7 +461,7 @@ def test_each_configuration_runs_in_its_own_process(monkeypatch):
         )
 
     monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
-    result = benchmark.run_subprocess(args, "triton", "forward", 512, 0.0)
+    result = benchmark.run_subprocess(args, "triton", "forward", 512)
 
     assert commands[0][commands[0].index("--implementation") + 1] == "triton"
     assert commands[0][commands[0].index("--timer") + 1] == "do_bench"
@@ -470,7 +472,7 @@ def test_each_configuration_runs_in_its_own_process(monkeypatch):
         "run",
         lambda *_a, **_k: SimpleNamespace(stdout="", stderr="CUDA out of memory"),
     )
-    assert benchmark.run_subprocess(args, "base", "forward", 512, 0.0)["status"] == "oom"
+    assert benchmark.run_subprocess(args, "base", "forward", 512)["status"] == "oom"
 
 
 def test_repeats_combine_to_the_median_run():
@@ -493,3 +495,20 @@ def test_repeats_combine_to_the_median_run():
     assert combined["repeat_spread"] == pytest.approx(1.0)
     assert (combined["repeats"], combined["failed_repeats"]) == (4, 1)
     assert combined["tokens_per_second"] == pytest.approx(1000.0 / 1.1)
+
+
+def test_backward_pass_replays_one_forward_graph():
+    benchmark = load_benchmark_module()
+    args = benchmark.build_parser().parse_args(
+        ["--worker", "--implementation", "torch", "--pass-mode", "backward", "--length", "16"]
+    )
+    args.total_tokens = 32
+    operation, clear_gradients, batch_size, _ = benchmark._prepare_case(
+        args, torch.device("cpu"), torch.float32
+    )
+
+    operation()
+    operation()
+
+    assert batch_size == 2
+    clear_gradients()

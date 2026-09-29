@@ -99,18 +99,27 @@ python -m benchmarks.benchmark_cuda \
 
 The release matrix compares one DeBERTa-v3-base-shaped attention layer across
 Hugging Face eager, DF PyTorch, DF Triton, and FlashDeBERTa. It measures
-inference forward and training forward+backward in BF16 at
+inference forward, training backward, and training forward+backward in BF16 at
 lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains exactly
 16,384 active tokens (`batch = 16384 / length`), so there is no batch or
-packed-layout axis. The layer has 12 heads of dimension 64; training uses
-dropout 0. Every configuration runs in its own process: 20 warmup iterations,
-then Triton's `do_bench` for 500 ms, which flushes the L2 cache before each
-timed iteration (`--timer events` times back-to-back warm iterations instead).
-The garbage collector is paused while timing. The matrix runs three times with
-the implementation order rotated, and each result is the median of the three
-runs' medians; the per-run medians are kept. Results record median, min, p10
-and p90 latency, QK+PV-equivalent throughput, incremental peak allocated
-memory, and allocator retries or `cudaMalloc` calls during timing. The Hugging Face `[B, 1, L, L]` mask and
+packed-layout axis. The layer has 12 heads of dimension 64 and no dropout.
+As in FlashAttention, backward is timed on its own: forward runs once, then
+`out.backward(grad, retain_graph=True)` is replayed.
+
+Every configuration runs in its own process, with a one-second pause between
+processes: 20 warmup iterations, then Triton's `do_bench` for 500 ms, which
+flushes the L2 cache before each iteration. The garbage collector is paused
+while timing. The matrix runs three times with the implementation order
+rotated, and each result is the median of the three runs' medians.
+
+The default timer is eager, so it includes Python, autograd and kernel-launch
+cost. For short training steps that cost is larger than the GPU work for every
+implementation, and results follow the CPU clock. `--timer cudagraph` replays
+the same calls from a CUDA graph to leave only GPU time; implementations that
+sync with the host are reported as `uncapturable`. Results record median, min,
+p10 and p90 latency, the CPU cost of issuing one iteration, QK+PV-equivalent
+throughput, incremental peak allocated memory, and allocator retries or
+`cudaMalloc` calls during eager timing. The Hugging Face `[B, 1, L, L]` mask and
 relative-position matrix are built once before timing, as a real encoder does.
 
 Generate the throughput and memory plots with:

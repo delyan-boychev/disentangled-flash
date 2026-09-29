@@ -1,16 +1,24 @@
-"""Paper-oriented single-layer disentangled-attention benchmark.
+"""Single-layer disentangled-attention benchmark.
 
-Follows FlashAttention's constant-token convention: each length uses
-max(1, total_tokens // length) sequences, all tokens active. Every
-configuration runs in its own process, so an OOM or a missing optional backend
-is recorded instead of aborting the matrix, and the matrix is repeated with the
-implementation order rotated so slow periods on the node don't favor anyone.
-The default timer is Triton's do_bench, which flushes L2 before each iteration.
+Follows FlashAttention's conventions: every length uses
+max(1, total_tokens // length) sequences with all tokens active, and backward
+is timed on its own by running forward once and replaying
+``out.backward(grad, retain_graph=True)``.
 
-Setup a real encoder does once for all layers (the Hugging Face [B, 1, L, L]
-mask and relative-position matrix) happens before timing. The reported TFLOP/s
-counts only dense QK and PV work, so it is a QK+PV-equivalent rate for the whole
-layer, not hardware utilization.
+Every configuration runs in its own process, so an OOM or a missing optional
+backend is recorded instead of aborting the matrix. The matrix repeats with the
+implementation order rotated, with a short pause between processes so the GPU
+doesn't carry power throttling from one run into the next.
+
+Two timers:
+  do_bench   eager, L2 flushed before each iteration. Includes Python and
+             launch overhead, which dominates short training steps.
+  cudagraph  the same calls replayed from a CUDA graph, so only GPU time is
+             left. Implementations that sync with the host can't be captured
+             and are reported as such.
+
+TFLOP/s counts only dense QK and PV work, so it is a QK+PV-equivalent rate for
+the whole layer, not hardware utilization.
 """
 
 from __future__ import annotations
@@ -47,9 +55,12 @@ from disentangled_flash.tuning import KernelTuningOptions
 
 RESULT_PREFIX = "__ATTENTION_RESULT__="
 IMPLEMENTATIONS = ("base", "torch", "triton", "flashdeberta")
-PASS_MODES = ("forward", "forward_backward")
+PASS_MODES = ("forward", "backward", "forward_backward")
+TIMERS = ("do_bench", "cudagraph")
 DEFAULT_LENGTHS = (128, 512, 1024, 2048, 4096, 8192)
 DEFAULT_TOTAL_TOKENS = 16_384
+# Dense-attention FLOPs relative to forward: backward is 2.5x, as in FlashAttention.
+FLOP_MULTIPLIERS = {"forward": 1.0, "backward": 2.5, "forward_backward": 3.5}
 
 
 def collect_environment() -> dict[str, Any]:
@@ -59,37 +70,18 @@ def collect_environment() -> dict[str, Any]:
             packages[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             packages[name] = None
-    git_commit = None
-    git_dirty = None
+    git = {"commit": None, "dirty": None}
+    root = Path(__file__).resolve().parents[1]
     try:
-        root = Path(__file__).resolve().parents[1]
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        status = subprocess.run(
-            ["git", "status", "--porcelain"],
-            cwd=root,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        git_commit = commit.stdout.strip()
-        git_dirty = bool(status.stdout.strip())
+        run = lambda *command: subprocess.run(
+            ["git", *command], cwd=root, check=True, capture_output=True, text=True, timeout=5
+        ).stdout.strip()
+        git = {"commit": run("rev-parse", "HEAD"), "dirty": bool(run("status", "--porcelain"))}
     except (OSError, subprocess.SubprocessError):
         pass
-    cuda = {
-        "available": torch.cuda.is_available(),
-        "runtime": torch.version.cuda,
-        "cudnn": torch.backends.cudnn.version(),
-    }
+    devices = []
     if torch.cuda.is_available():
-        cuda["devices"] = [
+        devices = [
             {
                 "name": torch.cuda.get_device_name(index),
                 "compute_capability": list(torch.cuda.get_device_capability(index)),
@@ -101,35 +93,25 @@ def collect_environment() -> dict[str, Any]:
         "python": platform.python_version(),
         "platform": platform.platform(),
         "packages": packages,
-        "cuda": cuda,
-        "git": {"commit": git_commit, "dirty": git_dirty},
+        "cuda": {"runtime": torch.version.cuda, "devices": devices},
+        "git": git,
         "command": sys.argv,
     }
 
 
 def batch_size_for_length(length: int, total_tokens: int) -> int:
-    if length <= 0:
-        raise ValueError("length must be positive")
-    if total_tokens <= 0:
-        raise ValueError("total_tokens must be positive")
+    if length <= 0 or total_tokens <= 0:
+        raise ValueError("length and total_tokens must be positive")
     return max(1, total_tokens // length)
 
 
 def effective_attention_flops(
-    batch_size: int,
-    num_heads: int,
-    sequence_length: int,
-    head_dim: int,
-    pass_mode: str,
+    batch_size: int, num_heads: int, sequence_length: int, head_dim: int, pass_mode: str
 ) -> int:
-    """Return conventional dense-attention FLOPs, excluding relative bias work."""
+    """Dense QK+PV FLOPs, excluding relative-bias work."""
 
     forward = 4 * batch_size * num_heads * sequence_length**2 * head_dim
-    multiplier = {
-        "forward": 1.0,
-        "forward_backward": 3.5,
-    }[pass_mode]
-    return int(forward * multiplier)
+    return int(forward * FLOP_MULTIPLIERS[pass_mode])
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -142,14 +124,15 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def make_config(head_dim: int, dropout: float) -> DebertaAttentionConfig:
+def make_config(head_dim: int) -> DebertaAttentionConfig:
+    """DeBERTa-v3-base attention: 12 heads, 256 position buckets."""
+
     num_heads = 12
-    hidden_size = num_heads * head_dim
     return DebertaAttentionConfig(
-        hidden_size=hidden_size,
+        hidden_size=num_heads * head_dim,
         num_attention_heads=num_heads,
         attention_head_size=head_dim,
-        attention_probs_dropout_prob=dropout,
+        attention_probs_dropout_prob=0.0,
         hidden_dropout_prob=0.0,
         max_relative_positions=512,
         max_position_embeddings=8192,
@@ -161,7 +144,7 @@ def make_config(head_dim: int, dropout: float) -> DebertaAttentionConfig:
 
 
 class AttentionCall(nn.Module):
-    """Normalize the mask contract of benchmark implementations."""
+    """Give every implementation the same call signature."""
 
     def __init__(self, module: nn.Module, *, expand_mask: bool = False) -> None:
         super().__init__()
@@ -169,9 +152,7 @@ class AttentionCall(nn.Module):
         self.expand_mask = expand_mask
 
     def prepare(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        self, hidden_states: torch.Tensor, attention_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Build the per-encoder mask and relative positions once, outside timing."""
 
@@ -186,26 +167,16 @@ class AttentionCall(nn.Module):
         )
         return _prepare_attention_mask(attention_mask, length, length), relative_pos
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        rel_embeddings: torch.Tensor,
-        relative_pos: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, attention_mask, rel_embeddings, relative_pos=None):
         return self.module(
-            hidden_states,
-            attention_mask,
-            relative_pos=relative_pos,
-            rel_embeddings=rel_embeddings,
+            hidden_states, attention_mask, relative_pos=relative_pos, rel_embeddings=rel_embeddings
         )[0]
 
 
 def _flashdeberta_config_kwargs(config: DebertaAttentionConfig) -> dict[str, Any]:
     values = dict(config.__dict__)
-    pos_att_type = values.get("pos_att_type")
-    if isinstance(pos_att_type, tuple):
-        values["pos_att_type"] = list(pos_att_type)
+    if isinstance(values.get("pos_att_type"), tuple):
+        values["pos_att_type"] = list(values["pos_att_type"])
     return values
 
 
@@ -217,8 +188,7 @@ def _make_flashdeberta(config: DebertaAttentionConfig) -> nn.Module:
         raise ModuleNotFoundError(
             "FlashDeBERTa is not installed; install the benchmark extra"
         ) from exc
-    flash_config = DebertaV2Config(**_flashdeberta_config_kwargs(config))
-    return FlashDisentangledSelfAttention(flash_config)
+    return FlashDisentangledSelfAttention(DebertaV2Config(**_flashdeberta_config_kwargs(config)))
 
 
 def make_module(
@@ -232,61 +202,31 @@ def make_module(
     tuning_mode: str,
     profile_paths: tuple[str, ...],
 ) -> AttentionCall:
-    expand_mask = False
+    inference = pass_mode == "forward"
     if implementation == "base":
         module = OriginalDisentangledSelfAttention(config)
-        expand_mask = True
     elif implementation == "torch":
         module = (
             TorchInferenceDisentangledSelfAttention(config, assume_unpadded=True)
-            if pass_mode == "forward"
+            if inference
             else TorchTrainingDisentangledSelfAttention(config, assume_unpadded=True)
         )
     elif implementation == "triton":
         options = KernelTuningOptions(mode=tuning_mode, profile_paths=profile_paths)
-        module = (
-            InferenceDisentangledSelfAttention(
-                config,
-                backend="triton",
-                assume_unpadded=True,
-                tuning=options,
-            )
-            if pass_mode == "forward"
-            else TritonTrainingDisentangledSelfAttention(
-                config,
-                assume_unpadded=True,
-                tuning=options,
-            )
+        cls = (
+            InferenceDisentangledSelfAttention
+            if inference
+            else TritonTrainingDisentangledSelfAttention
         )
+        extra = {"backend": "triton"} if inference else {}
+        module = cls(config, assume_unpadded=True, tuning=options, **extra)
     elif implementation == "flashdeberta":
         module = _make_flashdeberta(config)
     else:
         raise ValueError(f"unknown implementation: {implementation}")
     module.load_state_dict(reference_state, strict=True)
-    return AttentionCall(module, expand_mask=expand_mask).to(device=device, dtype=dtype)
-
-
-def _operation(
-    module: nn.Module,
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    rel_embeddings: torch.Tensor,
-    pass_mode: str,
-    relative_pos: torch.Tensor | None = None,
-):
-    if pass_mode == "forward":
-        with torch.no_grad():
-            return module(hidden_states, attention_mask, rel_embeddings, relative_pos)
-    if pass_mode == "forward_backward":
-        module.zero_grad(set_to_none=True)
-        if hidden_states.grad is not None:
-            hidden_states.grad = None
-        if rel_embeddings.grad is not None:
-            rel_embeddings.grad = None
-        output = module(hidden_states, attention_mask, rel_embeddings, relative_pos)
-        output.float().square().mean().backward()
-        return output
-    raise ValueError(f"operation does not directly handle {pass_mode}")
+    call = AttentionCall(module, expand_mask=implementation == "base")
+    return call.to(device=device, dtype=dtype)
 
 
 def summarize_samples(samples: list[float]) -> dict[str, Any]:
@@ -297,7 +237,6 @@ def summarize_samples(samples: list[float]) -> dict[str, Any]:
 
     return {
         "p50_ms": statistics.median(ordered),
-        "mean_ms": statistics.fmean(ordered),
         "min_ms": ordered[0],
         "p10_ms": percentile(0.10),
         "p90_ms": percentile(0.90),
@@ -305,18 +244,15 @@ def summarize_samples(samples: list[float]) -> dict[str, Any]:
     }
 
 
-def _prepare_case(
-    implementation: str,
-    args: argparse.Namespace,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> dict[str, Any]:
+def _prepare_case(args: argparse.Namespace, device: torch.device, dtype: torch.dtype):
+    """Build the module and inputs; return the timed callable and its grad tensors."""
+
     batch_size = batch_size_for_length(args.length, args.total_tokens)
-    config = make_config(args.head_dim, args.dropout)
+    config = make_config(args.head_dim)
     torch.manual_seed(args.seed)
     reference_state = OriginalDisentangledSelfAttention(config).state_dict()
     module = make_module(
-        implementation,
+        args.implementation,
         config,
         reference_state,
         device=device,
@@ -325,70 +261,53 @@ def _prepare_case(
         tuning_mode=args.tuning_mode,
         profile_paths=tuple(args.profile),
     )
-    module.train(args.pass_mode != "forward")
+    training = args.pass_mode != "forward"
+    module.train(training)
     # Same seed for every implementation, so all of them see identical inputs.
     generator = torch.Generator(device=device).manual_seed(args.seed + 1)
-    training = args.pass_mode != "forward"
-    hidden_states = torch.randn(
-        batch_size,
-        args.length,
-        config.hidden_size,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-        requires_grad=training,
-    )
-    attention_mask = torch.ones(batch_size, args.length, device=device, dtype=torch.bool)
-    rel_embeddings = torch.randn(
-        config.position_buckets * 2,
-        config.hidden_size,
-        generator=generator,
-        device=device,
-        dtype=dtype,
-        requires_grad=training,
-    )
-    attention_mask, relative_pos = module.prepare(hidden_states, attention_mask)
 
-    def operation():
-        return _operation(
-            module,
-            hidden_states,
-            attention_mask,
-            rel_embeddings,
-            args.pass_mode,
-            relative_pos,
+    def randn(*shape, requires_grad=training):
+        return torch.randn(
+            *shape, generator=generator, device=device, dtype=dtype, requires_grad=requires_grad
         )
 
+    hidden_states = randn(batch_size, args.length, config.hidden_size)
+    rel_embeddings = randn(config.position_buckets * 2, config.hidden_size)
+    attention_mask = torch.ones(batch_size, args.length, device=device, dtype=torch.bool)
+    attention_mask, relative_pos = module.prepare(hidden_states, attention_mask)
+    inputs = (hidden_states, attention_mask, rel_embeddings, relative_pos)
+    leaves = [hidden_states, rel_embeddings, *module.parameters()]
+
     def clear_gradients() -> None:
-        module.zero_grad(set_to_none=True)
-        hidden_states.grad = None
-        rel_embeddings.grad = None
+        for tensor in leaves:
+            tensor.grad = None
 
-    return {
-        "operation": operation,
-        "clear_gradients": clear_gradients,
-        "batch_size": batch_size,
-        "num_heads": config.num_attention_heads,
-    }
+    if args.pass_mode == "forward":
 
+        def operation():
+            with torch.no_grad():
+                module(*inputs)
 
-def _failure(implementation: str, error: BaseException) -> dict[str, Any]:
-    if isinstance(error, torch.cuda.OutOfMemoryError):
-        status = "oom"
-    elif isinstance(error, ModuleNotFoundError):
-        status = "unavailable"
+    elif args.pass_mode == "forward_backward":
+        grad_output = randn(batch_size, args.length, config.hidden_size, requires_grad=False)
+
+        def operation():
+            clear_gradients()
+            module(*inputs).backward(grad_output)
+
     else:
-        status = "error"
-    torch.cuda.empty_cache()
-    return {"status": status, "implementation": implementation, "error": f"{error}"[:4000]}
+        output = module(*inputs)
+        grad_output = randn(*output.shape, requires_grad=False)
+
+        def operation():
+            clear_gradients()
+            output.backward(grad_output, retain_graph=True)
+
+    return operation, clear_gradients, batch_size, config.num_attention_heads
 
 
 def _gc_paused(run):
-    """Run with the garbage collector paused, as timeit does.
-
-    A collection costs milliseconds and would otherwise land on whichever short
-    step happens to trigger it.
-    """
+    """Run with the garbage collector paused, as timeit does."""
 
     gc.collect()
     collecting = gc.isenabled()
@@ -400,32 +319,34 @@ def _gc_paused(run):
             gc.enable()
 
 
-def _measure_events(operation, iterations: int) -> tuple[list[float], float]:
-    """Back-to-back CUDA-event timing on warm caches; also host ms per iteration."""
+def _measure(operation, timer: str, rep_ms: float) -> list[float]:
+    from triton.testing import do_bench, do_bench_cudagraph
 
-    def run() -> tuple[list[float], float]:
-        torch.cuda.synchronize()
-        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iterations)]
-        host_started = time.perf_counter()
-        for index in range(iterations):
-            starts[index].record()
+    if timer == "cudagraph":
+        run = lambda: do_bench_cudagraph(operation, rep=rep_ms, return_mode="all")
+    else:
+        run = lambda: do_bench(operation, warmup=0, rep=rep_ms, return_mode="all")
+    return [float(sample) for sample in _gc_paused(run)]
+
+
+def _measure_host_issue(operation, iterations: int = 20) -> float:
+    """Median CPU time to issue one iteration from an idle GPU.
+
+    The launch queue never fills, so this is the Python, autograd and launch
+    cost alone. Close to the eager p50 means the step is host-bound.
+    """
+
+    def run() -> float:
+        samples = []
+        for _ in range(iterations):
+            torch.cuda.synchronize()
+            started = time.perf_counter()
             operation()
-            ends[index].record()
-        host_ms = (time.perf_counter() - host_started) * 1000.0 / iterations
+            samples.append((time.perf_counter() - started) * 1000.0)
         torch.cuda.synchronize()
-        return [float(start.elapsed_time(end)) for start, end in zip(starts, ends)], host_ms
+        return statistics.median(samples)
 
     return _gc_paused(run)
-
-
-def _measure_do_bench(operation, rep_ms: float) -> list[float]:
-    """Triton's do_bench: the L2 cache is flushed before every timed iteration."""
-
-    from triton.testing import do_bench
-
-    samples = _gc_paused(lambda: do_bench(operation, warmup=0, rep=rep_ms, return_mode="all"))
-    return [float(sample) for sample in samples]
 
 
 def worker(args: argparse.Namespace) -> dict[str, Any]:
@@ -434,38 +355,33 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    device_index = device.index if device.index is not None else 0
+    device_index = device.index or 0
     torch.cuda.set_device(device_index)
     dtype = dtype_from_name(args.dtype)
     if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
         raise RuntimeError("BF16 is not supported by this GPU")
-    implementation = args.implementation
-    if implementation == "flashdeberta" and args.dropout:
-        return {
-            "status": "unsupported",
-            "implementation": implementation,
-            "reason": "FlashDeBERTa does not apply attention-probability dropout",
-        }
 
-    case = _prepare_case(implementation, args, device, dtype)
-    operation = case["operation"]
+    operation, clear_gradients, batch_size, num_heads = _prepare_case(args, device, dtype)
     for _ in range(args.warmup):
         operation()
+    # do_bench allocates its L2-flush buffer on first use; get that out of the
+    # way so the allocator counters below only see the implementation.
+    _measure(operation, "do_bench", 10.0)
     torch.cuda.synchronize()
 
-    host_ms = None
     before = torch.cuda.memory_stats(device_index)
-    if args.timer == "do_bench":
-        samples = _measure_do_bench(operation, args.rep_ms)
-    else:
-        samples, host_ms = _measure_events(operation, args.iters)
+    try:
+        samples = _measure(operation, args.timer, args.rep_ms)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except Exception as exc:  # graph capture fails on host syncs
+        if args.timer != "cudagraph":
+            raise
+        return {"status": "uncapturable", "error": f"{type(exc).__name__}: {exc}"[:4000]}
     after = torch.cuda.memory_stats(device_index)
-    # Retries and fresh cudaMalloc calls while timing mean the cache ran out of
-    # fitting blocks; both are slow and synchronize the device.
-    retries = after.get("num_alloc_retries", 0) - before.get("num_alloc_retries", 0)
-    mallocs = after.get("num_device_alloc", 0) - before.get("num_device_alloc", 0)
+    host_ms = _measure_host_issue(operation)
 
-    case["clear_gradients"]()
+    clear_gradients()
     gc.collect()
     torch.cuda.empty_cache()
     baseline = torch.cuda.memory_allocated(device_index)
@@ -475,111 +391,71 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     peak = torch.cuda.max_memory_allocated(device_index)
 
     summary = summarize_samples(samples)
-    batch_size = case["batch_size"]
     flops = effective_attention_flops(
-        batch_size, case["num_heads"], args.length, args.head_dim, args.pass_mode
+        batch_size, num_heads, args.length, args.head_dim, args.pass_mode
     )
+    eager = args.timer == "do_bench"
+
+    def counter(name: str) -> int | None:
+        # Graph capture allocates its own pool, so the counters only mean
+        # something for eager timing.
+        return after.get(name, 0) - before.get(name, 0) if eager else None
+
     return {
         "status": "ok",
-        "implementation": implementation,
-        "equivalent_math": True,
-        "pass": args.pass_mode,
-        "dropout": args.dropout,
-        "dtype": args.dtype,
-        "batch_size": batch_size,
-        "sequence_length": args.length,
-        "total_tokens": batch_size * args.length,
         "head_dim": args.head_dim,
-        "num_heads": case["num_heads"],
+        "num_heads": num_heads,
         "timer": args.timer,
         **summary,
-        # Host time to issue one iteration (events timer only). Close to p50 means
-        # the step is limited by Python and kernel launches, not by the GPU.
-        "host_ms_per_iter": host_ms,
-        "allocator_retries": retries,
-        "cuda_mallocs_while_timing": mallocs,
         "timings_ms": samples,
+        "host_ms_per_iter": host_ms,
+        "allocator_retries": counter("num_alloc_retries"),
+        "cuda_mallocs_while_timing": counter("num_device_alloc"),
         "tokens_per_second": batch_size * args.length * 1000.0 / summary["p50_ms"],
         "effective_attention_tflops": flops / (summary["p50_ms"] * 1e9),
-        "effective_flops_definition": (
-            "dense QK+PV FLOPs over the whole layer's time; projections and "
-            "relative-bias work are timed but not counted"
-        ),
         "baseline_allocated_bytes": baseline,
         "peak_allocated_bytes": peak,
         "incremental_peak_allocated_bytes": max(0, peak - baseline),
         "gpu": torch.cuda.get_device_name(device_index),
-        "tuning_mode": args.tuning_mode if implementation == "triton" else None,
-        "profiles": list(args.profile) if implementation == "triton" else [],
+        "tuning_mode": args.tuning_mode if args.implementation == "triton" else None,
     }
 
 
 def run_subprocess(
-    args: argparse.Namespace,
-    implementation: str,
-    pass_mode: str,
-    length: int,
-    dropout: float,
+    args: argparse.Namespace, implementation: str, pass_mode: str, length: int
 ) -> dict[str, Any]:
-    command = [
-        sys.executable,
-        "-m",
-        "benchmarks.benchmark_cuda",
-        "--worker",
-        "--implementation",
-        implementation,
-        "--pass-mode",
-        pass_mode,
-        "--length",
-        str(length),
-        "--total-tokens",
-        str(args.total_tokens),
-        "--head-dim",
-        str(args.head_dim),
-        "--dtype",
-        args.dtype,
-        "--dropout",
-        str(dropout),
-        "--timer",
-        args.timer,
-        "--warmup",
-        str(args.warmup),
-        "--iters",
-        str(args.iters),
-        "--rep-ms",
-        str(args.rep_ms),
-        "--device",
-        args.device,
-        "--seed",
-        str(args.seed),
-        "--tuning-mode",
-        args.tuning_mode,
-    ]
-    for profile in args.profile:
-        command.extend(("--profile", profile))
-    environment = dict(os.environ)
+    command = [sys.executable, "-m", "benchmarks.benchmark_cuda", "--worker"]
+    for flag, value in (
+        ("--implementation", implementation),
+        ("--pass-mode", pass_mode),
+        ("--length", length),
+        ("--total-tokens", args.total_tokens),
+        ("--head-dim", args.head_dim),
+        ("--dtype", args.dtype),
+        ("--timer", args.timer),
+        ("--warmup", args.warmup),
+        ("--rep-ms", args.rep_ms),
+        ("--device", args.device),
+        ("--seed", args.seed),
+        ("--tuning-mode", args.tuning_mode),
+        *(("--profile", profile) for profile in args.profile),
+    ):
+        command.extend((flag, str(value)))
+    environment = {**os.environ}
     environment.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     completed = subprocess.run(
         command, text=True, capture_output=True, check=False, env=environment
     )
-    marker = next(
-        (
-            line[len(RESULT_PREFIX) :]
-            for line in reversed(completed.stdout.splitlines())
-            if line.startswith(RESULT_PREFIX)
-        ),
-        None,
-    )
     common = {
         "implementation": implementation,
         "pass": pass_mode,
-        "dropout": dropout,
         "dtype": args.dtype,
         "batch_size": batch_size_for_length(length, args.total_tokens),
         "sequence_length": length,
     }
-    if marker is not None:
-        return {**common, **json.loads(marker)}
+    for line in reversed(completed.stdout.splitlines()):
+        if line.startswith(RESULT_PREFIX):
+            return {**common, **json.loads(line[len(RESULT_PREFIX) :])}
     error = completed.stderr or completed.stdout
     lowered = error.lower()
     if "out of memory" in lowered:
@@ -592,27 +468,25 @@ def run_subprocess(
 
 
 def combine_repeats(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge one configuration's repeated runs into a single result."""
+    """Merge one configuration's repeats: the median of the per-run medians."""
 
     ok = [run for run in runs if run.get("status") == "ok"]
     if not ok:
         return runs[-1]
     medians = [run["p50_ms"] for run in ok]
-    best = min(medians)
-    combined = dict(min(ok, key=lambda run: abs(run["p50_ms"] - statistics.median(medians))))
     p50 = statistics.median(medians)
+    combined = dict(min(ok, key=lambda run: abs(run["p50_ms"] - p50)))
+    scale = combined["p50_ms"] / p50
     combined.update(
         {
             "p50_ms": p50,
             "min_ms": min(run["min_ms"] for run in ok),
             "repeat_p50_ms": medians,
-            "repeat_spread": max(medians) / best - 1.0,
+            "repeat_spread": max(medians) / min(medians) - 1.0,
             "repeats": len(runs),
             "failed_repeats": len(runs) - len(ok),
-            "tokens_per_second": combined["tokens_per_second"] * combined["p50_ms"] / p50,
-            "effective_attention_tflops": combined["effective_attention_tflops"]
-            * combined["p50_ms"]
-            / p50,
+            "tokens_per_second": combined["tokens_per_second"] * scale,
+            "effective_attention_tflops": combined["effective_attention_tflops"] * scale,
         }
     )
     return combined
@@ -629,26 +503,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=64)
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
     parser.add_argument(
-        "--training-dropouts",
-        nargs="+",
-        type=float,
-        default=[0.0],
-        help="Dropout values for training passes; inference forward always uses zero.",
-    )
-    parser.add_argument(
         "--timer",
-        choices=("do_bench", "events"),
+        choices=TIMERS,
         default="do_bench",
-        help="do_bench flushes L2 before each iteration; events times back-to-back warm runs.",
+        help="do_bench is eager with L2 flushes; cudagraph removes host overhead.",
     )
     parser.add_argument("--warmup", type=int, default=20, help="Untimed warmup iterations.")
-    parser.add_argument("--iters", type=int, default=100, help="Timed iterations (events timer).")
-    parser.add_argument("--rep-ms", type=float, default=500.0, help="Timed ms (do_bench timer).")
+    parser.add_argument("--rep-ms", type=float, default=500.0, help="Timed ms per run.")
     parser.add_argument(
         "--repeats",
         type=int,
         default=3,
         help="Run the matrix this many times, rotating the implementation order.",
+    )
+    parser.add_argument(
+        "--cooldown-s", type=float, default=1.0, help="Pause between worker processes."
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=17)
@@ -663,22 +532,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--implementation", choices=IMPLEMENTATIONS, help=argparse.SUPPRESS)
     parser.add_argument("--pass-mode", choices=PASS_MODES, help=argparse.SUPPRESS)
     parser.add_argument("--length", type=int, help=argparse.SUPPRESS)
-    parser.add_argument("--dropout", type=float, default=0.0, help=argparse.SUPPRESS)
     return parser
 
 
 def _describe(result: dict[str, Any]) -> str:
     if result["status"] != "ok":
-        return f"{result['status']}: {result.get('error', result.get('reason', ''))[:240]}"
+        return f"{result['status']}: {result.get('error', '')[:240]}"
     flags = []
     if result["allocator_retries"] or result["cuda_mallocs_while_timing"]:
         flags.append(
             f"allocator: {result['allocator_retries']} retries, "
             f"{result['cuda_mallocs_while_timing']} cudaMalloc while timing"
         )
-    host = result.get("host_ms_per_iter")
-    if host is not None and host >= 0.8 * result["p50_ms"]:
-        flags.append(f"host-bound, {host:.2f} ms/iter on the CPU")
+    if result["timer"] == "do_bench" and result["host_ms_per_iter"] >= 0.8 * result["p50_ms"]:
+        flags.append(f"host-bound, {result['host_ms_per_iter']:.2f} ms/iter on the CPU")
     return (
         f"p50 {result['p50_ms']:8.3f} ms  min {result['min_ms']:8.3f}  "
         f"incremental peak {result['incremental_peak_allocated_bytes'] / 1024**3:.3f} GiB"
@@ -697,88 +564,85 @@ def main() -> None:
             raise SystemExit("worker mode requires implementation, pass-mode, and length")
         try:
             result = worker(args)
-        except Exception as exc:  # noqa: BLE001 - preserve optional-backend failures
-            result = _failure(args.implementation, exc)
+        except Exception as exc:  # noqa: BLE001 - record failures, keep the matrix going
+            status = (
+                "oom"
+                if isinstance(exc, torch.cuda.OutOfMemoryError)
+                else "unavailable"
+                if isinstance(exc, ModuleNotFoundError)
+                else "error"
+            )
+            result = {"status": status, "error": f"{exc}"[:4000]}
         print(RESULT_PREFIX + json.dumps(result))
         return
 
-    if args.repeats < 1 or args.iters < 1 or args.rep_ms <= 0:
-        raise SystemExit("--repeats, --iters and --rep-ms must be positive")
-    if any(not 0.0 <= value < 1.0 for value in args.training_dropouts):
-        raise SystemExit("training dropout values must be in [0, 1)")
+    if args.repeats < 1 or args.rep_ms <= 0 or args.cooldown_s < 0:
+        raise SystemExit("--repeats and --rep-ms must be positive, --cooldown-s non-negative")
     if args.total_tokens < 1 or any(length < 1 for length in args.lengths):
         raise SystemExit("lengths and --total-tokens must be positive")
-    results: list[dict[str, Any]] = []
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    configuration = {
+        key: getattr(args, key)
+        for key in (
+            "implementations",
+            "passes",
+            "lengths",
+            "total_tokens",
+            "head_dim",
+            "dtype",
+            "timer",
+            "warmup",
+            "rep_ms",
+            "repeats",
+            "cooldown_s",
+            "device",
+            "seed",
+            "tuning_mode",
+            "profile",
+        )
+    }
+    results: list[dict[str, Any]] = []
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "environment": collect_environment(),
-        "configuration": {
-            "implementations": args.implementations,
-            "passes": args.passes,
-            "lengths": args.lengths,
-            "batch_schedule": "constant_tokens",
-            "total_tokens": args.total_tokens,
-            "head_dim": args.head_dim,
-            "dtype": args.dtype,
-            "training_dropouts": args.training_dropouts,
-            "timer": args.timer,
-            "warmup": args.warmup,
-            "iters": args.iters,
-            "rep_ms": args.rep_ms,
-            "repeats": args.repeats,
-            "device": args.device,
-            "seed": args.seed,
-            "tuning_mode": args.tuning_mode,
-            "profiles": args.profile,
-        },
+        "configuration": configuration,
         "results": results,
         "runs": [],
     }
-    groups = []
-    for pass_mode in args.passes:
-        dropouts = [0.0] if pass_mode == "forward" else args.training_dropouts
-        for dropout in dropouts:
-            for length in args.lengths:
-                groups.append((pass_mode, length, dropout))
-
-    # Every configuration gets its own process. Repeats rotate the order of the
-    # implementations, so slow periods on the node don't favor any of them.
-    runs: dict[tuple[str, str, int, float], list[dict[str, Any]]] = {}
+    groups = [(pass_mode, length) for pass_mode in args.passes for length in args.lengths]
+    runs: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
     total = len(groups) * len(args.implementations) * args.repeats
     step = 0
     for repeat in range(args.repeats):
         shift = repeat % len(args.implementations)
         order = args.implementations[shift:] + args.implementations[:shift]
-        for pass_mode, length, dropout in groups:
+        for pass_mode, length in groups:
             for implementation in order:
+                if step:
+                    time.sleep(args.cooldown_s)
                 step += 1
-                batch_size = batch_size_for_length(length, args.total_tokens)
-                result = run_subprocess(args, implementation, pass_mode, length, dropout)
-                runs.setdefault((implementation, pass_mode, length, dropout), []).append(result)
+                result = run_subprocess(args, implementation, pass_mode, length)
+                runs.setdefault((implementation, pass_mode, length), []).append(result)
                 payload["runs"].append({**result, "repeat": repeat})
                 write_json(output, payload)
                 print(
-                    f"[{step:03d}/{total:03d}] repeat {repeat + 1} {implementation:13} {pass_mode:16} "
-                    f"B={batch_size} L={length} dropout={dropout:g}  {_describe(result)}",
+                    f"[{step:03d}/{total:03d}] repeat {repeat + 1} {implementation:13} "
+                    f"{pass_mode:16} B={result['batch_size']} L={length}  {_describe(result)}",
                     flush=True,
                 )
 
-    for pass_mode, length, dropout in groups:
+    for pass_mode, length in groups:
         for implementation in args.implementations:
-            results.append(combine_repeats(runs[(implementation, pass_mode, length, dropout)]))
+            results.append(combine_repeats(runs[(implementation, pass_mode, length)]))
     write_json(output, payload)
     print()
     for result in results:
+        repeats = result.get("repeat_p50_ms")
         print(
             f"{result['implementation']:13} {result['pass']:16} L={result['sequence_length']:5} "
             f"{_describe(result)}"
-            + (
-                f"  repeats {', '.join(f'{value:.3f}' for value in result['repeat_p50_ms'])}"
-                if result.get("status") == "ok"
-                else ""
-            )
+            + (f"  repeats {', '.join(f'{value:.3f}' for value in repeats)}" if repeats else "")
         )
     print(f"Wrote {output.resolve()}")
 

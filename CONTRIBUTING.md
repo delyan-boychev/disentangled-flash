@@ -116,7 +116,7 @@ We measure the latency and accuracy of the reference, PyTorch-optimized, and Tri
 ### 1. Running Benchmarks
 * **CUDA Attention & Encoder Benchmark**:
   ```bash
-  python -m benchmarks.benchmark_cuda --scope encoder --dtypes fp16,fp32
+  python -m benchmarks.benchmark_encoder --scope encoder --dtypes fp16,fp32
   ```
 * **MPS Benchmark (macOS)**:
   ```bash
