@@ -2,6 +2,77 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-09-29
+
+### Bug Fixes
+
+- Fix benchmark worker variant scope ([46db32c](https://github.com/delyan-boychev/disentangled-flash/commit/46db32c01178c8880582ed7fdf9896c209c078f1))
+- Mask padded score gradients in backward ([14505a1](https://github.com/delyan-boychev/disentangled-flash/commit/14505a164df44d9b3d49503fc5e4db855c8f8be2))
+- Standardize torch backend name ([703a180](https://github.com/delyan-boychev/disentangled-flash/commit/703a1805f232ac32df1261493d383ae1bf1ff23b))
+- Handle fully masked Triton tiles ([b657e14](https://github.com/delyan-boychev/disentangled-flash/commit/b657e14930ca6d2ef175017b9392cea9ed125334))
+- Align training forward padding keyword with shared kernel ([78a16d9](https://github.com/delyan-boychev/disentangled-flash/commit/78a16d926f83a9e5312b2ac863e2124d0147cbcf))
+- Preserve packed convolution mask contract ([32a97a8](https://github.com/delyan-boychev/disentangled-flash/commit/32a97a8e7c7f7a9e65ec0b122b132038c182b1c3))
+
+### Documentation
+
+- Describe optimized training support ([1a89ba9](https://github.com/delyan-boychev/disentangled-flash/commit/1a89ba9fd68338b67804b7d0bc35afed74b546f3))
+- Publish H200 benchmark and parity results ([10f2691](https://github.com/delyan-boychev/disentangled-flash/commit/10f2691576aff67895a99bc0f69b97cbb0a4f538))
+- Report H200 performance and memory results ([c90a07a](https://github.com/delyan-boychev/disentangled-flash/commit/c90a07aadeb09b34f79c40fc7734322dc3faab3e))
+
+### Features
+
+- Add training backward for disentangled attention ([1339a06](https://github.com/delyan-boychev/disentangled-flash/commit/1339a06b40da200429e0816db40c12225eb8bdb1))
+
+### Miscellaneous Tasks
+
+- Detach training validation metrics ([35d835f](https://github.com/delyan-boychev/disentangled-flash/commit/35d835f30cd8a84f717545857db84e0d0ff62665))
+- Add fused attention dropout and precision-family tuning
+
+Apply attention-probability dropout inside the fused forward and
+backward kernels. A Philox mask keyed per batch/sequence and head is
+regenerated in dQ and dK/dV instead of being stored; the softmax
+denominator and LSE stay undropped and the output is scaled by 1/(1-p),
+as in FlashAttention. The seed is a device tensor saved for backward, so
+it follows the CUDA generator and traces under torch.compile. Training
+now uses Triton for configs with attention_probs_dropout_prob > 0.
+
+Tune FP16 and BF16 as one half-precision family, like FlashAttention and
+FlexAttention, and key training workloads by dropout. Legacy profiles
+with separate FP16/BF16 entries still load. FP32 searches a
+conservative single-stage space that mirrors runtime autotune pruning.
+The standard matrix is now 162 shapes and 1134 phase workloads. ([bf81da7](https://github.com/delyan-boychev/disentangled-flash/commit/bf81da7f9c404855873bb8dbab93494033bee821))
+- Fixed bug materilization large matricies ([571af50](https://github.com/delyan-boychev/disentangled-flash/commit/571af50192e6844b2e05ea373dcd08df353b60f5))
+- Install optional dependencies required by tests ([b2a5c9f](https://github.com/delyan-boychev/disentangled-flash/commit/b2a5c9f22ae6ea86826d45842a6f5fe6be931259))
+
+### Refactors
+
+- Clarify padding-mask specialization ([ba0e8cb](https://github.com/delyan-boychev/disentangled-flash/commit/ba0e8cb48764a3095d1a93b0e0367d69bb70b771))
+
+### Testing
+
+- Reuse optimized parity loader ([09012cf](https://github.com/delyan-boychev/disentangled-flash/commit/09012cfaa9ce57ca19b14f8e60489af8eef41394))
+
+### Bench
+
+- Add FlashDeBERTa to pretrained MNLI parity test ([ca9b479](https://github.com/delyan-boychev/disentangled-flash/commit/ca9b47914e5572e47aa0f27f814b366e7cdedbba))
+
+### Benchmark
+
+- Add FlashDeBERTa comparison ([0f3df3e](https://github.com/delyan-boychev/disentangled-flash/commit/0f3df3e36af72c7bb548b1d2e0d2fc79baad74ac))
+
+### Lint
+
+- Clean benchmark worker handling ([d8aca6c](https://github.com/delyan-boychev/disentangled-flash/commit/d8aca6c9cc39332e9d81c0d2502d203845c91582))
+- Clean inference benchmark error handling ([c349109](https://github.com/delyan-boychev/disentangled-flash/commit/c3491094431a29cf4e71e331be1b369dbc824191))
+- Iterate tensor stats mappings with items ([5fbde70](https://github.com/delyan-boychev/disentangled-flash/commit/5fbde709969507d97353945d7920825bbe48b369))
+
+### Validation
+
+- Add normalized parity metrics ([ee72375](https://github.com/delyan-boychev/disentangled-flash/commit/ee723751d0890b4ab0558064bab804f85de5c7ba))
+- Add multistep training parity ([0acb440](https://github.com/delyan-boychev/disentangled-flash/commit/0acb44007fc65555d6d88fa41800342f7e2bf0c9))
+- Stabilize multistep parity loss ([dffbe85](https://github.com/delyan-boychev/disentangled-flash/commit/dffbe85c7bd4da45a42c7767f40c13eafb33395c))
+- Add learnable structured multistep task ([701ee71](https://github.com/delyan-boychev/disentangled-flash/commit/701ee7186a54000e9251eeb265e0509ade5ada45))
+
 ## [0.2.0] - 2026-09-17
 
 ### Bug Fixes
