@@ -8,8 +8,10 @@ from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_cuda.py"
+ENCODER_BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_encoder.py"
 TRAINING_BENCHMARK_PATH = ROOT / "benchmarks" / "benchmark_training.py"
 MNLI_EVALUATION_PATH = ROOT / "benchmarks" / "evaluate_mnli.py"
+MULTISTEP_VALIDATION_PATH = ROOT / "validation" / "validate_multistep_training.py"
 
 
 def load_benchmark_module():
@@ -27,6 +29,18 @@ def load_benchmark_module():
     return module
 
 
+def load_encoder_benchmark_module():
+    spec = importlib.util.spec_from_file_location(
+        "benchmark_encoder",
+        ENCODER_BENCHMARK_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_training_benchmark_module():
     spec = importlib.util.spec_from_file_location(
         "benchmark_training",
@@ -39,41 +53,77 @@ def load_training_benchmark_module():
     return module
 
 
-def test_cuda_benchmark_exposes_unpadded_mode():
+def test_cuda_benchmark_defaults_to_constant_token_kernel_matrix():
     benchmark = load_benchmark_module()
-
-    args = benchmark.build_parser().parse_args(
-        [
-            "--assume-unpadded",
-            "--minimum-length-fraction",
-            "1.0",
-        ]
-    )
-
-    assert args.assume_unpadded is True
-    assert args.minimum_length_fraction == 1.0
-
-
-def test_cuda_benchmark_defaults_to_deberta_v3_base_matrix():
-    benchmark = load_benchmark_module()
-
     args = benchmark.build_parser().parse_args([])
 
-    assert args.scope == "encoder"
     assert args.implementations == ["base", "torch", "triton", "flashdeberta"]
-    assert args.layouts == ["padded", "packed"]
-    assert args.lengths == [64, 128, 256, 512, 1024, 2048, 4096, 8192]
-    assert args.hidden_size == 768
-    assert args.num_attention_heads == 12
-    assert args.num_hidden_layers == 12
-    assert args.intermediate_size == 3072
-    assert args.vocab_size == 128100
-    assert args.parity_samples == 1
-    assert args.parity_batch_size == 1
+    assert "flex" not in args.implementations
+    assert args.passes == ["forward", "forward_backward"]
+    assert args.lengths == [128, 512, 1024, 2048, 4096, 8192]
+    assert args.total_tokens == 16_384
+    assert args.head_dim == 64
+    assert args.dtype == "bf16"
+    assert args.training_dropouts == [0.0, 0.1]
+
+
+def test_cuda_benchmark_uses_constant_token_batches_and_reports_effective_flops():
+    benchmark = load_benchmark_module()
+
+    assert benchmark.batch_size_for_length(128, 16_384) == 128
+    assert benchmark.batch_size_for_length(512, 16_384) == 32
+    assert benchmark.batch_size_for_length(8192, 16_384) == 2
+    forward = benchmark.effective_attention_flops(2, 12, 512, 64, "forward")
+    combined = benchmark.effective_attention_flops(2, 12, 512, 64, "forward_backward")
+    assert combined == int(forward * 3.5)
+
+
+def test_torch_kernel_backend_runs_active_tokens_without_layout_axis():
+    benchmark = load_benchmark_module()
+    config = benchmark.make_config(64, 0.0)
+    reference = benchmark.OriginalDisentangledSelfAttention(config)
+    module = benchmark.make_module(
+        "torch",
+        config,
+        reference.state_dict(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        pass_mode="forward_backward",
+        tuning_mode="auto",
+        profile_paths=(),
+    ).eval()
+    hidden = torch.randn(2, 7, config.hidden_size)
+    mask = torch.ones(2, 7, dtype=torch.bool)
+    relative = torch.randn(config.position_buckets * 2, config.hidden_size)
+
+    output = module(hidden, mask, relative)
+
+    assert output.shape == hidden.shape
+
+
+def test_kernel_benchmark_selects_inference_and_training_triton_paths():
+    benchmark = load_benchmark_module()
+    config = benchmark.make_config(64, 0.0)
+    reference = benchmark.OriginalDisentangledSelfAttention(config)
+    options = {
+        "implementation": "triton",
+        "config": config,
+        "reference_state": reference.state_dict(),
+        "device": torch.device("cpu"),
+        "dtype": torch.float32,
+        "tuning_mode": "auto",
+        "profile_paths": (),
+    }
+
+    inference = benchmark.make_module(pass_mode="forward", **options)
+    training = benchmark.make_module(pass_mode="forward_backward", **options)
+
+    assert isinstance(inference.module, benchmark.InferenceDisentangledSelfAttention)
+    assert isinstance(training.module, benchmark.TritonTrainingDisentangledSelfAttention)
 
 
 def test_cuda_benchmark_reports_only_real_layouts():
-    benchmark = load_benchmark_module()
+    benchmark = load_encoder_benchmark_module()
 
     assert benchmark.unsupported_layout_reason("base", "packed") is not None
     assert benchmark.unsupported_layout_reason("flashdeberta", "padded") is not None
@@ -84,7 +134,7 @@ def test_cuda_benchmark_reports_only_real_layouts():
 
 
 def test_cuda_benchmark_uses_distinct_reproducible_input_batches():
-    benchmark = load_benchmark_module()
+    benchmark = load_encoder_benchmark_module()
     embedding = torch.arange(256, dtype=torch.float32).view(64, 4)
 
     first = benchmark.make_inputs(embedding, 3, 8, 3, 100, 0.5)
@@ -98,7 +148,7 @@ def test_cuda_benchmark_uses_distinct_reproducible_input_batches():
 
 
 def test_system_details_are_json_serializable_and_safe():
-    benchmark = load_benchmark_module()
+    benchmark = load_encoder_benchmark_module()
 
     details = benchmark.collect_system_details()
 
@@ -108,7 +158,7 @@ def test_system_details_are_json_serializable_and_safe():
 
 
 def test_cuda_summary_handles_oom_and_unavailable_parity(capsys):
-    benchmark = load_benchmark_module()
+    benchmark = load_encoder_benchmark_module()
     metadata = {
         "implementation": "triton",
         "scope": "encoder",
@@ -142,7 +192,7 @@ def test_cuda_summary_handles_oom_and_unavailable_parity(capsys):
 def test_make_models_accepts_unpadded_mode():
     import inspect
 
-    benchmark = load_benchmark_module()
+    benchmark = load_encoder_benchmark_module()
     signature = inspect.signature(benchmark.make_models)
     assert "assume_unpadded" in signature.parameters
 
@@ -156,6 +206,22 @@ def test_training_benchmark_exposes_strict_profile_only_mode():
 
     assert args.tuning_mode == "profile_only"
     assert args.profile == ["h200.json"]
+
+
+def test_training_benchmark_defaults_to_deberta_base_constant_tokens():
+    benchmark = load_training_benchmark_module()
+    args = benchmark.build_parser().parse_args([])
+
+    assert args.lengths == [128, 512, 2048, 8192]
+    assert args.total_tokens == 16_384
+    assert args.batch_size is None
+    assert args.dtype == "bf16"
+    assert args.dropout == 0.1
+    assert benchmark.batch_size_for_length(8192, args.total_tokens, args.batch_size) == 2
+
+    config = benchmark.make_config(8192, args.dropout)
+    assert config.num_hidden_layers == 12
+    assert config.intermediate_size == 3072
 
 
 def load_mnli_evaluation_module():
@@ -180,6 +246,8 @@ def test_mnli_evaluation_defaults_to_full_single_pass_matrix():
     assert args.batch_size == 8
     assert args.limit == 0
     assert args.runs == 1
+    assert args.dtype == "bf16"
+    assert args.output == "mnli_parity.json"
     assert evaluation.requested_variants(args.implementations, args.layouts) == (
         evaluation.Variant("base", "padded"),
         evaluation.Variant("torch", "padded"),
@@ -216,6 +284,23 @@ def test_mnli_evaluation_exposes_strict_profile_only_mode():
     assert args.tuning_mode == "profile_only"
     assert args.profile == ["h200.json"]
     assert args.runs == 3
+
+
+def test_multistep_parity_uses_base_shape_and_dropout():
+    spec = importlib.util.spec_from_file_location(
+        "validate_multistep_training",
+        MULTISTEP_VALIDATION_PATH,
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    validation = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(validation)
+
+    config = validation.make_config(8192, 0.1)
+    assert config.vocab_size == 128_100
+    assert config.num_hidden_layers == 12
+    assert config.intermediate_size == 3072
+    assert config.attention_probs_dropout_prob == 0.1
 
 
 def test_mnli_packed_path_runs_classifier_without_padding_attention():

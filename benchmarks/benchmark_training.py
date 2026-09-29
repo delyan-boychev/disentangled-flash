@@ -1,4 +1,10 @@
-"""Process-isolated DeBERTa training benchmark: HF vs FlashDeBERTa vs DisentangledFlash."""
+"""Deferred process-isolated DeBERTa-v3-base end-to-end training benchmark.
+
+The default matrix keeps the number of tokens per step approximately constant
+as sequence length changes. A fixed batch can still be requested for capacity
+studies and for reproducing older benchmark runs. This is not part of the
+release-facing kernel benchmark.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +20,20 @@ import torch
 
 RESULT_PREFIX = "__TRAIN_RESULT__="
 VARIANTS = ("deberta_hf", "deberta_flash", "deberta_df")
+DEFAULT_LENGTHS = (128, 512, 2048, 8192)
+DEFAULT_TOTAL_TOKENS = 16_384
+
+
+def batch_size_for_length(length: int, total_tokens: int, fixed_batch_size: int | None) -> int:
+    if length <= 0:
+        raise ValueError("length must be positive")
+    if fixed_batch_size is not None:
+        if fixed_batch_size <= 0:
+            raise ValueError("batch size must be positive")
+        return fixed_batch_size
+    if total_tokens <= 0:
+        raise ValueError("total tokens must be positive")
+    return max(1, total_tokens // length)
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -24,18 +44,18 @@ def dtype_from_name(name: str) -> torch.dtype:
     }[name]
 
 
-def make_config(max_length: int, intermediate_size: int):
+def make_config(max_length: int, dropout: float):
     from transformers import DebertaV2Config
 
     return DebertaV2Config(
-        vocab_size=50_368,
+        vocab_size=128_100,
         hidden_size=768,
-        num_hidden_layers=15,
+        num_hidden_layers=12,
         num_attention_heads=12,
-        intermediate_size=intermediate_size,
+        intermediate_size=3072,
         hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+        hidden_dropout_prob=dropout,
+        attention_probs_dropout_prob=dropout,
         max_position_embeddings=max(8192, max_length),
         type_vocab_size=0,
         initializer_range=0.02,
@@ -57,12 +77,13 @@ def build_model(
     dtype: torch.dtype,
     device: str,
     *,
+    dropout: float = 0.1,
     tuning_mode: str = "auto",
     profile_paths: tuple[str, ...] = (),
 ):
     from transformers import DebertaV2Model
 
-    config = make_config(length, 3200)
+    config = make_config(length, dropout)
     if variant == "deberta_flash":
         try:
             from flashdeberta import FlashDebertaV2Model
@@ -117,9 +138,12 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
         args.length,
         dtype,
         device_name,
+        dropout=args.dropout,
         tuning_mode=args.tuning_mode,
         profile_paths=tuple(args.profile),
     )
+    if args.execution == "compile":
+        model = torch.compile(model, mode=args.compile_mode, fullgraph=args.fullgraph)
     input_ids = torch.randint(
         10,
         30_000,
@@ -157,6 +181,8 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
         "length": args.length,
         "batch_size": args.batch_size,
         "dtype": args.dtype,
+        "dropout": args.dropout,
+        "execution": args.execution,
         "tuning_mode": args.tuning_mode,
         "profiles": list(args.profile),
         "status": "ok",
@@ -172,6 +198,7 @@ def worker(args: argparse.Namespace) -> dict[str, object]:
 
 
 def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[str, object]:
+    batch_size = batch_size_for_length(length, args.total_tokens, args.batch_size)
     cmd = [
         sys.executable,
         str(Path(__file__).resolve()),
@@ -181,7 +208,7 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
         "--length",
         str(length),
         "--batch-size",
-        str(args.batch_size),
+        str(batch_size),
         "--dtype",
         args.dtype,
         "--warmup",
@@ -190,9 +217,16 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
         str(args.iters),
         "--device",
         args.device,
+        "--dropout",
+        str(args.dropout),
+        "--execution",
+        args.execution,
+        "--compile-mode",
+        args.compile_mode,
         "--tuning-mode",
         args.tuning_mode,
     ]
+    cmd.append("--fullgraph" if args.fullgraph else "--no-fullgraph")
     for profile in args.profile:
         cmd.extend(("--profile", profile))
     proc = subprocess.run(cmd, text=True, capture_output=True, check=False)
@@ -205,8 +239,10 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
         return {
             "variant": variant,
             "length": length,
-            "batch_size": args.batch_size,
+            "batch_size": batch_size,
             "dtype": args.dtype,
+            "dropout": args.dropout,
+            "execution": args.execution,
             "tuning_mode": args.tuning_mode,
             "profiles": list(args.profile),
             "status": status,
@@ -217,10 +253,25 @@ def run_subprocess(args: argparse.Namespace, variant: str, length: int) -> dict[
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lengths", type=int, nargs="+", default=[512, 1024, 2048, 4096, 8192])
+    parser.add_argument("--lengths", type=int, nargs="+", default=list(DEFAULT_LENGTHS))
     parser.add_argument("--variants", nargs="+", choices=VARIANTS, default=list(VARIANTS))
-    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--total-tokens",
+        type=int,
+        default=DEFAULT_TOTAL_TOKENS,
+        help="Approximate tokens per step when --batch-size is omitted.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Use a fixed batch instead of constant-token scheduling.",
+    )
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--execution", choices=("eager", "compile"), default="eager")
+    parser.add_argument("--compile-mode", default="max-autotune-no-cudagraphs")
+    parser.add_argument("--fullgraph", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     parser.add_argument("--device", default="cuda:0")
@@ -259,6 +310,8 @@ def main() -> None:
                 "length": args.length,
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
+                "dropout": args.dropout,
+                "execution": args.execution,
                 "tuning_mode": args.tuning_mode,
                 "profiles": list(args.profile),
                 "status": "oom",
@@ -270,6 +323,8 @@ def main() -> None:
                 "length": args.length,
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
+                "dropout": args.dropout,
+                "execution": args.execution,
                 "tuning_mode": args.tuning_mode,
                 "profiles": list(args.profile),
                 "status": "error",
@@ -283,12 +338,18 @@ def main() -> None:
         for profile in args.profile:
             print(f"DisentangledFlash profile: {profile}")
     results = []
+    if not 0.0 <= args.dropout < 1.0:
+        raise SystemExit("--dropout must be in [0, 1)")
     total = len(args.variants) * len(args.lengths)
     count = 0
     for length in args.lengths:
         for variant in args.variants:
             count += 1
-            print(f"[{count:02d}/{total:02d}] {variant} L={length}", flush=True)
+            batch_size = batch_size_for_length(length, args.total_tokens, args.batch_size)
+            print(
+                f"[{count:02d}/{total:02d}] {variant} B={batch_size} L={length}",
+                flush=True,
+            )
             result = run_subprocess(args, variant, length)
             results.append(result)
             if result["status"] == "ok":
@@ -308,7 +369,15 @@ def main() -> None:
                     "lengths": args.lengths,
                     "variants": args.variants,
                     "batch_size": args.batch_size,
+                    "batch_schedule": (
+                        "fixed" if args.batch_size is not None else "constant_tokens"
+                    ),
+                    "total_tokens": args.total_tokens,
                     "dtype": args.dtype,
+                    "dropout": args.dropout,
+                    "execution": args.execution,
+                    "compile_mode": args.compile_mode,
+                    "fullgraph": args.fullgraph,
                     "warmup": args.warmup,
                     "iters": args.iters,
                     "device": args.device,

@@ -1,9 +1,11 @@
 """Evaluate DeBERTa inference backends on the real GLUE/MNLI dataset."""
 
 import argparse
+import json
 import statistics
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 
@@ -56,7 +58,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=list(LAYOUTS),
         help="Comma-separated layouts for the DF PyTorch and Triton implementations.",
     )
-    parser.add_argument("--dtype", choices=("fp16", "fp32"), default="fp16")
+    parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
     parser.add_argument("--bucket", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument(
@@ -89,6 +91,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--profile", action="append", default=[])
     parser.add_argument("--parity-atol", type=float)
     parser.add_argument("--parity-rtol", type=float)
+    parser.add_argument("--output", default="mnli_parity.json")
     parser.add_argument(
         "--require-full-parity",
         action="store_true",
@@ -377,16 +380,24 @@ def main() -> None:
 
     variants = requested_variants(args.implementations, args.layouts)
     device = torch.device("cuda")
-    dtype = {"fp16": torch.float16, "fp32": torch.float32}[args.dtype]
+    args.profile = [str(Path(profile).expanduser().resolve()) for profile in args.profile]
+    missing_profiles = [profile for profile in args.profile if not Path(profile).is_file()]
+    if missing_profiles:
+        raise ValueError(f"profile does not exist: {missing_profiles[0]}")
+    dtype = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }[args.dtype]
     atol = (
         args.parity_atol
         if args.parity_atol is not None
-        else (2e-2 if args.dtype == "fp16" else 1e-4)
+        else (2e-2 if args.dtype in {"fp16", "bf16"} else 1e-4)
     )
     rtol = (
         args.parity_rtol
         if args.parity_rtol is not None
-        else (2e-2 if args.dtype == "fp16" else 1e-4)
+        else (2e-2 if args.dtype in {"fp16", "bf16"} else 1e-4)
     )
 
     from transformers import AutoTokenizer
@@ -447,6 +458,7 @@ def main() -> None:
     print("GLUE/MNLI RESULTS — FULL DATASET PARITY AFTER CLASSIFICATION DECISION")
     print("=" * 112)
     parity_failures: list[str] = []
+    report_rows = []
     for variant, result in results.items():
         predictions = result.logits.argmax(dim=-1)
         mismatches = int((predictions != base_predictions).sum())
@@ -468,6 +480,56 @@ def main() -> None:
         )
         if not full_parity:
             parity_failures.append(variant.name)
+        report_rows.append(
+            {
+                "variant": variant.name,
+                "implementation": variant.implementation,
+                "layout": variant.layout,
+                "examples": examples,
+                "accuracy": accuracy,
+                "full_parity": full_parity,
+                "decision_mismatches": mismatches,
+                "logits_close": logits_close,
+                "logit_max_abs": float(logit_error.max()),
+                "logit_mean_abs": float(logit_error.mean()),
+                "probability_max_abs": float(probability_error.max()),
+                "probability_mean_abs": float(probability_error.mean()),
+                "run_times_ms": list(result.run_times_ms),
+                "mean_ms": statistics.mean(result.run_times_ms),
+            }
+        )
+
+    report = {
+        "configuration": {
+            "model": args.model,
+            "implementations": args.implementations,
+            "layouts": args.layouts,
+            "dtype": args.dtype,
+            "bucket": args.bucket,
+            "batch_size": args.batch_size,
+            "split": args.split,
+            "limit": args.limit,
+            "runs": args.runs,
+            "fp32_precision": args.fp32_precision,
+            "tuning_mode": args.tuning_mode,
+            "profiles": args.profile,
+            "parity_atol": atol,
+            "parity_rtol": rtol,
+        },
+        "dataset": {
+            "examples": examples,
+            "valid_tokens": valid_tokens,
+            "padded_tokens": padded_tokens,
+            "padding_fraction": 1.0 - valid_tokens / padded_tokens,
+        },
+        "all_variants_full_parity": not parity_failures,
+        "parity_failures": parity_failures,
+        "results": report_rows,
+    }
+    output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    print(f"\nSaved {output}")
 
     if parity_failures:
         print(f"\nVariants without full parity: {', '.join(parity_failures)}")

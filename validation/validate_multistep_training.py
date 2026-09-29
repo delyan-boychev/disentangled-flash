@@ -40,18 +40,18 @@ def seed_everything(seed: int) -> None:
     torch.use_deterministic_algorithms(False)
 
 
-def make_config(max_length: int):
+def make_config(max_length: int, dropout: float = 0.1):
     from transformers import DebertaV2Config
 
     return DebertaV2Config(
-        vocab_size=50_368,
+        vocab_size=128_100,
         hidden_size=768,
-        num_hidden_layers=15,
+        num_hidden_layers=12,
         num_attention_heads=12,
-        intermediate_size=3200,
+        intermediate_size=3072,
         hidden_act="gelu",
-        hidden_dropout_prob=0.0,
-        attention_probs_dropout_prob=0.0,
+        hidden_dropout_prob=dropout,
+        attention_probs_dropout_prob=dropout,
         max_position_embeddings=max(8192, max_length),
         type_vocab_size=0,
         initializer_range=0.02,
@@ -283,9 +283,14 @@ def evaluate_loss(
     batch: Batch,
     compute_dtype: torch.dtype,
 ) -> float:
-    input_ids, attention_mask, target = batch
-    _, loss = forward_loss(model, input_ids, attention_mask, target, compute_dtype)
-    return loss.item()
+    was_training = model.training
+    model.eval()
+    try:
+        input_ids, attention_mask, target = batch
+        _, loss = forward_loss(model, input_ids, attention_mask, target, compute_dtype)
+        return loss.item()
+    finally:
+        model.train(was_training)
 
 
 def main() -> None:
@@ -298,6 +303,7 @@ def main() -> None:
     parser.add_argument("--symbol-vocab-size", type=int, default=64)
     parser.add_argument("--target-std", type=float, default=0.5)
     parser.add_argument("--dtype", choices=tuple(COMPUTE_DTYPES), default="bf16")
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--mask-pattern", choices=("none", "right"), default="none")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -307,6 +313,18 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=41)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output", default="multistep_training_parity.json")
+    parser.add_argument(
+        "--tuning-mode",
+        choices=("auto", "autotune", "profile_only"),
+        default="auto",
+    )
+    parser.add_argument("--profile", action="append", default=[])
+    parser.add_argument("--max-fixed-loss-relative", type=float, default=0.05)
+    parser.add_argument(
+        "--require-parity",
+        action="store_true",
+        help="Exit unsuccessfully if final fixed-evaluation loss differs beyond the threshold.",
+    )
     args = parser.parse_args()
 
     if args.steps < 1:
@@ -317,6 +335,14 @@ def main() -> None:
         raise ValueError("--num-anchors must be >= 2")
     if args.symbol_vocab_size < 2:
         raise ValueError("--symbol-vocab-size must be >= 2")
+    if not 0.0 <= args.dropout < 1.0:
+        raise ValueError("--dropout must be in [0, 1)")
+    if args.max_fixed_loss_relative < 0.0:
+        raise ValueError("--max-fixed-loss-relative must be non-negative")
+    args.profile = [str(Path(profile).expanduser().resolve()) for profile in args.profile]
+    missing_profiles = [profile for profile in args.profile if not Path(profile).is_file()]
+    if missing_profiles:
+        raise ValueError(f"profile does not exist: {missing_profiles[0]}")
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
 
@@ -332,19 +358,23 @@ def main() -> None:
     from transformers import DebertaV2Model
     from transformers import __version__ as transformers_version
 
-    config = make_config(args.length)
+    config = make_config(args.length, args.dropout)
     reference = DebertaV2Model(config)
     candidate = copy.deepcopy(reference)
 
     reference.to(device=device, dtype=torch.float32).train()
     candidate.to(device=device, dtype=torch.float32).train()
 
-    from disentangled_flash import enable_deberta_training
+    from disentangled_flash import KernelTuningOptions, enable_deberta_training
 
     enable_deberta_training(
         candidate,
         assume_unpadded=args.mask_pattern == "none",
         fp32_precision="strict",
+        tuning=KernelTuningOptions(
+            mode=args.tuning_mode,
+            profile_paths=tuple(args.profile),
+        ),
     )
 
     reference_names = [name for name, _ in reference.named_parameters()]
@@ -458,6 +488,13 @@ def main() -> None:
             flush=True,
         )
 
+    final_fixed_reference = rows[-1]["fixed_reference_loss_after_step"]
+    final_fixed_candidate = rows[-1]["fixed_candidate_loss_after_step"]
+    final_fixed_relative = abs(final_fixed_candidate - final_fixed_reference) / max(
+        abs(final_fixed_reference),
+        torch.finfo(torch.float32).eps,
+    )
+    parity_passed = final_fixed_relative <= args.max_fixed_loss_relative
     result = {
         "configuration": vars(args),
         "environment": {
@@ -484,10 +521,26 @@ def main() -> None:
         "initial_fixed_candidate_loss": initial_fixed_candidate_loss,
         "steps": rows,
         "final": rows[-1],
+        "parity": {
+            "passed": parity_passed,
+            "metric": "final_fixed_loss_relative",
+            "value": final_fixed_relative,
+            "maximum": args.max_fixed_loss_relative,
+            "reference_loss_reduction": initial_fixed_reference_loss - final_fixed_reference,
+            "candidate_loss_reduction": initial_fixed_candidate_loss - final_fixed_candidate,
+        },
     }
     output = Path(args.output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"Saved {output}")
+    print(
+        f"Training parity {'passed' if parity_passed else 'failed'}: "
+        f"final fixed-loss relative difference={final_fixed_relative:.3e} "
+        f"(maximum {args.max_fixed_loss_relative:.3e})"
+    )
+    if args.require_parity and not parity_passed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
