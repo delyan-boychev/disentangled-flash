@@ -30,8 +30,10 @@ benchmark = [
     "tqdm>=4.66",
 ]
 dev = [
+    "numpy>=1.24",
     "pytest>=8",
     "ruff>=0.12",
+    "transformers>=4.57",
 ]
 
 [tool.setuptools]
