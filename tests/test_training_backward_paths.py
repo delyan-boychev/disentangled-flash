@@ -1,4 +1,4 @@
-"""CUDA check that the atomic-free backward path matches the atomic one."""
+"""CUDA check that the banded, atomic-free backward matches the atomic one."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ pytestmark = [
 ]
 
 
-def _run(dtype, length, **options):
+def _run(dtype, length, *, banded):
     from disentangled_flash.position import SharedPositionPlanCache, pad_position_table
     from disentangled_flash.training._kernels import training_attention
 
@@ -45,23 +45,24 @@ def _run(dtype, length, **options):
         score_scale=(head_dim * 3) ** -0.5,
         has_padding=True,
         strict_fp32=True,
-        **options,
+        gradient_band=plan.gradient_band if banded else None,
     )
     grad = torch.randn_like(output)
     gradients = torch.autograd.grad(output, (fused, pos_key, pos_query), grad)
-    return output, gradients, slots == 2 * length - 1
+    return output, gradients
 
 
+# 128 has one slot per distance, 700 has log buckets, 1500 saturates both ends.
+@pytest.mark.parametrize("length", [128, 700, 1500])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_unique_slot_stores_match_atomic_accumulation(dtype):
-    output, gradients, unique = _run(dtype, 128)
-    assert unique
-    unique_output, unique_gradients, _ = _run(dtype, 128, unique_slots=True)
+def test_banded_stores_match_atomic_accumulation(dtype, length):
+    output, gradients = _run(dtype, length, banded=False)
+    banded_output, banded_gradients = _run(dtype, length, banded=True)
 
     # The two paths autotune separately, so tiles (and summation order) may differ.
     tolerance = (
         {"rtol": 2e-2, "atol": 2e-2} if dtype == torch.bfloat16 else {"rtol": 1e-4, "atol": 1e-4}
     )
-    torch.testing.assert_close(unique_output, output, **tolerance)
-    for actual, expected in zip(unique_gradients, gradients):
+    torch.testing.assert_close(banded_output, output, **tolerance)
+    for actual, expected in zip(banded_gradients, gradients):
         torch.testing.assert_close(actual, expected, **tolerance)

@@ -215,21 +215,29 @@ def test_autograd_contexts_match_op_signatures():
             for node in ast.walk(_function(module, backward))
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == backward_op
         )
-        # *ctx.dq_config and *ctx.dkv_config each expand to four launch values.
-        passed = sum(4 if isinstance(arg, ast.Starred) else 1 for arg in call.args)
+        # *ctx.band expands to two values; *ctx.dq_config and *ctx.dkv_config to four.
+        widths = {"ctx.band": 2, "ctx.dq_config": 4, "ctx.dkv_config": 4}
+        passed = sum(
+            widths[ast.unparse(arg.value)] if isinstance(arg, ast.Starred) else 1
+            for arg in call.args
+        )
         assert passed == len(_function(module, backward_op).args.args), backward_op
 
 
-def test_backward_kernels_accept_and_receive_unique_slots():
+def test_backward_kernels_accept_and_receive_the_gradient_band():
     path = Path(__file__).parents[1] / "src/disentangled_flash/training/_kernels.py"
     module = ast.parse(path.read_text())
+    band = {"BANDED", "BAND_LOW", "BAND_HIGH", "GRAD_COLUMNS"}
     for name in (
         "_backward_dq_dc_kernel",
         "_backward_dkv_dt_kernel",
         "_packed_backward_dq_dc_kernel",
         "_packed_backward_dkv_dt_kernel",
     ):
-        assert "UNIQUE_SLOTS" in {arg.arg for arg in _function(module, name).args.args}, name
+        function = _function(module, name)
+        assert band <= {arg.arg for arg in function.args.args}, name
+        # Gradient rows use their own width, not the position-table width.
+        assert "atomic_add" in ast.unparse(function), name
     for name in ("_training_attention_backward_op", "_training_attention_packed_backward_op"):
         launches = [
             node
@@ -239,4 +247,40 @@ def test_backward_kernels_accept_and_receive_unique_slots():
         ]
         assert len(launches) == 2
         for launch in launches:
-            assert any(keyword.arg == "UNIQUE_SLOTS" for keyword in launch.keywords), name
+            assert band <= {keyword.arg for keyword in launch.keywords}, name
+
+
+def test_band_columns_fold_back_into_slot_gradients():
+    import torch
+
+    from disentangled_flash.position import SharedPositionPlanCache
+    from disentangled_flash.training._kernels import _position_gradients
+
+    torch.manual_seed(0)
+    cache = SharedPositionPlanCache(
+        position_buckets=256, max_relative_positions=512, position_embedding_size=256
+    )
+    length, heads, head_dim = 700, 2, 8
+    plan = cache.compact(length, "cpu")
+    band = plan.gradient_band
+    slots = plan.active_slots.numel()
+    rows = torch.randn(heads, length, head_dim, dtype=torch.float64)
+    table = torch.randn(heads, slots + 3, head_dim, dtype=torch.float64)
+    grad_pairs = torch.randn(heads, length, length, dtype=torch.float64)
+
+    # Reference: scatter every pair gradient into its slot.
+    positions = torch.arange(length)
+    distance = positions[:, None] - positions[None, :] + length - 1
+    slot = plan.delta_to_local.long()[distance]
+    grad_slots = torch.zeros(heads, length, table.size(1), dtype=torch.float64)
+    grad_slots.scatter_add_(2, slot.expand(heads, -1, -1), grad_pairs)
+    expected = _position_gradients(grad_slots, rows, table, torch.empty(0, dtype=torch.long))
+
+    # Band: one column per distance, saturated ends summed.
+    column = (distance - band.low).clamp(0, band.high - band.low)
+    grad_columns = torch.zeros(heads, length, band.column_slots.numel(), dtype=torch.float64)
+    grad_columns.scatter_add_(2, column.expand(heads, -1, -1), grad_pairs)
+    actual = _position_gradients(grad_columns, rows, table, band.column_slots)
+
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want)

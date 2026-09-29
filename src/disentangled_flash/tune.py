@@ -17,7 +17,7 @@ from typing import Any
 import torch
 
 from . import kernel
-from .position import SharedPositionPlanCache, aligned_slot_count
+from .position import GradientBand, SharedPositionPlanCache, aligned_slot_count
 from .tuning import (
     DEFAULT_DKV_KERNEL_CONFIGS,
     DEFAULT_DQ_KERNEL_CONFIGS,
@@ -426,7 +426,7 @@ class TrainingInputs:
     score_scale: float
     dropout_p: float = 0.0
     dropout_seed: torch.Tensor | None = None
-    unique_slots: bool = False
+    gradient_band: GradientBand | None = None
 
     def grad_tensors(self) -> tuple[torch.Tensor, ...]:
         tensors = [self.query, self.key, self.value]
@@ -502,7 +502,7 @@ def _make_training_inputs(
         max_seqlen=case.sequence_length,
         score_scale=(case.head_dim * scale_factor) ** -0.5,
         dropout_p=dropout_p,
-        unique_slots=active_slots == 2 * case.sequence_length - 1,
+        gradient_band=position_plan.gradient_band,
         # Fixed seed so every candidate sees the reference's mask.
         dropout_seed=(
             torch.tensor([0x1BF52], device=device, dtype=torch.int64) if dropout_p else None
@@ -542,7 +542,7 @@ def _run_training_forward(
         "dkv_config": dkv_config,
         "dropout_p": inputs.dropout_p,
         "dropout_seed": inputs.dropout_seed,
-        "unique_slots": inputs.unique_slots,
+        "gradient_band": inputs.gradient_band,
     }
     if workload.layout == "packed":
         return training_attention_packed(

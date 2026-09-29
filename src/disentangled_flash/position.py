@@ -33,12 +33,49 @@ def pad_position_table(table: torch.Tensor | None) -> torch.Tensor | None:
     return torch.nn.functional.pad(table, (0, 0, 0, extra))
 
 
+class GradientBand(NamedTuple):
+    """Distance columns that let backward write position gradients without atomics.
+
+    Distance index u = i - j + L - 1 maps to gradient column u - low. Inside the
+    band (0 < column < high - low) every distance has its own column, so each
+    program writes each of its (row, distance) gradients once. Distances at or
+    past either end share the first or last slot and are summed in registers
+    into columns 0 and high - low. column_slots maps every column to its local
+    slot so the gradient GEMMs can fold columns back into slots.
+    """
+
+    low: int
+    high: int
+    column_slots: torch.Tensor
+
+
+def gradient_band(delta_to_local: torch.Tensor, device: torch.device) -> GradientBand:
+    """Build the band from a compact [2L - 1] slot lookup (monotone in distance)."""
+
+    slots = delta_to_local.tolist()
+    last = len(slots) - 1
+    low = 0
+    while low < last and slots[low + 1] == slots[0]:
+        low += 1
+    high = last
+    while high - 1 > low and slots[high - 1] == slots[last]:
+        high -= 1
+    high = max(high, low + 1)
+    columns = [slots[0], *slots[low + 1 : high], slots[last]]
+    # Padding columns never receive gradient; repeating the last slot keeps the
+    # map monotone.
+    columns += [columns[-1]] * (aligned_slot_count(len(columns)) - len(columns))
+    return GradientBand(low, high, torch.tensor(columns, dtype=torch.long, device=device))
+
+
 class SharedPositionIndexPlan(NamedTuple):
     """Compact ``O(L)`` position plan consumed by the Triton kernel."""
 
     sequence_length: int
     active_slots: torch.Tensor
     delta_to_local: torch.Tensor
+    # None for per-example position_ids, whose backward keeps FP32 atomics.
+    gradient_band: GradientBand | None = None
 
 
 class SharedDensePositionIndexPlan(NamedTuple):
@@ -141,6 +178,7 @@ class SharedPositionPlanCache:
             sequence_length=length,
             active_slots=active_slots.to(device=resolved_device),
             delta_to_local=delta_to_local.to(device=resolved_device),
+            gradient_band=gradient_band(delta_to_local, resolved_device),
         )
         self._compact[cache_key] = plan
         return plan
@@ -199,6 +237,7 @@ class SharedPositionPlanCache:
 
 
 __all__ = [
+    "GradientBand",
     "SharedDensePositionIndexPlan",
     "SharedPositionIndexPlan",
     "SharedPositionPlanCache",
