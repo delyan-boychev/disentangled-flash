@@ -43,7 +43,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         tuning: KernelTuningOptions | None = None,
         profile_registry: ProfileRegistry | None = None,
         assume_unpadded: bool = False,
-        save_relative_tables: bool = False,
     ) -> None:
         super().__init__(
             config,
@@ -67,8 +66,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         # Workloads whose saved schedule failed; these fall back to autotuning.
         self._failed_profile_workloads: set[WorkloadKey] = set()
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
-        # Keep C2P/P2C for backward instead of recomputing them; costs memory.
-        self.save_relative_tables = save_relative_tables
 
     def _resolve_kernel_config(
         self,
@@ -268,7 +265,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 autotune_candidates=self.tuning.candidates,
                 dropout_p=dropout_p,
                 unique_slots=unique_slots,
-                save_relative_tables=self.save_relative_tables,
             ),
             config_options,
         )
@@ -351,7 +347,6 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 autotune_candidates=self.tuning.candidates,
                 dropout_p=dropout_p,
                 unique_slots=unique_slots,
-                save_relative_tables=self.save_relative_tables,
             ),
             config_options,
         )

@@ -1178,17 +1178,6 @@ def _empty_optional(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_empty((0,))
 
 
-def _saved_tables(
-    c2p: torch.Tensor,
-    p2c: torch.Tensor,
-    save: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Saving C2P/P2C skips their recompute in backward at the cost of memory.
-    if not save:
-        return c2p.new_empty((0,)), p2c.new_empty((0,))
-    return c2p, p2c
-
-
 def _head_rows(layer: torch.Tensor) -> torch.Tensor:
     # [B, H, L, D] -> [H, B * L, D]; a view for slices of the fused QKV output.
     batch, heads, length, head_dim = layer.shape
@@ -1263,7 +1252,6 @@ if (
         store_lse: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
-        save_relative_tables: bool,
         unique_slots: bool,
         autotune_bundle_id: int,
         forward_block_m: int,
@@ -1278,7 +1266,7 @@ if (
         dkv_block_n: int,
         dkv_num_warps: int,
         dkv_num_stages: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         del unique_slots
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
@@ -1355,12 +1343,7 @@ if (
             **_relative_strides(c2p, p2c, has_c2p, has_p2c),
             **launch_options,
         )
-        saved_c2p, saved_p2c = _saved_tables(
-            c2p.permute(1, 0, 2, 3) if has_c2p else c2p,
-            p2c.permute(1, 0, 2, 3) if has_p2c else p2c,
-            save_relative_tables and store_lse,
-        )
-        return output, lse_log2, saved_c2p, saved_p2c
+        return output, lse_log2
 
     @torch.library.triton_op(
         "disentangled_flash::training_attention_backward",
@@ -1384,8 +1367,6 @@ if (
         strict_fp32: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
-        saved_c2p: torch.Tensor,
-        saved_p2c: torch.Tensor,
         unique_slots: bool,
         autotune_bundle_id: int,
         dq_block_m: int,
@@ -1399,18 +1380,8 @@ if (
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        if not has_c2p:
-            c2p = _empty_optional(query)
-        elif saved_c2p.numel():
-            c2p = saved_c2p.permute(1, 0, 2, 3)
-        else:
-            c2p = _head_major_scores(query, pos_key)
-        if not has_p2c:
-            p2c = _empty_optional(key)
-        elif saved_p2c.numel():
-            p2c = saved_p2c.permute(1, 0, 2, 3)
-        else:
-            p2c = _head_major_scores(key, pos_query)
+        c2p = _head_major_scores(query, pos_key) if has_c2p else _empty_optional(query)
+        p2c = _head_major_scores(key, pos_query) if has_p2c else _empty_optional(key)
         # One contribution per element needs no FP32 atomics, so use the input dtype.
         gradient_dtype = query.dtype if unique_slots else torch.float32
 
@@ -1643,7 +1614,6 @@ if (
         store_lse: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
-        save_relative_tables: bool,
         unique_slots: bool,
         autotune_bundle_id: int,
         forward_block_m: int,
@@ -1658,7 +1628,7 @@ if (
         dkv_block_n: int,
         dkv_num_warps: int,
         dkv_num_stages: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         del unique_slots
         num_heads, total_tokens, head_dim = query.shape
         batch_size = cu_seqlens.numel() - 1
@@ -1728,8 +1698,7 @@ if (
             **_dropout_launch_options(dropout_p, dropout_seed),
             **launch_options,
         )
-        saved_c2p, saved_p2c = _saved_tables(c2p, p2c, save_relative_tables and store_lse)
-        return output, lse_log2, saved_c2p, saved_p2c
+        return output, lse_log2
 
     @torch.library.triton_op(
         "disentangled_flash::training_attention_packed_backward",
@@ -1753,8 +1722,6 @@ if (
         strict_fp32: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
-        saved_c2p: torch.Tensor,
-        saved_p2c: torch.Tensor,
         unique_slots: bool,
         autotune_bundle_id: int,
         dq_block_m: int,
@@ -1769,18 +1736,8 @@ if (
         num_heads, total_tokens, head_dim = query.shape
         batch_size = cu_seqlens.numel() - 1
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        if not has_c2p:
-            c2p = _empty_optional(query)
-        elif saved_c2p.numel():
-            c2p = saved_c2p
-        else:
-            c2p = torch.matmul(query, pos_key.transpose(-1, -2))
-        if not has_p2c:
-            p2c = _empty_optional(key)
-        elif saved_p2c.numel():
-            p2c = saved_p2c
-        else:
-            p2c = torch.matmul(key, pos_query.transpose(-1, -2))
+        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
+        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
         gradient_dtype = query.dtype if unique_slots else torch.float32
         delta = torch.empty((num_heads, total_tokens), device=query.device, dtype=torch.float32)
         grad_query = torch.empty_like(query)
@@ -1963,7 +1920,6 @@ if (
             store_lse,
             dropout_p,
             dropout_seed,
-            save_relative_tables,
             unique_slots,
             autotune_bundle_id,
             forward_block_m,
@@ -1982,8 +1938,7 @@ if (
         del forward_block_m, forward_block_n, forward_num_warps, forward_num_stages
         if not store_lse:
             raise RuntimeError("differentiable training forward requires STORE_LSE=True")
-        del save_relative_tables
-        attention_output, lse_log2, saved_c2p, saved_p2c = output
+        attention_output, lse_log2 = output
         ctx.unique_slots = unique_slots
         ctx.save_for_backward(
             query,
@@ -1996,8 +1951,6 @@ if (
             attention_output,
             lse_log2,
             dropout_seed,
-            saved_c2p,
-            saved_p2c,
         )
         ctx.dropout_p = dropout_p
         ctx.input_count = len(inputs)
@@ -2013,8 +1966,9 @@ if (
     def _training_attention_autograd_backward(
         ctx: Any,
         grad_output: torch.Tensor,
-        *_unused_grads: torch.Tensor | None,
+        grad_lse: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        del grad_lse
         (
             query,
             key,
@@ -2026,8 +1980,6 @@ if (
             output,
             lse_log2,
             dropout_seed,
-            saved_c2p,
-            saved_p2c,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = _training_attention_backward_op(
             query,
@@ -2047,8 +1999,6 @@ if (
             ctx.strict_fp32,
             ctx.dropout_p,
             dropout_seed,
-            saved_c2p,
-            saved_p2c,
             ctx.unique_slots,
             ctx.autotune_bundle_id,
             *ctx.dq_config,
@@ -2097,7 +2047,6 @@ if (
             store_lse,
             dropout_p,
             dropout_seed,
-            save_relative_tables,
             unique_slots,
             autotune_bundle_id,
             forward_block_m,
@@ -2116,8 +2065,7 @@ if (
         del forward_block_m, forward_block_n, forward_num_warps, forward_num_stages
         if not store_lse:
             raise RuntimeError("differentiable packed training forward requires STORE_LSE=True")
-        del save_relative_tables
-        attention_output, lse_log2, saved_c2p, saved_p2c = output
+        attention_output, lse_log2 = output
         ctx.unique_slots = unique_slots
         ctx.save_for_backward(
             query,
@@ -2130,8 +2078,6 @@ if (
             attention_output,
             lse_log2,
             dropout_seed,
-            saved_c2p,
-            saved_p2c,
         )
         ctx.dropout_p = dropout_p
         ctx.input_count = len(inputs)
@@ -2147,8 +2093,9 @@ if (
     def _training_attention_packed_autograd_backward(
         ctx: Any,
         grad_output: torch.Tensor,
-        *_unused_grads: torch.Tensor | None,
+        grad_lse: torch.Tensor | None,
     ) -> tuple[Any, ...]:
+        del grad_lse
         (
             query,
             key,
@@ -2160,8 +2107,6 @@ if (
             output,
             lse_log2,
             dropout_seed,
-            saved_c2p,
-            saved_p2c,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = (
             _training_attention_packed_backward_op(
@@ -2182,8 +2127,6 @@ if (
                 ctx.strict_fp32,
                 ctx.dropout_p,
                 dropout_seed,
-                saved_c2p,
-                saved_p2c,
                 ctx.unique_slots,
                 ctx.autotune_bundle_id,
                 *ctx.dq_config,
@@ -2234,7 +2177,6 @@ def training_attention(
     dropout_p: float = 0.0,
     dropout_seed: torch.Tensor | None = None,
     unique_slots: bool = False,
-    save_relative_tables: bool = False,
 ) -> torch.Tensor:
     """Differentiable fused attention.
 
@@ -2242,8 +2184,6 @@ def training_attention(
     dropout_p applies attention dropout in the kernels; pass dropout_seed to fix
     the mask. Set unique_slots when every relative distance has its own slot
     (active slots == 2L - 1): backward then writes gradients without atomics.
-    save_relative_tables keeps C2P/P2C for backward instead of recomputing them,
-    trading memory for speed.
     """
 
     _require_training_runtime()
@@ -2306,7 +2246,7 @@ def training_attention(
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
     autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
-    output, *_ = _training_attention_forward_op(
+    output, _lse = _training_attention_forward_op(
         query,
         key,
         value,
@@ -2322,7 +2262,6 @@ def training_attention(
         bool(store_lse),
         float(dropout_p),
         _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
-        bool(save_relative_tables),
         bool(unique_slots),
         autotune_bundle_id,
         *config_values(forward_config),
@@ -2351,7 +2290,6 @@ def training_attention_packed(
     dropout_p: float = 0.0,
     dropout_seed: torch.Tensor | None = None,
     unique_slots: bool = False,
-    save_relative_tables: bool = False,
 ) -> torch.Tensor:
     """Differentiable packed attention over FlashAttention-style boundaries."""
 
@@ -2411,7 +2349,7 @@ def training_attention_packed(
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
     autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
-    output, *_ = _training_attention_packed_forward_op(
+    output, _lse = _training_attention_packed_forward_op(
         query,
         key,
         value,
@@ -2427,7 +2365,6 @@ def training_attention_packed(
         bool(torch.is_grad_enabled()),
         float(dropout_p),
         _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
-        bool(save_relative_tables),
         bool(unique_slots),
         autotune_bundle_id,
         *config_values(forward_config),

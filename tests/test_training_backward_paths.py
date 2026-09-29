@@ -1,4 +1,4 @@
-"""CUDA checks that the atomic-free and saved-table backward paths match the default."""
+"""CUDA check that the atomic-free backward path matches the atomic one."""
 
 from __future__ import annotations
 
@@ -65,13 +65,3 @@ def test_unique_slot_stores_match_atomic_accumulation(dtype):
     torch.testing.assert_close(unique_output, output, **tolerance)
     for actual, expected in zip(unique_gradients, gradients):
         torch.testing.assert_close(actual, expected, **tolerance)
-
-
-@pytest.mark.parametrize("length", [128, 512])
-def test_saved_relative_tables_match_recompute(length):
-    output, gradients, _ = _run(torch.bfloat16, length)
-    saved_output, saved_gradients, _ = _run(torch.bfloat16, length, save_relative_tables=True)
-
-    torch.testing.assert_close(saved_output, output, rtol=0, atol=0)
-    for actual, expected in zip(saved_gradients, gradients):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
