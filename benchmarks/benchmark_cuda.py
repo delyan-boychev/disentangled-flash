@@ -8,6 +8,11 @@ unavailable optional backend remains a result instead of aborting the matrix.
 All inputs are active tokens, so there is no padded/packed layout axis.
 FlashDeBERTa is optional and is exercised through its public single-attention-
 layer class when installed.
+
+Setup that a real encoder does once for all layers (the Hugging Face [B, 1, L, L]
+mask and relative-position matrix) is built before timing. The reported TFLOP/s
+counts only dense QK and PV work, so it is a QK+PV-equivalent rate for the whole
+layer, not hardware utilization.
 """
 
 from __future__ import annotations
@@ -31,6 +36,7 @@ from disentangled_flash._reference import (
     DebertaAttentionConfig,
     OriginalDisentangledSelfAttention,
     _prepare_attention_mask,
+    build_relative_position,
 )
 from disentangled_flash._torch import (
     TorchInferenceDisentangledSelfAttention,
@@ -163,19 +169,35 @@ class AttentionCall(nn.Module):
         self.module = module
         self.expand_mask = expand_mask
 
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Build the per-encoder mask and relative positions once, outside timing."""
+
+        if not self.expand_mask:
+            return attention_mask, None
+        length = hidden_states.size(1)
+        relative_pos = build_relative_position(
+            hidden_states,
+            hidden_states,
+            bucket_size=self.module.position_buckets,
+            max_position=self.module.max_relative_positions,
+        )
+        return _prepare_attention_mask(attention_mask, length, length), relative_pos
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         rel_embeddings: torch.Tensor,
+        relative_pos: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        mask = attention_mask
-        if self.expand_mask:
-            length = hidden_states.size(1)
-            mask = _prepare_attention_mask(mask, length, length)
         return self.module(
             hidden_states,
-            mask,
+            attention_mask,
+            relative_pos=relative_pos,
             rel_embeddings=rel_embeddings,
         )[0]
 
@@ -251,17 +273,18 @@ def _operation(
     attention_mask: torch.Tensor,
     rel_embeddings: torch.Tensor,
     pass_mode: str,
+    relative_pos: torch.Tensor | None = None,
 ):
     if pass_mode == "forward":
         with torch.no_grad():
-            return module(hidden_states, attention_mask, rel_embeddings)
+            return module(hidden_states, attention_mask, rel_embeddings, relative_pos)
     if pass_mode == "forward_backward":
         module.zero_grad(set_to_none=True)
         if hidden_states.grad is not None:
             hidden_states.grad = None
         if rel_embeddings.grad is not None:
             rel_embeddings.grad = None
-        output = module(hidden_states, attention_mask, rel_embeddings)
+        output = module(hidden_states, attention_mask, rel_embeddings, relative_pos)
         output.float().square().mean().backward()
         return output
     raise ValueError(f"operation does not directly handle {pass_mode}")
@@ -330,6 +353,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         dtype=dtype,
         requires_grad=args.pass_mode != "forward",
     )
+    attention_mask, relative_pos = module.prepare(hidden_states, attention_mask)
 
     def operation():
         return _operation(
@@ -338,6 +362,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
             attention_mask,
             rel_embeddings,
             args.pass_mode,
+            relative_pos,
         )
 
     timings = _measure_events(operation, args.warmup, args.iters)
@@ -377,7 +402,10 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         "timings_ms": timings,
         "tokens_per_second": batch_size * args.length * 1000.0 / median_ms,
         "effective_attention_tflops": flops / (median_ms * 1e9),
-        "effective_flops_definition": "dense QK+PV only; relative-bias work excluded",
+        "effective_flops_definition": (
+            "dense QK+PV FLOPs over the whole layer's time; projections and "
+            "relative-bias work are timed but not counted"
+        ),
         "baseline_allocated_bytes": baseline,
         "peak_allocated_bytes": peak,
         "incremental_peak_allocated_bytes": max(0, peak - baseline),
@@ -568,8 +596,8 @@ def main() -> None:
         if result["status"] == "ok":
             print(
                 f"  {result['p50_ms']:.3f} ms  "
-                f"{result['effective_attention_tflops']:.2f} effective TFLOP/s  "
-                f"peak={result['peak_allocated_bytes'] / 1024**3:.3f} GiB",
+                f"{result['effective_attention_tflops']:.2f} QK+PV-equivalent TFLOP/s  "
+                f"incremental peak={result['incremental_peak_allocated_bytes'] / 1024**3:.3f} GiB",
                 flush=True,
             )
         else:

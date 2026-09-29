@@ -361,3 +361,65 @@ def test_mnli_packed_path_runs_classifier_without_padding_attention():
     )
 
     torch.testing.assert_close(logits, torch.tensor([[2.0, 12.0], [4.0, 14.0]]))
+
+
+def test_kernel_benchmark_builds_hugging_face_setup_outside_timing():
+    benchmark = load_benchmark_module()
+    config = benchmark.make_config(64, 0.0)
+    reference = benchmark.OriginalDisentangledSelfAttention(config)
+    call = benchmark.make_module(
+        "base",
+        config,
+        reference.state_dict(),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+        pass_mode="forward",
+        tuning_mode="auto",
+        profile_paths=(),
+    ).eval()
+    hidden = torch.randn(2, 9, config.hidden_size)
+    mask = torch.ones(2, 9, dtype=torch.bool)
+    relative = torch.randn(config.position_buckets * 2, config.hidden_size)
+
+    expanded, relative_pos = call.prepare(hidden, mask)
+
+    assert expanded.shape == (2, 1, 9, 9)
+    assert relative_pos.shape == (1, 9, 9)
+    expected = call.module(
+        hidden,
+        benchmark._prepare_attention_mask(mask, 9, 9),
+        rel_embeddings=relative,
+    )[0]
+    torch.testing.assert_close(call(hidden, expanded, relative, relative_pos), expected)
+
+
+def test_memory_plot_uses_incremental_peak(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "plot_cuda_results", ROOT / "benchmarks" / "plot_cuda_results.py"
+    )
+    assert spec is not None and spec.loader is not None
+    plot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(plot)
+    rows = [
+        {
+            "status": "ok",
+            "implementation": "triton",
+            "pass": pass_mode,
+            "dropout": 0.0,
+            "sequence_length": length,
+            "p50_ms": 1.0,
+            "effective_attention_tflops": 1.0,
+            "peak_allocated_bytes": 8 * plot.GIB,
+            "incremental_peak_allocated_bytes": plot.GIB // 4,
+            "gpu": "GPU",
+        }
+        for pass_mode in ("forward", "forward_backward")
+        for length in (128, 512)
+    ]
+    report = tmp_path / "results.json"
+    report.write_text(json.dumps({"results": rows, "configuration": {}}))
+    frame, configuration = plot.load_results(report)
+
+    assert plot._memory_ticks(frame["incremental_peak_allocated_bytes"] / plot.GIB) == (0.25, 0.5)
+    outputs = plot.make_release_figures(frame, configuration, tmp_path, dpi=40)
+    assert all(path.exists() for path in outputs)

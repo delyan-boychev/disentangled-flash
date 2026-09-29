@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +43,7 @@ def load_results(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "sequence_length",
         "p50_ms",
         "effective_attention_tflops",
-        "peak_allocated_bytes",
+        "incremental_peak_allocated_bytes",
     }
     missing = sorted(required.difference(frame.columns))
     if missing:
@@ -57,6 +58,17 @@ def _length_label(value: int) -> str:
 
 def _memory_label(value: float, _position: int) -> str:
     return f"{value:g}"
+
+
+def _memory_ticks(values: pd.Series) -> tuple[float, ...]:
+    # Powers of two that bracket the data, so small incremental peaks stay visible.
+    positive = values[values > 0]
+    low = 2.0 ** math.floor(math.log2(positive.min())) if not positive.empty else 0.25
+    high = 2.0 ** math.ceil(math.log2(values.max())) if not positive.empty else 32.0
+    ticks = [low]
+    while ticks[-1] < high or len(ticks) < 2:
+        ticks.append(ticks[-1] * 2)
+    return tuple(ticks)
 
 
 def _plot_series(axis: Any, panel: pd.DataFrame, metric: str) -> None:
@@ -120,8 +132,9 @@ def _make_metric_figure(
             axis.set_ylim(bottom=0)
         else:
             axis.set_yscale("log", base=2)
-            axis.set_ylim(0.25, 32)
-            axis.set_yticks((0.25, 0.5, 1, 2, 4, 8, 16, 32))
+            ticks = _memory_ticks(usable[metric])
+            axis.set_ylim(ticks[0], ticks[-1])
+            axis.set_yticks(ticks)
             axis.yaxis.set_major_formatter(FuncFormatter(_memory_label))
 
     axes[0].set_ylabel(ylabel)
@@ -170,7 +183,8 @@ def make_release_figures(
     usable = frame[frame["status"].eq("ok") & frame["dropout"].eq(0.0)].copy()
     if usable.empty:
         raise ValueError("no successful dropout-zero benchmark rows to plot")
-    usable["peak_memory_gib"] = usable["peak_allocated_bytes"] / GIB
+    # Memory above the pre-measurement allocation (weights and inputs excluded).
+    usable["peak_memory_gib"] = usable["incremental_peak_allocated_bytes"] / GIB
 
     plt.rcParams.update(
         {
@@ -196,8 +210,8 @@ def make_release_figures(
         usable,
         configuration,
         metric="effective_attention_tflops",
-        title="Attention kernel speed",
-        ylabel="Speed (TFLOP/s)",
+        title="Attention layer speed",
+        ylabel="QK+PV-equivalent TFLOP/s",
         output_stem="kernel_throughput_h200",
         output_dir=output_dir,
         dpi=dpi,
@@ -206,8 +220,8 @@ def make_release_figures(
         usable,
         configuration,
         metric="peak_memory_gib",
-        title="Attention peak memory",
-        ylabel="Peak memory (GiB, log₂ scale)",
+        title="Attention incremental peak memory",
+        ylabel="Incremental peak memory (GiB, log₂ scale)",
         output_stem="kernel_memory_h200",
         output_dir=output_dir,
         dpi=dpi,

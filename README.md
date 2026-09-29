@@ -104,8 +104,9 @@ lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains exactly
 16,384 active tokens (`batch = 16384 / length`), so there is no batch or
 packed-layout axis. The layer has 12 heads of dimension 64; training uses
 dropout 0. Each case runs in an isolated process with 5 warmups and 25 timed
-iterations, recording median latency, effective attention throughput, and
-incremental peak allocated memory.
+iterations, recording median latency, QK+PV-equivalent throughput, and
+incremental peak allocated memory. The Hugging Face `[B, 1, L, L]` mask and
+relative-position matrix are built once before timing, as a real encoder does.
 
 Generate the throughput and memory plots with:
 
@@ -119,10 +120,10 @@ python -m benchmarks.plot_cuda_results \
 
 Measured on one NVIDIA H200 (SM90), BF16, PyTorch 2.14.0+cu130, Triton 3.8.0,
 CUDA 13.0, and FlashDeBERTa 0.0.7, using the bundled profile in `profile_only`
-mode. Plots show effective attention throughput and incremental peak memory
+mode. Plots show QK+PV-equivalent throughput and incremental peak memory
 across the six sequence lengths at a fixed total of 16,384 tokens per batch:
 
-![Attention kernel effective throughput on H200](docs/figures/kernel_throughput_h200.png)
+![Attention layer QK+PV-equivalent throughput on H200](docs/figures/kernel_throughput_h200.png)
 
 ![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
 
@@ -139,9 +140,9 @@ were:
 At this length DF Triton is 5.54× faster than Hugging Face eager and 1.46×
 faster than FlashDeBERTa for forward; for forward+backward it is 1.34× and
 7.42× faster, respectively. These are attention-layer measurements, not full
-encoder training numbers. Throughput is an effective dense-attention equivalent
-computed from QK and PV matrix-multiply FLOPs; it excludes DeBERTa relative-bias
-work. Timings include each implementation's attention path and are not a
+encoder training numbers. Throughput divides only the dense QK and PV FLOPs by
+the whole layer's time, which also includes the QKV and relative-position
+projections, so it understates GPU utilization, most at short lengths. Timings include each implementation's attention path and are not a
 comparison to plain, no-relative-bias FlashAttention. At short training lengths
 the Triton path is not always fastest (for example, it is slower than the eager
 baseline at lengths 128 and 512).
