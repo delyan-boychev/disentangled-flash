@@ -43,6 +43,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         tuning: KernelTuningOptions | None = None,
         profile_registry: ProfileRegistry | None = None,
         assume_unpadded: bool = False,
+        save_relative_tables: bool = False,
     ) -> None:
         super().__init__(
             config,
@@ -66,6 +67,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         # Workloads whose saved schedule failed; these fall back to autotuning.
         self._failed_profile_workloads: set[WorkloadKey] = set()
         self.attention_probability_dropout = float(config.attention_probs_dropout_prob)
+        # Keep C2P/P2C for backward instead of recomputing them; costs memory.
+        self.save_relative_tables = save_relative_tables
 
     def _resolve_kernel_config(
         self,
@@ -233,6 +236,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
         active_slots = int(plan.active_slots.numel())
+        # One slot per distance lets backward skip atomics; custom positions never do.
+        unique_slots = position_ids is None and active_slots == 2 * sequence_length - 1
         dropout_p = self.attention_probability_dropout if self.training else 0.0
         config_options = {
             "hidden_states": hidden_states,
@@ -262,6 +267,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 dkv_config=dkv_config,
                 autotune_candidates=self.tuning.candidates,
                 dropout_p=dropout_p,
+                unique_slots=unique_slots,
+                save_relative_tables=self.save_relative_tables,
             ),
             config_options,
         )
@@ -314,6 +321,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
         scale_factor = 1 + int(has_c2p) + int(has_p2c)
         score_scale = 1.0 / math.sqrt(self.attention_head_size * scale_factor)
         dropout_p = self.attention_probability_dropout if self.training else 0.0
+        unique_slots = int(plan.active_slots.numel()) == 2 * info.max_seqlen - 1
         config_options = {
             "hidden_states": hidden_states,
             "sequence_length": info.max_seqlen,
@@ -342,6 +350,8 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 dkv_config=dkv_config,
                 autotune_candidates=self.tuning.candidates,
                 dropout_p=dropout_p,
+                unique_slots=unique_slots,
+                save_relative_tables=self.save_relative_tables,
             ),
             config_options,
         )

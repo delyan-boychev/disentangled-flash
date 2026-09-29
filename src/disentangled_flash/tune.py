@@ -270,9 +270,18 @@ def _make_padded_inputs(
     position_plan = position_cache.compact(length, device)
     active_slots = position_plan.active_slots.numel()
     table_width = aligned_slot_count(active_slots)
-    relative_shape = (batch_size, num_heads, length, table_width)
-    c2p = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_c2p else query
-    p2c = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_p2c else key
+    # Head-major storage viewed as [B, H, L, R], as the attention modules produce it.
+    relative_shape = (num_heads, batch_size, length, table_width)
+    c2p = (
+        torch.randn(relative_shape, device=device, dtype=dtype).permute(1, 0, 2, 3)
+        if case.has_c2p
+        else query
+    )
+    p2c = (
+        torch.randn(relative_shape, device=device, dtype=dtype).permute(1, 0, 2, 3)
+        if case.has_p2c
+        else key
+    )
     attention_mask = torch.ones(batch_size, length, device=device, dtype=torch.bool)
     scale_factor = 1 + int(case.has_c2p) + int(case.has_p2c)
     score_scale = (head_dim * scale_factor) ** -0.5
@@ -417,6 +426,7 @@ class TrainingInputs:
     score_scale: float
     dropout_p: float = 0.0
     dropout_seed: torch.Tensor | None = None
+    unique_slots: bool = False
 
     def grad_tensors(self) -> tuple[torch.Tensor, ...]:
         tensors = [self.query, self.key, self.value]
@@ -492,6 +502,7 @@ def _make_training_inputs(
         max_seqlen=case.sequence_length,
         score_scale=(case.head_dim * scale_factor) ** -0.5,
         dropout_p=dropout_p,
+        unique_slots=active_slots == 2 * case.sequence_length - 1,
         # Fixed seed so every candidate sees the reference's mask.
         dropout_seed=(
             torch.tensor([0x1BF52], device=device, dtype=torch.int64) if dropout_p else None
@@ -531,6 +542,7 @@ def _run_training_forward(
         "dkv_config": dkv_config,
         "dropout_p": inputs.dropout_p,
         "dropout_seed": inputs.dropout_seed,
+        "unique_slots": inputs.unique_slots,
     }
     if workload.layout == "packed":
         return training_attention_packed(

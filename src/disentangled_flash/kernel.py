@@ -37,6 +37,36 @@ except ImportError:  # Triton is intentionally optional on CPU and macOS.
     tl = None
 
 
+def _head_major_scores(layer: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Return layer @ table^T as a [B, H, L, R] view of head-major [H, B, L, R] storage.
+
+    With layer a view of the fused QKV output, [H, B * L, D] is a free view, so
+    this is one batched GEMM with no copies and no broadcast over the batch.
+    """
+
+    batch, heads, length, head_dim = layer.shape
+    rows = layer.permute(1, 0, 2, 3).reshape(heads, batch * length, head_dim)
+    scores = torch.bmm(rows, table.transpose(1, 2))
+    return scores.view(heads, batch, length, -1).permute(1, 0, 2, 3)
+
+
+def _relative_strides(
+    c2p: torch.Tensor,
+    p2c: torch.Tensor,
+    has_c2p: bool,
+    has_p2c: bool,
+) -> dict[str, int]:
+    # C2P, P2C and their gradients share one [B, H, L, R] layout.
+    table = c2p if has_c2p else p2c if has_p2c else None
+    if table is None:
+        return {"stride_rb": 0, "stride_rh": 0, "stride_rl": 0}
+    return {
+        "stride_rb": table.stride(0),
+        "stride_rh": table.stride(1),
+        "stride_rl": table.stride(2),
+    }
+
+
 AUTOTUNE_SPECIALIZATION_KEY = (
     "LENGTH_REGIME",
     "HEAD_DIM",
@@ -182,6 +212,9 @@ if triton is not None:
         stride_vh,
         stride_vl,
         stride_vd,
+        stride_rb,
+        stride_rh,
+        stride_rl,
         ACTIVE_SLOTS,
         NUM_HEADS,
         SEQUENCE_LENGTH,
@@ -243,9 +276,9 @@ if triton is not None:
         accumulator = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
 
         if HAS_C2P:
-            c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            c2p_base = c2p + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
         if HAS_P2C:
-            p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            p2c_base = p2c + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
 
         for key_start in tl.range(0, SEQUENCE_LENGTH, BLOCK_N):
             key_start = tl.multiple_of(key_start, BLOCK_N)
@@ -298,14 +331,14 @@ if triton is not None:
 
             if HAS_C2P:
                 scores += tl.load(
-                    c2p_base + query_offsets[:, None] * ACTIVE_SLOTS + local_slot,
+                    c2p_base + query_offsets[:, None] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
 
             if HAS_P2C:
                 scores += tl.load(
-                    p2c_base + key_offsets[None, :] * ACTIVE_SLOTS + local_slot,
+                    p2c_base + key_offsets[None, :] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
@@ -786,6 +819,7 @@ if triton is not None:
             "STRICT_FP32": strict_fp32,
             "STORE_LSE": False,
             "PHYSICAL_PAIRS": False,
+            **_relative_strides(c2p, p2c, has_c2p, has_p2c),
         }
         torch.library.wrap_triton(autotuned_kernel)[grid](
             query,
@@ -927,6 +961,7 @@ if triton is not None:
             STRICT_FP32=strict_fp32,
             STORE_LSE=False,
             PHYSICAL_PAIRS=False,
+            **_relative_strides(c2p, p2c, has_c2p, has_p2c),
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             num_warps=num_warps,
@@ -1681,13 +1716,13 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         if has_c2p:
             if plan.pos_key is None:
                 raise ValueError("prepared Triton plan has no content-to-position keys")
-            c2p = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2))
+            c2p = _head_major_scores(query_layer, plan.pos_key)
         else:
             c2p = query_layer
         if has_p2c:
             if plan.pos_query is None:
                 raise ValueError("prepared Triton plan has no position-to-content queries")
-            p2c = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2))
+            p2c = _head_major_scores(key_layer, plan.pos_query)
         else:
             p2c = key_layer
 

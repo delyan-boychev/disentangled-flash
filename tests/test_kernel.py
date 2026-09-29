@@ -46,3 +46,24 @@ def test_online_softmax_handles_completely_masked_first_tile():
 
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output[:, -1], value[:, 0, -1], rtol=0.0, atol=1e-6)
+
+
+def test_head_major_scores_match_matmul_without_copying_the_input():
+    from disentangled_flash.kernel import _head_major_scores, _relative_strides
+
+    batch, heads, length, head_dim, slots = 3, 4, 5, 8, 16
+    fused = torch.randn(batch, length, 3 * heads * head_dim, dtype=torch.float64)
+    query = fused[..., : heads * head_dim].view(batch, length, heads, head_dim).permute(0, 2, 1, 3)
+    table = torch.randn(heads, slots, head_dim, dtype=torch.float64)
+
+    scores = _head_major_scores(query, table)
+
+    torch.testing.assert_close(scores, torch.matmul(query, table.transpose(-1, -2)))
+    assert scores.permute(1, 0, 2, 3).is_contiguous()
+    strides = _relative_strides(scores, scores, True, True)
+    assert strides == {
+        "stride_rb": length * slots,
+        "stride_rh": batch * length * slots,
+        "stride_rl": slots,
+    }
+    assert _relative_strides(query, query, False, False)["stride_rb"] == 0

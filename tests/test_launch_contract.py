@@ -24,11 +24,18 @@ def test_configured_launcher_passes_all_runtime_strides():
         and any(keyword.arg == "ACTIVE_SLOTS" for keyword in node.keywords)
     )
 
-    runtime_argument_count = next(
-        index for index, argument in enumerate(kernel.args.args) if argument.arg == "ACTIVE_SLOTS"
+    runtime_arguments = [argument.arg for argument in kernel.args.args]
+    runtime_arguments = runtime_arguments[: runtime_arguments.index("ACTIVE_SLOTS")]
+    relative_strides = ["stride_rb", "stride_rh", "stride_rl"]
+    # Relative-table strides are passed by keyword through _relative_strides.
+    assert runtime_arguments[-3:] == relative_strides
+    assert len(call.args) == len(runtime_arguments) - len(relative_strides) == 21
+    assert any(
+        keyword.arg is None
+        and isinstance(keyword.value, ast.Call)
+        and getattr(keyword.value.func, "id", "") == "_relative_strides"
+        for keyword in call.keywords
     )
-    assert runtime_argument_count == 21
-    assert len(call.args) == runtime_argument_count
 
 
 def test_packed_configured_launcher_matches_kernel_runtime_arguments():

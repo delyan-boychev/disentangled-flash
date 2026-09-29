@@ -42,8 +42,10 @@ if triton is not None:
         _deberta_attention_forward_kernel,
         _deberta_attention_packed_forward_kernel,
         _dropout_keep,
+        _head_major_scores,
         _make_autotuned_kernel,
         _make_packed_autotuned_kernel,
+        _relative_strides,
     )
 
     @triton.jit
@@ -131,6 +133,9 @@ if triton is not None:
         stride_dqh,
         stride_dql,
         stride_dqd,
+        stride_rb,
+        stride_rh,
+        stride_rl,
         ACTIVE_SLOTS: tl.constexpr,
         BATCH_SIZE: tl.constexpr,
         NUM_HEADS: tl.constexpr,
@@ -152,6 +157,7 @@ if triton is not None:
         DROPOUT_P=0.0,
         DROPOUT_SCALE=1.0,
         HAS_DROPOUT: tl.constexpr = False,
+        UNIQUE_SLOTS: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -194,10 +200,10 @@ if triton is not None:
 
         dq = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
         if HAS_C2P:
-            c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
-            dc_base = grad_c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            c2p_base = c2p + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
+            dc_base = grad_c2p + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
         if HAS_P2C:
-            p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            p2c_base = p2c + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
 
         for key_start in tl.range(0, SEQUENCE_LENGTH, BLOCK_N):
             key_start = tl.multiple_of(key_start, BLOCK_N)
@@ -244,13 +250,13 @@ if triton is not None:
             ).to(tl.int32)
             if HAS_C2P:
                 scores += tl.load(
-                    c2p_base + rows[:, None] * ACTIVE_SLOTS + local_slot,
+                    c2p_base + rows[:, None] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
             if HAS_P2C:
                 scores += tl.load(
-                    p2c_base + cols[None, :] * ACTIVE_SLOTS + local_slot,
+                    p2c_base + cols[None, :] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
@@ -297,11 +303,19 @@ if triton is not None:
                 dq += tl.dot(ds_raw.to(tl.float16), k)
 
             if HAS_C2P:
-                tl.atomic_add(
-                    dc_base + rows[:, None] * ACTIVE_SLOTS + local_slot,
-                    ds_raw,
-                    mask=score_grad_pair,
-                )
+                # Rows are owned per program; unique slots mean one write per element.
+                if UNIQUE_SLOTS:
+                    tl.store(
+                        dc_base + rows[:, None] * stride_rl + local_slot,
+                        ds_raw.to(dc_base.dtype.element_ty),
+                        mask=score_grad_pair,
+                    )
+                else:
+                    tl.atomic_add(
+                        dc_base + rows[:, None] * stride_rl + local_slot,
+                        ds_raw,
+                        mask=score_grad_pair,
+                    )
 
         tl.store(
             dq_base + rows[:, None] * stride_dql + dims[None, :] * stride_dqd,
@@ -348,6 +362,9 @@ if triton is not None:
         stride_dvh,
         stride_dvl,
         stride_dvd,
+        stride_rb,
+        stride_rh,
+        stride_rl,
         ACTIVE_SLOTS: tl.constexpr,
         BATCH_SIZE: tl.constexpr,
         NUM_HEADS: tl.constexpr,
@@ -369,6 +386,7 @@ if triton is not None:
         DROPOUT_P=0.0,
         DROPOUT_SCALE=1.0,
         HAS_DROPOUT: tl.constexpr = False,
+        UNIQUE_SLOTS: tl.constexpr = False,
     ):
         key_block = tl.program_id(0)
         batch_head = tl.program_id(1)
@@ -411,10 +429,10 @@ if triton is not None:
         dk = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
         dv = tl.zeros([BLOCK_N, HEAD_DIM], dtype=tl.float32)
         if HAS_C2P:
-            c2p_base = c2p + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            c2p_base = c2p + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
         if HAS_P2C:
-            p2c_base = p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
-            dt_base = grad_p2c + batch_head * SEQUENCE_LENGTH * ACTIVE_SLOTS
+            p2c_base = p2c + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
+            dt_base = grad_p2c + batch.to(tl.int64) * stride_rb + head.to(tl.int64) * stride_rh
 
         for query_start in tl.range(0, SEQUENCE_LENGTH, BLOCK_M):
             query_start = tl.multiple_of(query_start, BLOCK_M)
@@ -464,13 +482,13 @@ if triton is not None:
             ).to(tl.int32)
             if HAS_C2P:
                 scores += tl.load(
-                    c2p_base + rows[:, None] * ACTIVE_SLOTS + local_slot,
+                    c2p_base + rows[:, None] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
             if HAS_P2C:
                 scores += tl.load(
-                    p2c_base + cols[None, :] * ACTIVE_SLOTS + local_slot,
+                    p2c_base + cols[None, :] * stride_rl + local_slot,
                     mask=pair_in_bounds,
                     other=0.0,
                 )
@@ -524,11 +542,19 @@ if triton is not None:
                 dv += tl.dot(tl.trans(p_dropped.to(tl.float16)), do)
 
             if HAS_P2C:
-                tl.atomic_add(
-                    dt_base + cols[None, :] * ACTIVE_SLOTS + local_slot,
-                    ds_raw,
-                    mask=score_grad_pair,
-                )
+                # Rows are owned per program; unique slots mean one write per element.
+                if UNIQUE_SLOTS:
+                    tl.store(
+                        dt_base + cols[None, :] * stride_rl + local_slot,
+                        ds_raw.to(dt_base.dtype.element_ty),
+                        mask=score_grad_pair,
+                    )
+                else:
+                    tl.atomic_add(
+                        dt_base + cols[None, :] * stride_rl + local_slot,
+                        ds_raw,
+                        mask=score_grad_pair,
+                    )
 
         tl.store(
             dk_base + cols[:, None] * stride_dkl + dims[None, :] * stride_dkd,
@@ -618,6 +644,7 @@ if triton is not None:
         DROPOUT_P=0.0,
         DROPOUT_SCALE=1.0,
         HAS_DROPOUT: tl.constexpr = False,
+        UNIQUE_SLOTS: tl.constexpr = False,
     ):
         query_block = tl.program_id(0)
         sequence_head = tl.program_id(1)
@@ -730,11 +757,19 @@ if triton is not None:
             else:
                 dq += tl.dot(ds.to(tl.float16), k)
             if HAS_C2P:
-                tl.atomic_add(
-                    dc_base + query_tokens[:, None] * ACTIVE_SLOTS + local_slot,
-                    ds,
-                    mask=pair_mask,
-                )
+                # Rows are owned per program; unique slots mean one write per element.
+                if UNIQUE_SLOTS:
+                    tl.store(
+                        dc_base + query_tokens[:, None] * ACTIVE_SLOTS + local_slot,
+                        ds.to(dc_base.dtype.element_ty),
+                        mask=pair_mask,
+                    )
+                else:
+                    tl.atomic_add(
+                        dc_base + query_tokens[:, None] * ACTIVE_SLOTS + local_slot,
+                        ds,
+                        mask=pair_mask,
+                    )
 
         tl.store(
             dq_base + query_tokens[:, None] * stride_dql + dims[None, :] * stride_dqd,
@@ -792,6 +827,7 @@ if triton is not None:
         DROPOUT_P=0.0,
         DROPOUT_SCALE=1.0,
         HAS_DROPOUT: tl.constexpr = False,
+        UNIQUE_SLOTS: tl.constexpr = False,
     ):
         key_block = tl.program_id(0)
         sequence_head = tl.program_id(1)
@@ -913,11 +949,19 @@ if triton is not None:
                 dk += tl.dot(tl.trans(ds.to(tl.float16)), q)
                 dv += tl.dot(tl.trans(p_dropped.to(tl.float16)), do)
             if HAS_P2C:
-                tl.atomic_add(
-                    dt_base + key_tokens[None, :] * ACTIVE_SLOTS + local_slot,
-                    ds,
-                    mask=pair_mask,
-                )
+                # Rows are owned per program; unique slots mean one write per element.
+                if UNIQUE_SLOTS:
+                    tl.store(
+                        dt_base + key_tokens[None, :] * ACTIVE_SLOTS + local_slot,
+                        ds.to(dt_base.dtype.element_ty),
+                        mask=pair_mask,
+                    )
+                else:
+                    tl.atomic_add(
+                        dt_base + key_tokens[None, :] * ACTIVE_SLOTS + local_slot,
+                        ds,
+                        mask=pair_mask,
+                    )
 
         tl.store(
             dk_base + key_tokens[:, None] * stride_dkl + dims[None, :] * stride_dkd,
@@ -1008,6 +1052,7 @@ if triton is not None:
         "IS_FP32",
         "STRICT_FP32",
         "HAS_DROPOUT",
+        "UNIQUE_SLOTS",
     ]
 
     def _prune_backward_configs(
@@ -1133,6 +1178,28 @@ def _empty_optional(reference: torch.Tensor) -> torch.Tensor:
     return reference.new_empty((0,))
 
 
+def _saved_tables(
+    c2p: torch.Tensor,
+    p2c: torch.Tensor,
+    save: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # Saving C2P/P2C skips their recompute in backward at the cost of memory.
+    if not save:
+        return c2p.new_empty((0,)), p2c.new_empty((0,))
+    return c2p, p2c
+
+
+def _head_rows(layer: torch.Tensor) -> torch.Tensor:
+    # [B, H, L, D] -> [H, B * L, D]; a view for slices of the fused QKV output.
+    batch, heads, length, head_dim = layer.shape
+    return layer.permute(1, 0, 2, 3).reshape(heads, batch * length, head_dim)
+
+
+def _from_head_rows(rows: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+    batch, heads, length, head_dim = like.shape
+    return rows.view(heads, batch, length, head_dim).permute(1, 0, 2, 3)
+
+
 def _dropout_launch_options(dropout_p: float, dropout_seed: torch.Tensor) -> dict[str, Any]:
     has_dropout = dropout_p > 0.0
     return {
@@ -1196,6 +1263,8 @@ if (
         store_lse: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
+        save_relative_tables: bool,
+        unique_slots: bool,
         autotune_bundle_id: int,
         forward_block_m: int,
         forward_block_n: int,
@@ -1209,11 +1278,12 @@ if (
         dkv_block_n: int,
         dkv_num_warps: int,
         dkv_num_stages: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del unique_slots
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
-        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
+        c2p = _head_major_scores(query, pos_key) if has_c2p else _empty_optional(query)
+        p2c = _head_major_scores(key, pos_query) if has_p2c else _empty_optional(key)
         output = torch.empty(
             (batch_size, sequence_length, num_heads * head_dim),
             device=query.device,
@@ -1282,9 +1352,15 @@ if (
             STRICT_FP32=strict_fp32,
             STORE_LSE=store_lse,
             **_dropout_launch_options(dropout_p, dropout_seed),
+            **_relative_strides(c2p, p2c, has_c2p, has_p2c),
             **launch_options,
         )
-        return output, lse_log2
+        saved_c2p, saved_p2c = _saved_tables(
+            c2p.permute(1, 0, 2, 3) if has_c2p else c2p,
+            p2c.permute(1, 0, 2, 3) if has_p2c else p2c,
+            save_relative_tables and store_lse,
+        )
+        return output, lse_log2, saved_c2p, saved_p2c
 
     @torch.library.triton_op(
         "disentangled_flash::training_attention_backward",
@@ -1308,6 +1384,9 @@ if (
         strict_fp32: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
+        saved_c2p: torch.Tensor,
+        saved_p2c: torch.Tensor,
+        unique_slots: bool,
         autotune_bundle_id: int,
         dq_block_m: int,
         dq_block_n: int,
@@ -1320,8 +1399,20 @@ if (
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         batch_size, num_heads, sequence_length, head_dim = query.shape
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
-        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
+        if not has_c2p:
+            c2p = _empty_optional(query)
+        elif saved_c2p.numel():
+            c2p = saved_c2p.permute(1, 0, 2, 3)
+        else:
+            c2p = _head_major_scores(query, pos_key)
+        if not has_p2c:
+            p2c = _empty_optional(key)
+        elif saved_p2c.numel():
+            p2c = saved_p2c.permute(1, 0, 2, 3)
+        else:
+            p2c = _head_major_scores(key, pos_query)
+        # One contribution per element needs no FP32 atomics, so use the input dtype.
+        gradient_dtype = query.dtype if unique_slots else torch.float32
 
         output_heads = output.view(batch_size, sequence_length, num_heads, head_dim).permute(
             0, 2, 1, 3
@@ -1338,24 +1429,26 @@ if (
         grad_query = torch.empty_like(query)
         grad_key = torch.empty_like(key)
         grad_value = torch.empty_like(value)
+        # Head-major [H, B, L, R], like C2P/P2C, so the gradient GEMMs need no copies.
         grad_c2p = (
             torch.zeros(
-                (batch_size, num_heads, sequence_length, active_slots),
+                (num_heads, batch_size, sequence_length, active_slots),
                 device=query.device,
-                dtype=torch.float32,
+                dtype=gradient_dtype,
             )
             if has_c2p
             else torch.empty((0,), device=query.device, dtype=torch.float32)
         )
         grad_p2c = (
             torch.zeros(
-                (batch_size, num_heads, sequence_length, active_slots),
+                (num_heads, batch_size, sequence_length, active_slots),
                 device=query.device,
-                dtype=torch.float32,
+                dtype=gradient_dtype,
             )
             if has_p2c
             else torch.empty((0,), device=query.device, dtype=torch.float32)
         )
+        relative_strides = _relative_strides(c2p, p2c, has_c2p, has_p2c)
 
         fallback = _backward_tile_config(sequence_length, head_dim)
         preprocess_block = dq_block_m or fallback.block_m
@@ -1413,7 +1506,7 @@ if (
             lse_log2,
             delta,
             grad_query,
-            grad_c2p,
+            grad_c2p.permute(1, 0, 2, 3) if has_c2p else grad_c2p,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -1450,6 +1543,8 @@ if (
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(sequence_length),
             **_dropout_launch_options(dropout_p, dropout_seed),
+            **relative_strides,
+            UNIQUE_SLOTS=unique_slots,
             **dq_options,
         )
 
@@ -1481,7 +1576,7 @@ if (
             delta,
             grad_key,
             grad_value,
-            grad_p2c,
+            grad_p2c.permute(1, 0, 2, 3) if has_p2c else grad_p2c,
             query.stride(0),
             query.stride(1),
             query.stride(2),
@@ -1522,6 +1617,8 @@ if (
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(sequence_length),
             **_dropout_launch_options(dropout_p, dropout_seed),
+            **relative_strides,
+            UNIQUE_SLOTS=unique_slots,
             **dkv_options,
         )
         return grad_query, grad_key, grad_value, grad_c2p, grad_p2c
@@ -1546,6 +1643,8 @@ if (
         store_lse: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
+        save_relative_tables: bool,
+        unique_slots: bool,
         autotune_bundle_id: int,
         forward_block_m: int,
         forward_block_n: int,
@@ -1559,7 +1658,8 @@ if (
         dkv_block_n: int,
         dkv_num_warps: int,
         dkv_num_stages: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        del unique_slots
         num_heads, total_tokens, head_dim = query.shape
         batch_size = cu_seqlens.numel() - 1
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
@@ -1628,7 +1728,8 @@ if (
             **_dropout_launch_options(dropout_p, dropout_seed),
             **launch_options,
         )
-        return output, lse_log2
+        saved_c2p, saved_p2c = _saved_tables(c2p, p2c, save_relative_tables and store_lse)
+        return output, lse_log2, saved_c2p, saved_p2c
 
     @torch.library.triton_op(
         "disentangled_flash::training_attention_packed_backward",
@@ -1652,6 +1753,9 @@ if (
         strict_fp32: bool,
         dropout_p: float,
         dropout_seed: torch.Tensor,
+        saved_c2p: torch.Tensor,
+        saved_p2c: torch.Tensor,
+        unique_slots: bool,
         autotune_bundle_id: int,
         dq_block_m: int,
         dq_block_n: int,
@@ -1665,8 +1769,19 @@ if (
         num_heads, total_tokens, head_dim = query.shape
         batch_size = cu_seqlens.numel() - 1
         active_slots = pos_key.size(-2) if has_c2p else pos_query.size(-2) if has_p2c else 0
-        c2p = torch.matmul(query, pos_key.transpose(-1, -2)) if has_c2p else _empty_optional(query)
-        p2c = torch.matmul(key, pos_query.transpose(-1, -2)) if has_p2c else _empty_optional(key)
+        if not has_c2p:
+            c2p = _empty_optional(query)
+        elif saved_c2p.numel():
+            c2p = saved_c2p
+        else:
+            c2p = torch.matmul(query, pos_key.transpose(-1, -2))
+        if not has_p2c:
+            p2c = _empty_optional(key)
+        elif saved_p2c.numel():
+            p2c = saved_p2c
+        else:
+            p2c = torch.matmul(key, pos_query.transpose(-1, -2))
+        gradient_dtype = query.dtype if unique_slots else torch.float32
         delta = torch.empty((num_heads, total_tokens), device=query.device, dtype=torch.float32)
         grad_query = torch.empty_like(query)
         grad_key = torch.empty_like(key)
@@ -1675,7 +1790,7 @@ if (
             torch.zeros(
                 (num_heads, total_tokens, active_slots),
                 device=query.device,
-                dtype=torch.float32,
+                dtype=gradient_dtype,
             )
             if has_c2p
             else torch.empty((0,), device=query.device, dtype=torch.float32)
@@ -1684,7 +1799,7 @@ if (
             torch.zeros(
                 (num_heads, total_tokens, active_slots),
                 device=query.device,
-                dtype=torch.float32,
+                dtype=gradient_dtype,
             )
             if has_p2c
             else torch.empty((0,), device=query.device, dtype=torch.float32)
@@ -1763,6 +1878,7 @@ if (
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(max_seqlen),
             **_dropout_launch_options(dropout_p, dropout_seed),
+            UNIQUE_SLOTS=unique_slots,
             **dq_options,
         )
 
@@ -1825,6 +1941,7 @@ if (
             STRICT_FP32=strict_fp32,
             LENGTH_REGIME=tuning_sequence_length(max_seqlen),
             **_dropout_launch_options(dropout_p, dropout_seed),
+            UNIQUE_SLOTS=unique_slots,
             **dkv_options,
         )
         return grad_query, grad_key, grad_value, grad_c2p, grad_p2c
@@ -1846,6 +1963,8 @@ if (
             store_lse,
             dropout_p,
             dropout_seed,
+            save_relative_tables,
+            unique_slots,
             autotune_bundle_id,
             forward_block_m,
             forward_block_n,
@@ -1863,7 +1982,9 @@ if (
         del forward_block_m, forward_block_n, forward_num_warps, forward_num_stages
         if not store_lse:
             raise RuntimeError("differentiable training forward requires STORE_LSE=True")
-        attention_output, lse_log2 = output
+        del save_relative_tables
+        attention_output, lse_log2, saved_c2p, saved_p2c = output
+        ctx.unique_slots = unique_slots
         ctx.save_for_backward(
             query,
             key,
@@ -1875,6 +1996,8 @@ if (
             attention_output,
             lse_log2,
             dropout_seed,
+            saved_c2p,
+            saved_p2c,
         )
         ctx.dropout_p = dropout_p
         ctx.input_count = len(inputs)
@@ -1890,9 +2013,8 @@ if (
     def _training_attention_autograd_backward(
         ctx: Any,
         grad_output: torch.Tensor,
-        grad_lse: torch.Tensor | None,
+        *_unused_grads: torch.Tensor | None,
     ) -> tuple[Any, ...]:
-        del grad_lse
         (
             query,
             key,
@@ -1904,6 +2026,8 @@ if (
             output,
             lse_log2,
             dropout_seed,
+            saved_c2p,
+            saved_p2c,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = _training_attention_backward_op(
             query,
@@ -1923,6 +2047,9 @@ if (
             ctx.strict_fp32,
             ctx.dropout_p,
             dropout_seed,
+            saved_c2p,
+            saved_p2c,
+            ctx.unique_slots,
             ctx.autotune_bundle_id,
             *ctx.dq_config,
             *ctx.dkv_config,
@@ -1930,15 +2057,15 @@ if (
 
         grad_pos_key = None
         if ctx.has_c2p:
-            grad_c2p_typed = grad_c2p.to(dtype=query.dtype)
-            grad_query = grad_query + torch.matmul(grad_c2p_typed, pos_key)
-            grad_pos_key = torch.matmul(grad_c2p_typed.transpose(-1, -2), query).sum(dim=0)
+            grad_c2p_rows = grad_c2p.to(dtype=query.dtype).flatten(1, 2)
+            grad_query = grad_query + _from_head_rows(torch.bmm(grad_c2p_rows, pos_key), query)
+            grad_pos_key = torch.bmm(grad_c2p_rows.transpose(1, 2), _head_rows(query))
 
         grad_pos_query = None
         if ctx.has_p2c:
-            grad_p2c_typed = grad_p2c.to(dtype=key.dtype)
-            grad_key = grad_key + torch.matmul(grad_p2c_typed, pos_query)
-            grad_pos_query = torch.matmul(grad_p2c_typed.transpose(-1, -2), key).sum(dim=0)
+            grad_p2c_rows = grad_p2c.to(dtype=key.dtype).flatten(1, 2)
+            grad_key = grad_key + _from_head_rows(torch.bmm(grad_p2c_rows, pos_query), key)
+            grad_pos_query = torch.bmm(grad_p2c_rows.transpose(1, 2), _head_rows(key))
 
         gradients = (grad_query, grad_key, grad_value, grad_pos_key, grad_pos_query)
 
@@ -1970,6 +2097,8 @@ if (
             store_lse,
             dropout_p,
             dropout_seed,
+            save_relative_tables,
+            unique_slots,
             autotune_bundle_id,
             forward_block_m,
             forward_block_n,
@@ -1987,7 +2116,9 @@ if (
         del forward_block_m, forward_block_n, forward_num_warps, forward_num_stages
         if not store_lse:
             raise RuntimeError("differentiable packed training forward requires STORE_LSE=True")
-        attention_output, lse_log2 = output
+        del save_relative_tables
+        attention_output, lse_log2, saved_c2p, saved_p2c = output
+        ctx.unique_slots = unique_slots
         ctx.save_for_backward(
             query,
             key,
@@ -1999,6 +2130,8 @@ if (
             attention_output,
             lse_log2,
             dropout_seed,
+            saved_c2p,
+            saved_p2c,
         )
         ctx.dropout_p = dropout_p
         ctx.input_count = len(inputs)
@@ -2014,9 +2147,8 @@ if (
     def _training_attention_packed_autograd_backward(
         ctx: Any,
         grad_output: torch.Tensor,
-        grad_lse: torch.Tensor | None,
+        *_unused_grads: torch.Tensor | None,
     ) -> tuple[Any, ...]:
-        del grad_lse
         (
             query,
             key,
@@ -2028,6 +2160,8 @@ if (
             output,
             lse_log2,
             dropout_seed,
+            saved_c2p,
+            saved_p2c,
         ) = ctx.saved_tensors
         grad_query, grad_key, grad_value, grad_c2p, grad_p2c = (
             _training_attention_packed_backward_op(
@@ -2048,6 +2182,9 @@ if (
                 ctx.strict_fp32,
                 ctx.dropout_p,
                 dropout_seed,
+                saved_c2p,
+                saved_p2c,
+                ctx.unique_slots,
                 ctx.autotune_bundle_id,
                 *ctx.dq_config,
                 *ctx.dkv_config,
@@ -2096,12 +2233,17 @@ def training_attention(
     autotune_candidates: tuple[KernelConfig, ...] | None = None,
     dropout_p: float = 0.0,
     dropout_seed: torch.Tensor | None = None,
+    unique_slots: bool = False,
+    save_relative_tables: bool = False,
 ) -> torch.Tensor:
     """Differentiable fused attention.
 
     query, key and value are [B, H, L, D]; pos_key and pos_query are [H, R, D].
-    Backward recomputes C2P/P2C instead of saving them. dropout_p applies
-    attention dropout in the kernels; pass dropout_seed to fix the mask.
+    dropout_p applies attention dropout in the kernels; pass dropout_seed to fix
+    the mask. Set unique_slots when every relative distance has its own slot
+    (active slots == 2L - 1): backward then writes gradients without atomics.
+    save_relative_tables keeps C2P/P2C for backward instead of recomputing them,
+    trading memory for speed.
     """
 
     _require_training_runtime()
@@ -2164,7 +2306,7 @@ def training_attention(
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
     autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
-    output, _lse = _training_attention_forward_op(
+    output, *_ = _training_attention_forward_op(
         query,
         key,
         value,
@@ -2180,6 +2322,8 @@ def training_attention(
         bool(store_lse),
         float(dropout_p),
         _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
+        bool(save_relative_tables),
+        bool(unique_slots),
         autotune_bundle_id,
         *config_values(forward_config),
         *config_values(dq_config),
@@ -2206,6 +2350,8 @@ def training_attention_packed(
     autotune_candidates: tuple[KernelConfig, ...] | None = None,
     dropout_p: float = 0.0,
     dropout_seed: torch.Tensor | None = None,
+    unique_slots: bool = False,
+    save_relative_tables: bool = False,
 ) -> torch.Tensor:
     """Differentiable packed attention over FlashAttention-style boundaries."""
 
@@ -2265,7 +2411,7 @@ def training_attention_packed(
         return config.block_m, config.block_n, config.num_warps, config.num_stages
 
     autotune_bundle_id = _register_training_autotune_candidates(autotune_candidates)
-    output, _lse = _training_attention_packed_forward_op(
+    output, *_ = _training_attention_packed_forward_op(
         query,
         key,
         value,
@@ -2281,6 +2427,8 @@ def training_attention_packed(
         bool(torch.is_grad_enabled()),
         float(dropout_p),
         _resolve_dropout_seed(query, float(dropout_p), dropout_seed),
+        bool(save_relative_tables),
+        bool(unique_slots),
         autotune_bundle_id,
         *config_values(forward_config),
         *config_values(dq_config),
