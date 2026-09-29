@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch import nn
 
@@ -423,3 +424,63 @@ def test_memory_plot_uses_incremental_peak(tmp_path):
     assert plot._memory_ticks(frame["incremental_peak_allocated_bytes"] / plot.GIB) == (0.25, 0.5)
     outputs = plot.make_release_figures(frame, configuration, tmp_path, dpi=40)
     assert all(path.exists() for path in outputs)
+
+
+def test_round_summary_drops_throttled_rounds_and_flags_drift():
+    benchmark = load_benchmark_module()
+
+    summary = benchmark.summarize_rounds(
+        [([1.0, 1.0], 1980), ([2.0, 2.0], 990), ([1.0, 1.0], 1975)]
+    )
+    assert summary["throttled_rounds"] == 1
+    assert summary["samples_kept"] == 4
+    assert summary["p50_ms"] == 1.0
+    assert summary["stable"]
+
+    drifting = benchmark.summarize_rounds([([1.0] * 4, None), ([1.2] * 4, None)])
+    assert drifting["throttled_rounds"] == 0
+    assert drifting["samples_kept"] == 8
+    assert not drifting["stable"]
+    assert drifting["drift"] == pytest.approx(0.2)
+
+
+def test_cuda_benchmark_defaults_interleave_enough_samples():
+    benchmark = load_benchmark_module()
+    args = benchmark.build_parser().parse_args([])
+
+    assert (args.warmup, args.iters, args.rounds) == (20, 100, 5)
+
+
+def test_benchmark_worker_results_are_merged_per_implementation(monkeypatch):
+    benchmark = load_benchmark_module()
+    args = benchmark.build_parser().parse_args([])
+    worker_output = [
+        {"status": "ok", "implementation": "base", "p50_ms": 1.0},
+        {"status": "oom", "implementation": "triton", "error": "out of memory"},
+    ]
+
+    def fake_run(command, **_kwargs):
+        assert command[command.index("--implementation") + 1 : command.index("--pass-mode")] == [
+            "base",
+            "triton",
+        ]
+        return SimpleNamespace(
+            stdout="noise\n" + benchmark.RESULT_PREFIX + json.dumps(worker_output), stderr=""
+        )
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+    results = benchmark.run_subprocess(args, ["base", "triton"], "forward", 512, 0.0)
+
+    assert [result["implementation"] for result in results] == ["base", "triton"]
+    assert all(
+        result["sequence_length"] == 512 and result["batch_size"] == 32 for result in results
+    )
+    assert results[1]["status"] == "oom"
+
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="Segmentation fault"),
+    )
+    crashed = benchmark.run_subprocess(args, ["base", "triton"], "forward", 512, 0.0)
+    assert [result["status"] for result in crashed] == ["worker_crash", "worker_crash"]
