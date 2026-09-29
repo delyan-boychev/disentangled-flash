@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 from torch import nn
 
@@ -438,12 +437,13 @@ def test_sample_summary_reports_robust_statistics():
     assert summary["p90_ms"] == 10.0
 
 
-def test_cuda_benchmark_defaults_to_do_bench_with_repeats():
+def test_cuda_benchmark_defaults_to_flash_attention_3_timing():
     benchmark = load_benchmark_module()
     args = benchmark.build_parser().parse_args([])
 
     assert args.timer == "do_bench"
-    assert (args.warmup, args.rep_ms, args.repeats, args.cooldown_s) == (20, 500.0, 3, 1.0)
+    assert (args.warmup_ms, args.rep_ms, args.cooldown_s) == (3.0, 30.0, 1.0)
+    assert not hasattr(args, "repeats")
     assert benchmark.build_parser().parse_args(["--timer", "cudagraph"]).timer == "cudagraph"
 
 
@@ -473,28 +473,6 @@ def test_each_configuration_runs_in_its_own_process(monkeypatch):
         lambda *_a, **_k: SimpleNamespace(stdout="", stderr="CUDA out of memory"),
     )
     assert benchmark.run_subprocess(args, "base", "forward", 512)["status"] == "oom"
-
-
-def test_repeats_combine_to_the_median_run():
-    benchmark = load_benchmark_module()
-
-    def run(p50):
-        return {
-            "status": "ok",
-            "p50_ms": p50,
-            "min_ms": p50 - 0.1,
-            "tokens_per_second": 1000.0 / p50,
-            "effective_attention_tflops": 10.0 / p50,
-        }
-
-    combined = benchmark.combine_repeats([run(2.0), run(1.0), run(1.1), {"status": "oom"}])
-
-    assert combined["p50_ms"] == 1.1
-    assert combined["min_ms"] == pytest.approx(0.9)
-    assert combined["repeat_p50_ms"] == [2.0, 1.0, 1.1]
-    assert combined["repeat_spread"] == pytest.approx(1.0)
-    assert (combined["repeats"], combined["failed_repeats"]) == (4, 1)
-    assert combined["tokens_per_second"] == pytest.approx(1000.0 / 1.1)
 
 
 def test_backward_pass_replays_one_forward_graph():

@@ -6,9 +6,9 @@ is timed on its own by running forward once and replaying
 ``out.backward(grad, retain_graph=True)``.
 
 Every configuration runs in its own process, so an OOM or a missing optional
-backend is recorded instead of aborting the matrix. The matrix repeats with the
-implementation order rotated, with a short pause between processes so the GPU
-doesn't carry power throttling from one run into the next.
+backend is recorded instead of aborting the matrix. Timing follows
+FlashAttention 3: do_bench with 3 ms warmup and 30 ms of timing, and a 1 s pause
+between processes so the GPU doesn't carry power throttling into the next run.
 
 Two timers:
   do_bench   eager, L2 flushed before each iteration. Includes Python and
@@ -319,13 +319,13 @@ def _gc_paused(run):
             gc.enable()
 
 
-def _measure(operation, timer: str, rep_ms: float) -> list[float]:
+def _measure(operation, timer: str, warmup_ms: float, rep_ms: float) -> list[float]:
     from triton.testing import do_bench, do_bench_cudagraph
 
     if timer == "cudagraph":
         run = lambda: do_bench_cudagraph(operation, rep=rep_ms, return_mode="all")
     else:
-        run = lambda: do_bench(operation, warmup=0, rep=rep_ms, return_mode="all")
+        run = lambda: do_bench(operation, warmup=warmup_ms, rep=rep_ms, return_mode="all")
     return [float(sample) for sample in _gc_paused(run)]
 
 
@@ -362,16 +362,16 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("BF16 is not supported by this GPU")
 
     operation, clear_gradients, batch_size, num_heads = _prepare_case(args, device, dtype)
-    for _ in range(args.warmup):
-        operation()
-    # do_bench allocates its L2-flush buffer on first use; get that out of the
-    # way so the allocator counters below only see the implementation.
-    _measure(operation, "do_bench", 10.0)
+    # One untimed call pays for Triton compilation and lazy setup. do_bench
+    # allocates its L2-flush buffer on first use, so do that here too; the
+    # allocator counters below then only see the implementation.
+    operation()
+    _measure(operation, "do_bench", 0.0, 1.0)
     torch.cuda.synchronize()
 
     before = torch.cuda.memory_stats(device_index)
     try:
-        samples = _measure(operation, args.timer, args.rep_ms)
+        samples = _measure(operation, args.timer, args.warmup_ms, args.rep_ms)
     except torch.cuda.OutOfMemoryError:
         raise
     except Exception as exc:  # graph capture fails on host syncs
@@ -433,7 +433,7 @@ def run_subprocess(
         ("--head-dim", args.head_dim),
         ("--dtype", args.dtype),
         ("--timer", args.timer),
-        ("--warmup", args.warmup),
+        ("--warmup-ms", args.warmup_ms),
         ("--rep-ms", args.rep_ms),
         ("--device", args.device),
         ("--seed", args.seed),
@@ -467,31 +467,6 @@ def run_subprocess(
     return {**common, "status": status, "error": error[-4000:]}
 
 
-def combine_repeats(runs: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge one configuration's repeats: the median of the per-run medians."""
-
-    ok = [run for run in runs if run.get("status") == "ok"]
-    if not ok:
-        return runs[-1]
-    medians = [run["p50_ms"] for run in ok]
-    p50 = statistics.median(medians)
-    combined = dict(min(ok, key=lambda run: abs(run["p50_ms"] - p50)))
-    scale = combined["p50_ms"] / p50
-    combined.update(
-        {
-            "p50_ms": p50,
-            "min_ms": min(run["min_ms"] for run in ok),
-            "repeat_p50_ms": medians,
-            "repeat_spread": max(medians) / min(medians) - 1.0,
-            "repeats": len(runs),
-            "failed_repeats": len(runs) - len(ok),
-            "tokens_per_second": combined["tokens_per_second"] * scale,
-            "effective_attention_tflops": combined["effective_attention_tflops"] * scale,
-        }
-    )
-    return combined
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument(
@@ -508,14 +483,9 @@ def build_parser() -> argparse.ArgumentParser:
         default="do_bench",
         help="do_bench is eager with L2 flushes; cudagraph removes host overhead.",
     )
-    parser.add_argument("--warmup", type=int, default=20, help="Untimed warmup iterations.")
-    parser.add_argument("--rep-ms", type=float, default=500.0, help="Timed ms per run.")
-    parser.add_argument(
-        "--repeats",
-        type=int,
-        default=3,
-        help="Run the matrix this many times, rotating the implementation order.",
-    )
+    # FlashAttention 3's settings: do_bench(warmup=3, rep=30), 1 s between runs.
+    parser.add_argument("--warmup-ms", type=float, default=3.0, help="do_bench warmup time.")
+    parser.add_argument("--rep-ms", type=float, default=30.0, help="do_bench timed time.")
     parser.add_argument(
         "--cooldown-s", type=float, default=1.0, help="Pause between worker processes."
     )
@@ -576,8 +546,8 @@ def main() -> None:
         print(RESULT_PREFIX + json.dumps(result))
         return
 
-    if args.repeats < 1 or args.rep_ms <= 0 or args.cooldown_s < 0:
-        raise SystemExit("--repeats and --rep-ms must be positive, --cooldown-s non-negative")
+    if args.rep_ms <= 0 or args.warmup_ms < 0 or args.cooldown_s < 0:
+        raise SystemExit("--rep-ms must be positive, --warmup-ms and --cooldown-s non-negative")
     if args.total_tokens < 1 or any(length < 1 for length in args.lengths):
         raise SystemExit("lengths and --total-tokens must be positive")
     output = Path(args.output)
@@ -592,9 +562,8 @@ def main() -> None:
             "head_dim",
             "dtype",
             "timer",
-            "warmup",
+            "warmup_ms",
             "rep_ms",
-            "repeats",
             "cooldown_s",
             "device",
             "seed",
@@ -608,41 +577,23 @@ def main() -> None:
         "environment": collect_environment(),
         "configuration": configuration,
         "results": results,
-        "runs": [],
     }
-    groups = [(pass_mode, length) for pass_mode in args.passes for length in args.lengths]
-    runs: dict[tuple[str, str, int], list[dict[str, Any]]] = {}
-    total = len(groups) * len(args.implementations) * args.repeats
-    step = 0
-    for repeat in range(args.repeats):
-        shift = repeat % len(args.implementations)
-        order = args.implementations[shift:] + args.implementations[:shift]
-        for pass_mode, length in groups:
-            for implementation in order:
-                if step:
-                    time.sleep(args.cooldown_s)
-                step += 1
-                result = run_subprocess(args, implementation, pass_mode, length)
-                runs.setdefault((implementation, pass_mode, length), []).append(result)
-                payload["runs"].append({**result, "repeat": repeat})
-                write_json(output, payload)
-                print(
-                    f"[{step:03d}/{total:03d}] repeat {repeat + 1} {implementation:13} "
-                    f"{pass_mode:16} B={result['batch_size']} L={length}  {_describe(result)}",
-                    flush=True,
-                )
-
-    for pass_mode, length in groups:
-        for implementation in args.implementations:
-            results.append(combine_repeats(runs[(implementation, pass_mode, length)]))
-    write_json(output, payload)
-    print()
-    for result in results:
-        repeats = result.get("repeat_p50_ms")
+    cases = [
+        (pass_mode, length, implementation)
+        for pass_mode in args.passes
+        for length in args.lengths
+        for implementation in args.implementations
+    ]
+    for step, (pass_mode, length, implementation) in enumerate(cases, start=1):
+        if step > 1:
+            time.sleep(args.cooldown_s)
+        result = run_subprocess(args, implementation, pass_mode, length)
+        results.append(result)
+        write_json(output, payload)
         print(
-            f"{result['implementation']:13} {result['pass']:16} L={result['sequence_length']:5} "
-            f"{_describe(result)}"
-            + (f"  repeats {', '.join(f'{value:.3f}' for value in repeats)}" if repeats else "")
+            f"[{step:03d}/{len(cases):03d}] {implementation:13} {pass_mode:16} "
+            f"B={result['batch_size']} L={length}  {_describe(result)}",
+            flush=True,
         )
     print(f"Wrote {output.resolve()}")
 

@@ -106,11 +106,11 @@ packed-layout axis. The layer has 12 heads of dimension 64 and no dropout.
 As in FlashAttention, backward is timed on its own: forward runs once, then
 `out.backward(grad, retain_graph=True)` is replayed.
 
-Every configuration runs in its own process, with a one-second pause between
-processes: 20 warmup iterations, then Triton's `do_bench` for 500 ms, which
-flushes the L2 cache before each iteration. The garbage collector is paused
-while timing. The matrix runs three times with the implementation order
-rotated, and each result is the median of the three runs' medians.
+Timing follows FlashAttention 3. Every configuration runs once in its own
+process: one untimed call for compilation and setup, then Triton's `do_bench`
+with 3 ms warmup and 30 ms of timing, which flushes the L2 cache before each
+iteration, and a one-second pause before the next process. The garbage
+collector is paused while timing.
 
 The default timer is eager, so it includes Python, autograd and kernel-launch
 cost. For short training steps that cost is larger than the GPU work for every

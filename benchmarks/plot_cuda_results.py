@@ -165,8 +165,7 @@ def _make_metric_figure(
             f"{configuration.get('dtype', 'bf16').upper()}   ·   head dimension "
             f"{configuration.get('head_dim', 64)}   ·   "
             f"batch × length = {configuration.get('total_tokens', 16384):,} tokens   ·   "
-            f"{configuration.get('timer', 'do_bench')} timer, median of "
-            f"{configuration.get('repeats', 1)} runs"
+            f"median, {configuration.get('timer', 'do_bench')} timer"
         ),
         ha="center",
         fontsize=9.5,
