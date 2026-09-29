@@ -284,10 +284,17 @@ REGISTER_BUDGET = 160
 
 @dataclass(frozen=True)
 class DeviceResources:
-    """Per-block limits reported by the GPU."""
+    """What the heuristic needs to know about a GPU, read from the device."""
 
     shared_memory_per_block: int
     multiprocessor_count: int
+    compute_capability: tuple[int, int] = (8, 0)
+
+    @property
+    def pipelines_loads(self) -> bool:
+        # Asynchronous global-to-shared copies, which multi-stage pipelines need,
+        # arrived with compute capability 8.0.
+        return self.compute_capability >= (8, 0)
 
     @classmethod
     def current(cls, device: torch.device | str | int | None = None) -> DeviceResources:
@@ -311,6 +318,7 @@ def _device_resources(index: int) -> DeviceResources:
     return DeviceResources(
         shared_memory_per_block=int(shared_memory),
         multiprocessor_count=int(properties.multi_processor_count),
+        compute_capability=(properties.major, properties.minor),
     )
 
 
@@ -381,13 +389,16 @@ def hardware_safe_candidates(
     return kept or (KernelConfig(16, 16, 4),)
 
 
+# Always fits: about 35 KB at worst (FP32, head dim 128, dK/dV), under the
+# 48 KB every CUDA GPU allows per block.
+HEURISTIC_FLOOR = KernelConfig(16, 16, 4)
+
+
 def _base_heuristic(phase: str, sequence_length: int, dtype: str) -> KernelConfig:
-    # Defaults from the most common H200 winners; the caller fits them to the device.
+    # Configs that win when the GPU is saturated; smaller batches shrink them later.
     fp32 = tuning_dtype(dtype) == "float32"
     if phase in FORWARD_PHASES:
         if sequence_length <= 128:
-            return KernelConfig(16, 32, 2)
-        if sequence_length <= 1024:
             return KernelConfig(32, 64, 4)
         return KernelConfig(64, 64, 4)
     if phase == "backward_dq":
@@ -400,6 +411,8 @@ def _base_heuristic(phase: str, sequence_length: int, dtype: str) -> KernelConfi
 
 
 def _shrink(config: KernelConfig) -> KernelConfig:
+    if config.num_stages > 1:
+        return replace(config, num_stages=config.num_stages - 1)
     if config.block_m >= config.block_n and config.block_m > 16:
         return replace(config, block_m=config.block_m // 2)
     if config.block_n > 16:
@@ -417,12 +430,24 @@ def heuristic_config(
     batch_heads: int | None,
     resources: DeviceResources,
 ) -> KernelConfig:
-    """Pick a config without benchmarking: shrink to fit, then split tiles if SMs sit idle.
+    """Pick a config without benchmarking, from the workload and the GPU's limits.
 
-    batch_heads=None (a symbolic batch under torch.compile) skips the split.
+    batch_heads=None (a symbolic batch under torch.compile) skips the SM split.
     """
 
-    config = _base_heuristic(phase, tuning_sequence_length(sequence_length), dtype)
+    length = tuning_sequence_length(sequence_length)
+    config = _base_heuristic(phase, length, dtype)
+    if head_dim >= 128 and config.block_m * config.block_n > 256:
+        config = _shrink(config)
+    # Two stages help forward once there are several K/V tiles to stream.
+    if (
+        phase in FORWARD_PHASES
+        and tuning_dtype(dtype) == "half"
+        and resources.pipelines_loads
+        and length > 128
+    ):
+        config = replace(config, num_stages=2)
+
     while config != _shrink(config) and not (
         fits_device(config, phase=phase, head_dim=head_dim, dtype=dtype, resources=resources)
         and estimate_registers(config, phase=phase, head_dim=head_dim) <= REGISTER_BUDGET

@@ -805,8 +805,15 @@ def test_fp32_searches_only_conservative_single_stage_schedules():
     ) == (KernelConfig(32, 32, 4),)
 
 
-H200 = DeviceResources(shared_memory_per_block=232448, multiprocessor_count=132)
-SMALL_GPU = DeviceResources(shared_memory_per_block=65536, multiprocessor_count=40)
+H200 = DeviceResources(
+    shared_memory_per_block=232448, multiprocessor_count=132, compute_capability=(9, 0)
+)
+SMALL_GPU = DeviceResources(
+    shared_memory_per_block=65536, multiprocessor_count=40, compute_capability=(7, 5)
+)
+MINIMUM_GPU = DeviceResources(
+    shared_memory_per_block=48 * 1024, multiprocessor_count=16, compute_capability=(7, 0)
+)
 
 
 def test_shared_memory_filter_drops_large_tiles_on_small_gpus():
@@ -852,7 +859,7 @@ def test_heuristic_always_returns_a_safe_config(resources, phase, dtype, length)
         assert config in hardware_safe_candidates(
             (config,), phase=phase, head_dim=head_dim, dtype=dtype, resources=resources
         )
-        assert config.num_stages == 1
+        assert config.num_stages <= 2
 
 
 def test_heuristic_splits_tiles_when_the_launch_underfills_the_gpu():
@@ -866,7 +873,7 @@ def test_heuristic_splits_tiles_when_the_launch_underfills_the_gpu():
     saturated = heuristic_config(batch_heads=24, **options)
     underfilled = heuristic_config(batch_heads=1, **options)
 
-    assert saturated == KernelConfig(64, 64, 4)
+    assert saturated == KernelConfig(64, 64, 4, 2)
     assert underfilled.block_m < saturated.block_m
 
 
@@ -1011,3 +1018,73 @@ def test_config_resolution_compiles_with_fullgraph_and_one_graph_per_family(monk
 
     # 100 and 120 share the 128 family and the batch never recompiles; 700 is new.
     assert counter.frame_count == 2
+
+
+@pytest.mark.parametrize("phase", ["inference", "training_forward", "backward_dq", "backward_dkv"])
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
+def test_heuristic_floor_fits_the_smallest_cuda_gpu(phase, dtype):
+    from disentangled_flash.tuning import HEURISTIC_FLOOR
+
+    assert fits_device(
+        HEURISTIC_FLOOR, phase=phase, head_dim=128, dtype=dtype, resources=MINIMUM_GPU
+    )
+    for length in (64, 512, 8192):
+        config = heuristic_config(
+            phase=phase,
+            sequence_length=length,
+            head_dim=128,
+            dtype=dtype,
+            batch_heads=384,
+            resources=MINIMUM_GPU,
+        )
+        assert fits_device(config, phase=phase, head_dim=128, dtype=dtype, resources=MINIMUM_GPU)
+
+
+def test_heuristic_pipelines_only_where_the_hardware_supports_it():
+    def forward(dtype, resources, length=2048):
+        return heuristic_config(
+            phase="inference",
+            sequence_length=length,
+            head_dim=64,
+            dtype=dtype,
+            batch_heads=96,
+            resources=resources,
+        )
+
+    assert forward("bfloat16", H200).num_stages == 2
+    assert forward("bfloat16", SMALL_GPU).num_stages == 1  # no async copies before sm80
+    assert forward("float32", H200).num_stages == 1
+    assert forward("bfloat16", H200, length=128).num_stages == 1
+    backward = heuristic_config(
+        phase="backward_dq",
+        sequence_length=2048,
+        head_dim=64,
+        dtype="bfloat16",
+        batch_heads=96,
+        resources=H200,
+    )
+    assert backward.num_stages == 1
+
+
+def test_heuristic_matches_the_h200_profile_for_saturated_inference():
+    profile = load_bundled_profiles()[0]
+    for length in (512, 1024, 2048, 4096, 8192):
+        entry = next(
+            entry
+            for entry in profile.entries
+            if entry.workload.phase == "inference"
+            and entry.workload.sequence_length == length
+            and entry.workload.dtype == "half"
+            and entry.workload.batch_heads == 32
+            and entry.workload.layout == "padded"
+            and not entry.workload.uses_padding_mask
+        )
+        config = heuristic_config(
+            phase="inference",
+            sequence_length=length,
+            head_dim=64,
+            dtype="bfloat16",
+            batch_heads=16384 // length * 12,
+            resources=H200,
+        )
+        assert config == entry.config
