@@ -102,7 +102,7 @@ Hugging Face eager, DF PyTorch, DF Triton, and FlashDeBERTa. It measures
 inference forward and training forward+backward in BF16 at
 lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains approximately
 16k active tokens (`batch = max(1, 16384 // length)`), so there is no batch or
-packed-layout axis. Training is measured with dropout 0 and 0.1. Each case runs
+packed-layout axis. Training is measured with dropout 0. Each case runs
 in an isolated process and records latency, effective attention throughput,
 peak memory, OOMs, and unavailable optional backends.
 

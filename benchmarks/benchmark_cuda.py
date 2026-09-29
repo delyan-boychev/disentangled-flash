@@ -180,6 +180,14 @@ class AttentionCall(nn.Module):
         )[0]
 
 
+def _flashdeberta_config_kwargs(config: DebertaAttentionConfig) -> dict[str, Any]:
+    values = dict(config.__dict__)
+    pos_att_type = values.get("pos_att_type")
+    if isinstance(pos_att_type, tuple):
+        values["pos_att_type"] = list(pos_att_type)
+    return values
+
+
 def _make_flashdeberta(config: DebertaAttentionConfig) -> nn.Module:
     try:
         from flashdeberta.model import FlashDisentangledSelfAttention
@@ -188,7 +196,7 @@ def _make_flashdeberta(config: DebertaAttentionConfig) -> nn.Module:
         raise ModuleNotFoundError(
             "FlashDeBERTa is not installed; install the benchmark extra"
         ) from exc
-    flash_config = DebertaV2Config(**config.__dict__)
+    flash_config = DebertaV2Config(**_flashdeberta_config_kwargs(config))
     return FlashDisentangledSelfAttention(flash_config)
 
 
@@ -463,7 +471,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--training-dropouts",
         nargs="+",
         type=float,
-        default=[0.0, 0.1],
+        default=[0.0],
         help="Dropout values for training passes; inference forward always uses zero.",
     )
     parser.add_argument("--warmup", type=int, default=5)

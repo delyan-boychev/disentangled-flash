@@ -64,7 +64,16 @@ def test_cuda_benchmark_defaults_to_constant_token_kernel_matrix():
     assert args.total_tokens == 16_384
     assert args.head_dim == 64
     assert args.dtype == "bf16"
-    assert args.training_dropouts == [0.0, 0.1]
+    assert args.training_dropouts == [0.0]
+
+
+def test_flashdeberta_config_uses_transformers_compatible_position_types():
+    benchmark = load_benchmark_module()
+    config = benchmark.make_config(64, 0.0)
+
+    values = benchmark._flashdeberta_config_kwargs(config)
+
+    assert values["pos_att_type"] == ["p2c", "c2p"]
 
 
 def test_cuda_benchmark_uses_constant_token_batches_and_reports_effective_flops():
