@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 
-from benchmarks.benchmark_cuda import (
+from benchmarks.benchmark_encoder import (
     compile_isolated,
     configure_fp32,
     initialize_parameters,
@@ -27,7 +27,7 @@ from disentangled_flash._reference import (
 )
 from disentangled_flash._torch import TorchInferenceDisentangledSelfAttention
 from disentangled_flash._validation import require_finite
-from disentangled_flash.kernel import TritonInferenceDisentangledSelfAttention
+from disentangled_flash.kernel import InferenceDisentangledSelfAttention
 
 DTYPES = {
     "fp16": torch.float16,
@@ -113,7 +113,7 @@ def build_pair(
     reference = OriginalDisentangledSelfAttention(config)
     initialize_parameters(reference, seed)
     if backend == "triton":
-        target = TritonInferenceDisentangledSelfAttention(
+        target = InferenceDisentangledSelfAttention(
             config,
             fp32_precision=fp32_precision,
             assume_unpadded=assume_unpadded,
