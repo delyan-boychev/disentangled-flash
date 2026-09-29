@@ -1088,3 +1088,27 @@ def test_heuristic_matches_the_h200_profile_for_saturated_inference():
             resources=H200,
         )
         assert config == entry.config
+
+
+@pytest.mark.parametrize(
+    ("phase", "length", "expected"),
+    [
+        # Best or near-best in H200 sweeps at the benchmark shapes.
+        ("training_forward", 128, KernelConfig(64, 64, 4, 2)),
+        ("training_forward", 512, KernelConfig(64, 64, 4, 2)),
+        ("backward_dq", 128, KernelConfig(64, 32, 4)),
+        ("backward_dq", 512, KernelConfig(32, 32, 4)),
+        ("backward_dkv", 128, KernelConfig(16, 16, 4)),
+        ("backward_dkv", 512, KernelConfig(16, 16, 4)),
+    ],
+)
+def test_heuristic_training_configs_at_saturated_shapes(phase, length, expected):
+    config = heuristic_config(
+        phase=phase,
+        sequence_length=length,
+        head_dim=64,
+        dtype="bfloat16",
+        batch_heads=16384 // length * 12,
+        resources=H200,
+    )
+    assert config == expected

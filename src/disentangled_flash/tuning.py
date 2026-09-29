@@ -397,15 +397,17 @@ HEURISTIC_FLOOR = KernelConfig(16, 16, 4)
 def _base_heuristic(phase: str, sequence_length: int, dtype: str) -> KernelConfig:
     # Configs that win when the GPU is saturated; smaller batches shrink them later.
     fp32 = tuning_dtype(dtype) == "float32"
+    if phase == "inference" and sequence_length <= 128:
+        return KernelConfig(32, 64, 4)
     if phase in FORWARD_PHASES:
-        if sequence_length <= 128:
-            return KernelConfig(32, 64, 4)
         return KernelConfig(64, 64, 4)
     if phase == "backward_dq":
         if fp32:
             return KernelConfig(32, 32, 4)
-        if 512 <= sequence_length <= 2048:
-            return KernelConfig(32, 64, 4)
+        if sequence_length <= 128:
+            return KernelConfig(64, 32, 4)
+        if sequence_length <= 4096:
+            return KernelConfig(32, 32, 4)
         return KernelConfig(16, 16, 4)
     return KernelConfig(16, 16, 4)
 
@@ -444,7 +446,7 @@ def heuristic_config(
         phase in FORWARD_PHASES
         and tuning_dtype(dtype) == "half"
         and resources.pipelines_loads
-        and length > 128
+        and (length > 128 or phase == "training_forward")
     ):
         config = replace(config, num_stages=2)
 
