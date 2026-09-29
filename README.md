@@ -100,19 +100,51 @@ python -m benchmarks.benchmark_cuda \
 The release matrix compares one DeBERTa-v3-base-shaped attention layer across
 Hugging Face eager, DF PyTorch, DF Triton, and FlashDeBERTa. It measures
 inference forward and training forward+backward in BF16 at
-lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains approximately
-16k active tokens (`batch = max(1, 16384 // length)`), so there is no batch or
-packed-layout axis. Training is measured with dropout 0. Each case runs
-in an isolated process and records latency, effective attention throughput,
-peak memory, OOMs, and unavailable optional backends.
+lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains exactly
+16,384 active tokens (`batch = 16384 / length`), so there is no batch or
+packed-layout axis. The layer has 12 heads of dimension 64; training uses
+dropout 0. Each case runs in an isolated process with 5 warmups and 25 timed
+iterations, recording median latency, effective attention throughput, and
+incremental peak allocated memory.
 
-Generate latency and memory plots with:
+Generate the throughput and memory plots with:
 
 ```bash
 python -m benchmarks.plot_cuda_results \
   attention_kernel_results.json \
   --output-dir benchmarks/results/kernel
 ```
+
+### H200 kernel results
+
+Measured on one NVIDIA H200 (SM90), BF16, PyTorch 2.14.0+cu130, Triton 3.8.0,
+CUDA 13.0, and FlashDeBERTa 0.0.7, using the bundled profile in `profile_only`
+mode. The benchmark commit was `bfd3e11`. Plots show all six sequence lengths
+and the constant-token batch schedule:
+
+![Attention kernel effective throughput on H200](docs/figures/kernel_throughput_h200.png)
+
+![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
+
+At length 8192 (batch 2), the measured p50 latency and effective throughput
+were:
+
+| Implementation | Forward p50 | Forward TFLOP/s | Forward + backward p50 | Forward + backward TFLOP/s |
+| --- | ---: | ---: | ---: | ---: |
+| Hugging Face eager | 47.40 ms | 8.7 | 119.30 ms | 12.1 |
+| DF PyTorch | 26.33 ms | 15.7 | 153.84 ms | 9.4 |
+| DF Triton | 8.55 ms | 48.2 | 88.91 ms | 16.2 |
+| FlashDeBERTa | 12.45 ms | 33.1 | 659.45 ms | 2.2 |
+
+At this length DF Triton is 5.54× faster than Hugging Face eager and 1.46×
+faster than FlashDeBERTa for forward; for forward+backward it is 1.34× and
+7.42× faster, respectively. These are attention-layer measurements, not full
+encoder training numbers. Throughput is an effective dense-attention equivalent
+computed from QK and PV matrix-multiply FLOPs; it excludes DeBERTa relative-bias
+work. Timings include each implementation's attention path and are not a
+comparison to plain, no-relative-bias FlashAttention. At short training lengths
+the Triton path is not always fastest (for example, it is slower than the eager
+baseline at lengths 128 and 512).
 
 ### Kernel tuning profiles
 
@@ -224,6 +256,25 @@ python -m benchmarks.evaluate_mnli \
   --output mnli_parity.json
 ```
 
+### H200 MNLI decision parity
+
+The full `validation_matched` split (9,815 examples; DeBERTa-v2-xlarge-MNLI)
+was evaluated in FP16 at batch size 16 using the bundled H200 profile. All
+implementations and layouts had the same accuracy (91.74%) and zero
+classification-decision mismatches against Hugging Face:
+
+| Variant | Decision mismatches | Maximum absolute logit difference |
+| --- | ---: | ---: |
+| DF PyTorch, padded | 0 / 9,815 | 0.1094 |
+| DF PyTorch, packed | 0 / 9,815 | 0.1074 |
+| DF Triton, padded | 0 / 9,815 | 0.0742 |
+| DF Triton, packed | 0 / 9,815 | 0.0508 |
+| FlashDeBERTa, packed | 0 / 9,815 | 0.0801 |
+
+This is decision parity, not bitwise or elementwise logit parity: the maximum
+logit differences are nonzero. The recorded BF16 run did not meet full decision
+parity, so the FP16 result above is the release parity claim.
+
 ## CUDA validation
 
 ```bash
@@ -256,9 +307,17 @@ python -m validation.validate_multistep_training \
   --profile src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json
 ```
 
-The multi-step report records the loss curve plus output, gradient, and
-post-update parameter divergence from Hugging Face. End-to-end performance is
-not part of the release benchmark matrix.
+The BF16 check used a 12-layer DeBERTa-v2-shaped model, length 1024, batch 2,
+dropout 0.1, and 20 optimizer steps. It passed the configured final fixed-loss
+gate: the candidate/reference fixed losses after step 20 were 0.683213 and
+0.683757, respectively (0.0796% relative difference, below the 5% limit).
+Reference and candidate fixed losses fell by 0.4446 and 0.4452 over the run.
+The check also records backward gradients and post-update parameters: at the
+last step, aggregate gradient relative L2 difference was 14.75% (cosine
+similarity 0.9891), and parameter relative L2 difference was 0.42% (cosine
+similarity 0.99999). Thus this is a multi-step training-path parity check
+including backward, not a claim that individual gradients are numerically
+identical. End-to-end performance is not part of the release benchmark matrix.
 
 ## Attribution
 
