@@ -426,61 +426,70 @@ def test_memory_plot_uses_incremental_peak(tmp_path):
     assert all(path.exists() for path in outputs)
 
 
-def test_round_summary_drops_throttled_rounds_and_flags_drift():
+def test_sample_summary_reports_robust_statistics():
     benchmark = load_benchmark_module()
 
-    summary = benchmark.summarize_rounds(
-        [([1.0, 1.0], 1980), ([2.0, 2.0], 990), ([1.0, 1.0], 1975)]
-    )
-    assert summary["throttled_rounds"] == 1
-    assert summary["samples_kept"] == 4
-    assert summary["p50_ms"] == 1.0
-    assert summary["stable"]
+    summary = benchmark.summarize_samples([3.0, 1.0, 2.0, 10.0, 2.0])
 
-    drifting = benchmark.summarize_rounds([([1.0] * 4, None), ([1.2] * 4, None)])
-    assert drifting["throttled_rounds"] == 0
-    assert drifting["samples_kept"] == 8
-    assert not drifting["stable"]
-    assert drifting["drift"] == pytest.approx(0.2)
+    assert summary["p50_ms"] == 2.0
+    assert summary["min_ms"] == 1.0
+    assert summary["samples"] == 5
+    assert summary["p90_ms"] == 10.0
 
 
-def test_cuda_benchmark_defaults_interleave_enough_samples():
+def test_cuda_benchmark_defaults_to_do_bench_with_repeats():
     benchmark = load_benchmark_module()
     args = benchmark.build_parser().parse_args([])
 
-    assert (args.warmup, args.iters, args.rounds) == (20, 100, 5)
+    assert args.timer == "do_bench"
+    assert (args.warmup, args.iters, args.rep_ms, args.repeats) == (20, 100, 500.0, 3)
 
 
-def test_benchmark_worker_results_are_merged_per_implementation(monkeypatch):
+def test_each_configuration_runs_in_its_own_process(monkeypatch):
     benchmark = load_benchmark_module()
     args = benchmark.build_parser().parse_args([])
-    worker_output = [
-        {"status": "ok", "implementation": "base", "p50_ms": 1.0},
-        {"status": "oom", "implementation": "triton", "error": "out of memory"},
-    ]
+    commands = []
 
-    def fake_run(command, **_kwargs):
-        assert command[command.index("--implementation") + 1 : command.index("--pass-mode")] == [
-            "base",
-            "triton",
-        ]
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["env"]["PYTORCH_CUDA_ALLOC_CONF"]
+        output = {"status": "ok", "implementation": "triton", "p50_ms": 1.0}
         return SimpleNamespace(
-            stdout="noise\n" + benchmark.RESULT_PREFIX + json.dumps(worker_output), stderr=""
+            stdout="noise\n" + benchmark.RESULT_PREFIX + json.dumps(output), stderr=""
         )
 
     monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
-    results = benchmark.run_subprocess(args, ["base", "triton"], "forward", 512, 0.0)
+    result = benchmark.run_subprocess(args, "triton", "forward", 512, 0.0)
 
-    assert [result["implementation"] for result in results] == ["base", "triton"]
-    assert all(
-        result["sequence_length"] == 512 and result["batch_size"] == 32 for result in results
-    )
-    assert results[1]["status"] == "oom"
+    assert commands[0][commands[0].index("--implementation") + 1] == "triton"
+    assert commands[0][commands[0].index("--timer") + 1] == "do_bench"
+    assert (result["status"], result["sequence_length"], result["batch_size"]) == ("ok", 512, 32)
 
     monkeypatch.setattr(
         benchmark.subprocess,
         "run",
-        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="Segmentation fault"),
+        lambda *_a, **_k: SimpleNamespace(stdout="", stderr="CUDA out of memory"),
     )
-    crashed = benchmark.run_subprocess(args, ["base", "triton"], "forward", 512, 0.0)
-    assert [result["status"] for result in crashed] == ["worker_crash", "worker_crash"]
+    assert benchmark.run_subprocess(args, "base", "forward", 512, 0.0)["status"] == "oom"
+
+
+def test_repeats_combine_to_the_median_run():
+    benchmark = load_benchmark_module()
+
+    def run(p50):
+        return {
+            "status": "ok",
+            "p50_ms": p50,
+            "min_ms": p50 - 0.1,
+            "tokens_per_second": 1000.0 / p50,
+            "effective_attention_tflops": 10.0 / p50,
+        }
+
+    combined = benchmark.combine_repeats([run(2.0), run(1.0), run(1.1), {"status": "oom"}])
+
+    assert combined["p50_ms"] == 1.1
+    assert combined["min_ms"] == pytest.approx(0.9)
+    assert combined["repeat_p50_ms"] == [2.0, 1.0, 1.1]
+    assert combined["repeat_spread"] == pytest.approx(1.0)
+    assert (combined["repeats"], combined["failed_repeats"]) == (4, 1)
+    assert combined["tokens_per_second"] == pytest.approx(1000.0 / 1.1)

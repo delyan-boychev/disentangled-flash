@@ -103,13 +103,14 @@ inference forward and training forward+backward in BF16 at
 lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains exactly
 16,384 active tokens (`batch = 16384 / length`), so there is no batch or
 packed-layout axis. The layer has 12 heads of dimension 64; training uses
-dropout 0. For each shape, all implementations share one process: 20 warmups,
-then 100 timed iterations each, split into 5 interleaved rounds with the order
-rotating, so throttling or drift affects every implementation equally. With
-`nvidia-ml-py` installed, rounds run below 90% of the best observed SM clock
-are excluded, and results whose last quarter is more than 5% slower than their
-first are flagged as unstable. Results record median, min, p10 and p90 latency,
-QK+PV-equivalent throughput, and incremental peak allocated memory. The Hugging Face `[B, 1, L, L]` mask and
+dropout 0. Every configuration runs in its own process: 20 warmup iterations,
+then Triton's `do_bench` for 500 ms, which flushes the L2 cache before each
+timed iteration (`--timer events` times back-to-back warm iterations instead).
+The garbage collector is paused while timing. The matrix runs three times with
+the implementation order rotated, and each result is the median of the three
+runs' medians; the per-run medians are kept. Results record median, min, p10
+and p90 latency, QK+PV-equivalent throughput, incremental peak allocated
+memory, and allocator retries or `cudaMalloc` calls during timing. The Hugging Face `[B, 1, L, L]` mask and
 relative-position matrix are built once before timing, as a real encoder does.
 
 Generate the throughput and memory plots with:

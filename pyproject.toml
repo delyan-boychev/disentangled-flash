@@ -25,7 +25,6 @@ benchmark = [
     "transformers>=4.57",
     "flashdeberta>=0.0.7",
     "matplotlib>=3.9",
-    "nvidia-ml-py>=12",
     "pandas>=2.2",
     "seaborn>=0.13",
     "tqdm>=4.66",
