@@ -12,7 +12,7 @@ import torch
 from .._reference import DebertaAttentionConfig
 from .._torch import TorchTrainingDisentangledSelfAttention
 from ..packed import PackedSequenceInfo, resolve_packed_info
-from ..position import SharedPositionPlanCache
+from ..position import SharedPositionPlanCache, pad_position_table
 from ..tuning import (
     KernelConfig,
     KernelTuningOptions,
@@ -226,6 +226,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
                 rel_embeddings,
                 plan.active_slots,
             )
+            pos_key, pos_query = pad_position_table(pos_key), pad_position_table(pos_query)
 
         has_c2p = self.relative_attention and "c2p" in self.pos_att_type
         has_p2c = self.relative_attention and "p2c" in self.pos_att_type
@@ -307,6 +308,7 @@ class TritonTrainingDisentangledSelfAttention(TorchTrainingDisentangledSelfAtten
             if rel_embeddings is None:
                 raise ValueError("rel_embeddings is required for relative attention")
             pos_key, pos_query = self._project_active_positions(rel_embeddings, plan.active_slots)
+            pos_key, pos_query = pad_position_table(pos_key), pad_position_table(pos_query)
         has_c2p = self.relative_attention and "c2p" in self.pos_att_type
         has_p2c = self.relative_attention and "p2c" in self.pos_att_type
         scale_factor = 1 + int(has_c2p) + int(has_p2c)

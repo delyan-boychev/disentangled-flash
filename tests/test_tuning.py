@@ -1112,3 +1112,19 @@ def test_heuristic_training_configs_at_saturated_shapes(phase, length, expected)
         resources=H200,
     )
     assert config == expected
+
+
+def test_padded_position_columns_are_never_read():
+    case = TuningCase(128, 64, 2, "float32", has_c2p=True, has_p2c=True, fp32_precision="strict")
+    arguments, _ = _make_inputs(case, torch.device("cpu"))
+    c2p, p2c = arguments[3], arguments[4]
+    real = 2 * 128 - 1
+
+    assert c2p.size(-1) == 256 and arguments[10] == 256
+    expected = _reference(arguments)
+    noisy = list(arguments)
+    noisy[3] = c2p.clone()
+    noisy[4] = p2c.clone()
+    noisy[3][..., real:] = 1e6
+    noisy[4][..., real:] = -1e6
+    torch.testing.assert_close(_reference(tuple(noisy)), expected)

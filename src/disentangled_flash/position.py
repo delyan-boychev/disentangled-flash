@@ -12,6 +12,26 @@ import torch
 
 from ._reference import make_log_bucket_position
 
+# cuBLAS only uses its fast Hopper GEMMs for 16-byte aligned rows. The active
+# slot count is 2L-1 for short sequences, so position tables get zero rows up to
+# a multiple of 8; the kernels never index them.
+POSITION_SLOT_ALIGNMENT = 8
+
+
+def aligned_slot_count(slot_count: int) -> int:
+    return -(-slot_count // POSITION_SLOT_ALIGNMENT) * POSITION_SLOT_ALIGNMENT
+
+
+def pad_position_table(table: torch.Tensor | None) -> torch.Tensor | None:
+    """Pad a [..., slots, D] projected position table to an aligned slot count."""
+
+    if table is None:
+        return None
+    extra = aligned_slot_count(table.size(-2)) - table.size(-2)
+    if not extra:
+        return table
+    return torch.nn.functional.pad(table, (0, 0, 0, extra))
+
 
 class SharedPositionIndexPlan(NamedTuple):
     """Compact ``O(L)`` position plan consumed by the Triton kernel."""

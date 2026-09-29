@@ -17,7 +17,7 @@ from typing import Any
 import torch
 
 from . import kernel
-from .position import SharedPositionPlanCache
+from .position import SharedPositionPlanCache, aligned_slot_count
 from .tuning import (
     DEFAULT_DKV_KERNEL_CONFIGS,
     DEFAULT_DQ_KERNEL_CONFIGS,
@@ -269,7 +269,8 @@ def _make_padded_inputs(
     )
     position_plan = position_cache.compact(length, device)
     active_slots = position_plan.active_slots.numel()
-    relative_shape = (batch_size, num_heads, length, active_slots)
+    table_width = aligned_slot_count(active_slots)
+    relative_shape = (batch_size, num_heads, length, table_width)
     c2p = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_c2p else query
     p2c = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_p2c else key
     attention_mask = torch.ones(batch_size, length, device=device, dtype=torch.bool)
@@ -286,7 +287,7 @@ def _make_padded_inputs(
         num_heads,
         length,
         length,
-        active_slots,
+        table_width,
         length - 1,
         score_scale * 1.4426950408889634,
         case.uses_padding_mask,
@@ -353,7 +354,8 @@ def _make_packed_inputs(
     )
     position_plan = position_cache.compact(case.sequence_length, device)
     active_slots = position_plan.active_slots.numel()
-    relative_shape = (num_heads, total_tokens, active_slots)
+    table_width = aligned_slot_count(active_slots)
+    relative_shape = (num_heads, total_tokens, table_width)
     c2p = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_c2p else query
     p2c = torch.randn(relative_shape, device=device, dtype=dtype) if case.has_p2c else key
     scale_factor = 1 + int(case.has_c2p) + int(case.has_p2c)
@@ -368,7 +370,7 @@ def _make_packed_inputs(
         cu_seqlens,
         case.sequence_length,
         case.sequence_length,
-        active_slots,
+        table_width,
         case.sequence_length - 1,
         score_scale * 1.4426950408889634,
         case.has_c2p,
@@ -466,7 +468,8 @@ def _make_training_inputs(
     )
     position_plan = position_cache.compact(case.sequence_length, device)
     active_slots = position_plan.active_slots.numel()
-    position_shape = (num_heads, active_slots, case.head_dim)
+    # Same aligned width as the training module; the extra rows are never indexed.
+    position_shape = (num_heads, aligned_slot_count(active_slots), case.head_dim)
     pos_key = (
         torch.randn(position_shape, device=device, dtype=dtype, requires_grad=True)
         if case.has_c2p

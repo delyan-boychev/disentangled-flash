@@ -15,7 +15,7 @@ import torch
 
 from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
 from .packed import PackedSequenceInfo, resolve_packed_info
-from .position import canonical_device
+from .position import canonical_device, pad_position_table
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
     KernelConfig,
@@ -1377,6 +1377,12 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         if hasattr(self, "_triton_position_projection_cache"):
             self._triton_position_projection_cache.clear()
 
+    @staticmethod
+    def _table_width(plan: TritonPreparedPositionPlan, active_slot_count: int) -> int:
+        # Tables may be padded past the active slots; the kernel needs their row stride.
+        table = plan.pos_key if plan.pos_key is not None else plan.pos_query
+        return active_slot_count if table is None else table.size(-2)
+
     def _resolve_kernel_config(
         self,
         hidden_states: torch.Tensor,
@@ -1524,7 +1530,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             cu_seqlens,
             info.max_seqlen,
             tuning_sequence_length(info.max_seqlen),
-            active_slot_count,
+            self._table_width(plan, active_slot_count),
             plan.position_offset,
             score_scale_log2,
             has_c2p,
@@ -1584,6 +1590,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         )
         if representative_plan is None:
             pos_key, pos_query = self._project_active_positions(indices.active_slots)
+            pos_key, pos_query = pad_position_table(pos_key), pad_position_table(pos_query)
         else:
             pos_key, pos_query = representative_plan.pos_key, representative_plan.pos_query
         plan = TritonPreparedPositionPlan(
@@ -1706,7 +1713,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             self.num_attention_heads,
             sequence_length,
             tuning_sequence_length(plan.sequence_length),
-            active_slot_count,
+            self._table_width(plan, active_slot_count),
             plan.position_offset,
             score_scale_log2,
             not self.assume_unpadded,

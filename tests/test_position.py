@@ -72,3 +72,20 @@ def test_family_position_plan_covers_shorter_runtime_length():
     family_slots = family.active_slots[family.delta_to_local[family_indices].long()]
 
     assert torch.equal(family_slots, runtime_slots)
+
+
+def test_position_tables_pad_to_aligned_slot_counts():
+    from disentangled_flash.position import aligned_slot_count, pad_position_table
+
+    assert [aligned_slot_count(count) for count in (127, 255, 511, 512)] == [128, 256, 512, 512]
+    table = torch.randn(12, 255, 64, requires_grad=True)
+    padded = pad_position_table(table)
+
+    assert padded.shape == (12, 256, 64)
+    torch.testing.assert_close(padded[:, :255], table)
+    assert torch.count_nonzero(padded[:, 255:]) == 0
+    padded.sum().backward()
+    torch.testing.assert_close(table.grad, torch.ones_like(table))
+    assert pad_position_table(None) is None
+    aligned = torch.randn(12, 512, 64)
+    assert pad_position_table(aligned) is aligned
