@@ -200,7 +200,7 @@ def _make_metric_figure(
     )
     if timing:
         formula_footer = (
-            "Algorithmic FLOPs per B,H: forward 4L²D + 4LRD  ·  "
+            "FLOPs per B,H: forward 4L²D + 4LRD  ·  "
             "backward 10L²D + 12LRD  ·  combined 14L²D + 16LRD"
         )
         setup_footer += "  ·  median of do_bench  ·  hollow markers: host-bound"
@@ -249,8 +249,8 @@ def make_release_figures(
         usable,
         configuration,
         metric="attention_tflops",
-        title="Disentangled-attention algorithmic throughput",
-        ylabel="Algorithmic TFLOP/s",
+        title="Disentangled-attention throughput",
+        ylabel="TFLOP/s",
         output_stem="kernel_throughput_h200",
         output_dir=output_dir,
         dpi=dpi,
