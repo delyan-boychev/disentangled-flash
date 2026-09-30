@@ -10,15 +10,15 @@ backend is recorded instead of aborting the matrix. Timing follows
 FlashAttention 3: do_bench with 3 ms warmup and 30 ms of timing, and a 1 s pause
 between processes so the GPU doesn't carry power throttling into the next run.
 
-Two timers:
-  do_bench   eager, L2 flushed before each iteration. Includes Python and
-             launch overhead, which dominates short training steps.
-  cudagraph  the same calls replayed from a CUDA graph, so only GPU time is
-             left. Implementations that sync with the host can't be captured
-             and are reported as such.
+Timing is eager, with the L2 cache flushed before each iteration, so it
+includes Python, autograd and launch overhead. Each result also records the CPU
+time to issue one iteration; when that reaches the latency, the point is
+host-bound and measures the CPU rather than the GPU.
 
-TFLOP/s counts only dense QK and PV work, so it is a QK+PV-equivalent rate for
-the whole layer, not hardware utilization.
+TFLOP/s counts the attention's matmul work: QK and PV, plus the C2P/P2C
+position-table GEMMs over the relative positions a length actually uses.
+Softmax, bias gathers and the Q/K/V and position projections are left out, as
+FlashAttention leaves out softmax and projections.
 """
 
 from __future__ import annotations
@@ -50,17 +50,18 @@ from disentangled_flash._torch import (
     TorchTrainingDisentangledSelfAttention,
 )
 from disentangled_flash.kernel import InferenceDisentangledSelfAttention
+from disentangled_flash.position import SharedPositionPlanCache
 from disentangled_flash.training import TritonTrainingDisentangledSelfAttention
 from disentangled_flash.tuning import KernelTuningOptions
 
 RESULT_PREFIX = "__ATTENTION_RESULT__="
 IMPLEMENTATIONS = ("base", "torch", "triton", "flashdeberta")
 PASS_MODES = ("forward", "backward", "forward_backward")
-TIMERS = ("do_bench", "cudagraph")
 DEFAULT_LENGTHS = (128, 512, 1024, 2048, 4096, 8192)
 DEFAULT_TOTAL_TOKENS = 16_384
-# Dense-attention FLOPs relative to forward: backward is 2.5x, as in FlashAttention.
-FLOP_MULTIPLIERS = {"forward": 1.0, "backward": 2.5, "forward_backward": 3.5}
+# Backward recomputes every score term, then forms both operand gradients.
+DENSE_FLOPS = {"forward": 4, "backward": 10, "forward_backward": 14}
+POSITION_FLOPS = {"forward": 2, "backward": 6, "forward_backward": 8}
 
 
 def collect_environment() -> dict[str, Any]:
@@ -105,13 +106,34 @@ def batch_size_for_length(length: int, total_tokens: int) -> int:
     return max(1, total_tokens // length)
 
 
-def effective_attention_flops(
-    batch_size: int, num_heads: int, sequence_length: int, head_dim: int, pass_mode: str
-) -> int:
-    """Dense QK+PV FLOPs, excluding relative-bias work."""
+def relative_position_count(config: DebertaAttentionConfig, sequence_length: int) -> int:
+    """Distinct relative-position rows that sequences of this length read."""
 
-    forward = 4 * batch_size * num_heads * sequence_length**2 * head_dim
-    return int(forward * FLOP_MULTIPLIERS[pass_mode])
+    embedding_size = (
+        config.position_buckets if config.position_buckets > 0 else config.max_relative_positions
+    )
+    plans = SharedPositionPlanCache(
+        position_buckets=config.position_buckets,
+        max_relative_positions=config.max_relative_positions,
+        position_embedding_size=embedding_size,
+    )
+    return plans.compact(sequence_length, "cpu").active_slots.numel()
+
+
+def attention_flops(
+    config: DebertaAttentionConfig, batch_size: int, sequence_length: int, pass_mode: str
+) -> int:
+    """Matmul FLOPs of disentangled attention: QK, PV and the position-table GEMMs."""
+
+    terms = len({"c2p", "p2c"}.intersection(config.pos_att_type or ()))
+    terms *= config.relative_attention
+    positions = relative_position_count(config, sequence_length) if terms else 0
+    per_head = (
+        (DENSE_FLOPS[pass_mode] * sequence_length + POSITION_FLOPS[pass_mode] * terms * positions)
+        * sequence_length
+        * config.attention_head_size
+    )
+    return batch_size * config.num_attention_heads * per_head
 
 
 def dtype_from_name(name: str) -> torch.dtype:
@@ -318,14 +340,13 @@ def _gc_paused(run):
             gc.enable()
 
 
-def _measure(operation, timer: str, warmup_ms: float, rep_ms: float) -> list[float]:
-    from triton.testing import do_bench, do_bench_cudagraph
+def _measure(operation, warmup_ms: float, rep_ms: float) -> list[float]:
+    from triton.testing import do_bench
 
-    if timer == "cudagraph":
-        run = lambda: do_bench_cudagraph(operation, rep=rep_ms, return_mode="all")
-    else:
-        run = lambda: do_bench(operation, warmup=warmup_ms, rep=rep_ms, return_mode="all")
-    return [float(sample) for sample in _gc_paused(run)]
+    samples = _gc_paused(
+        lambda: do_bench(operation, warmup=warmup_ms, rep=rep_ms, return_mode="all")
+    )
+    return [float(sample) for sample in samples]
 
 
 def _measure_host_issue(operation, iterations: int = 20) -> float:
@@ -363,18 +384,11 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     operation, clear_gradients, batch_size, num_heads = _prepare_case(args, device, dtype)
     # Exclude compilation, lazy setup, and do_bench's L2 buffer from measurement.
     operation()
-    _measure(operation, "do_bench", 0.0, 1.0)
+    _measure(operation, 0.0, 1.0)
     torch.cuda.synchronize()
 
     before = torch.cuda.memory_stats(device_index)
-    try:
-        samples = _measure(operation, args.timer, args.warmup_ms, args.rep_ms)
-    except torch.cuda.OutOfMemoryError:
-        raise
-    except Exception as exc:  # graph capture fails on host syncs
-        if args.timer != "cudagraph":
-            raise
-        return {"status": "uncapturable", "error": f"{type(exc).__name__}: {exc}"[:4000]}
+    samples = _measure(operation, args.warmup_ms, args.rep_ms)
     after = torch.cuda.memory_stats(device_index)
     host_ms = _measure_host_issue(operation)
 
@@ -388,26 +402,22 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     peak = torch.cuda.max_memory_allocated(device_index)
 
     summary = summarize_samples(samples)
-    flops = effective_attention_flops(
-        batch_size, num_heads, args.length, args.head_dim, args.pass_mode
-    )
-    eager = args.timer == "do_bench"
+    flops = attention_flops(make_config(args.head_dim), batch_size, args.length, args.pass_mode)
 
-    def counter(name: str) -> int | None:
-        return after.get(name, 0) - before.get(name, 0) if eager else None
+    def counter(name: str) -> int:
+        return after.get(name, 0) - before.get(name, 0)
 
     return {
         "status": "ok",
         "head_dim": args.head_dim,
         "num_heads": num_heads,
-        "timer": args.timer,
         **summary,
         "timings_ms": samples,
         "host_ms_per_iter": host_ms,
         "allocator_retries": counter("num_alloc_retries"),
         "cuda_mallocs_while_timing": counter("num_device_alloc"),
         "tokens_per_second": batch_size * args.length * 1000.0 / summary["p50_ms"],
-        "effective_attention_tflops": flops / (summary["p50_ms"] * 1e9),
+        "attention_tflops": flops / (summary["p50_ms"] * 1e9),
         "baseline_allocated_bytes": baseline,
         "peak_allocated_bytes": peak,
         "incremental_peak_allocated_bytes": max(0, peak - baseline),
@@ -427,7 +437,6 @@ def run_subprocess(
         ("--total-tokens", args.total_tokens),
         ("--head-dim", args.head_dim),
         ("--dtype", args.dtype),
-        ("--timer", args.timer),
         ("--warmup-ms", args.warmup_ms),
         ("--rep-ms", args.rep_ms),
         ("--device", args.device),
@@ -472,12 +481,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total-tokens", type=int, default=DEFAULT_TOTAL_TOKENS)
     parser.add_argument("--head-dim", type=int, choices=(64, 128), default=64)
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="bf16")
-    parser.add_argument(
-        "--timer",
-        choices=TIMERS,
-        default="do_bench",
-        help="do_bench is eager with L2 flushes; cudagraph removes host overhead.",
-    )
     # FlashAttention 3's settings: do_bench(warmup=3, rep=30), 1 s between runs.
     parser.add_argument("--warmup-ms", type=float, default=3.0, help="do_bench warmup time.")
     parser.add_argument("--rep-ms", type=float, default=30.0, help="do_bench timed time.")
@@ -509,7 +512,7 @@ def _describe(result: dict[str, Any]) -> str:
             f"allocator: {result['allocator_retries']} retries, "
             f"{result['cuda_mallocs_while_timing']} cudaMalloc while timing"
         )
-    if result["timer"] == "do_bench" and result["host_ms_per_iter"] >= 0.8 * result["p50_ms"]:
+    if result["host_ms_per_iter"] >= 0.8 * result["p50_ms"]:
         flags.append(f"host-bound, {result['host_ms_per_iter']:.2f} ms/iter on the CPU")
     return (
         f"p50 {result['p50_ms']:8.3f} ms  min {result['min_ms']:8.3f}  "
@@ -556,7 +559,6 @@ def main() -> None:
             "total_tokens",
             "head_dim",
             "dtype",
-            "timer",
             "warmup_ms",
             "rep_ms",
             "cooldown_s",
@@ -568,7 +570,7 @@ def main() -> None:
     }
     results: list[dict[str, Any]] = []
     payload = {
-        "schema_version": 3,
+        "schema_version": 5,
         "environment": collect_environment(),
         "configuration": configuration,
         "results": results,

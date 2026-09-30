@@ -64,7 +64,6 @@ def test_cuda_benchmark_defaults_to_constant_token_kernel_matrix():
     assert args.total_tokens == 16_384
     assert args.head_dim == 64
     assert args.dtype == "bf16"
-    assert args.timer == "do_bench"
 
 
 def test_flashdeberta_config_uses_transformers_compatible_position_types():
@@ -82,11 +81,17 @@ def test_cuda_benchmark_uses_constant_token_batches_and_reports_effective_flops(
     assert benchmark.batch_size_for_length(128, 16_384) == 128
     assert benchmark.batch_size_for_length(512, 16_384) == 32
     assert benchmark.batch_size_for_length(8192, 16_384) == 2
-    forward = benchmark.effective_attention_flops(2, 12, 512, 64, "forward")
-    combined = benchmark.effective_attention_flops(2, 12, 512, 64, "forward_backward")
-    assert combined == int(forward * 3.5)
-    backward = benchmark.effective_attention_flops(2, 12, 512, 64, "backward")
-    assert backward == int(forward * 2.5)
+    config = benchmark.make_config(64)
+    assert benchmark.relative_position_count(config, 128) == 255
+    assert benchmark.relative_position_count(config, 2048) == 512
+    heads_dims = 2 * 12 * 64
+    for pass_mode, dense, position in (
+        ("forward", 4, 2),
+        ("backward", 10, 6),
+        ("forward_backward", 14, 8),
+    ):
+        expected = heads_dims * 512 * (dense * 512 + position * 2 * 511)
+        assert benchmark.attention_flops(config, 2, 512, pass_mode) == expected
 
 
 def test_torch_kernel_backend_runs_active_tokens_without_layout_axis():
@@ -409,7 +414,8 @@ def test_memory_plot_uses_incremental_peak(tmp_path):
             "pass": pass_mode,
             "sequence_length": length,
             "p50_ms": 1.0,
-            "effective_attention_tflops": 1.0,
+            "batch_size": 1,
+            "head_dim": 64,
             "peak_allocated_bytes": 8 * plot.GIB,
             "incremental_peak_allocated_bytes": plot.GIB // 4,
             "gpu": "GPU",
@@ -441,10 +447,9 @@ def test_cuda_benchmark_defaults_to_flash_attention_3_timing():
     benchmark = load_benchmark_module()
     args = benchmark.build_parser().parse_args([])
 
-    assert args.timer == "do_bench"
+    assert not hasattr(args, "timer")
     assert (args.warmup_ms, args.rep_ms, args.cooldown_s) == (3.0, 30.0, 1.0)
     assert not hasattr(args, "repeats")
-    assert benchmark.build_parser().parse_args(["--timer", "cudagraph"]).timer == "cudagraph"
 
 
 def test_each_configuration_runs_in_its_own_process(monkeypatch):
@@ -464,7 +469,6 @@ def test_each_configuration_runs_in_its_own_process(monkeypatch):
     result = benchmark.run_subprocess(args, "triton", "forward", 512)
 
     assert commands[0][commands[0].index("--implementation") + 1] == "triton"
-    assert commands[0][commands[0].index("--timer") + 1] == "do_bench"
     assert (result["status"], result["sequence_length"], result["batch_size"]) == ("ok", 512, 32)
 
     monkeypatch.setattr(

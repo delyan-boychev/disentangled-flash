@@ -14,14 +14,18 @@ matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import seaborn as sns
 from matplotlib.ticker import FuncFormatter
 
 GIB = 1024**3
+# Host issue time at or above this fraction of latency marks a CPU-bound point.
+HOST_BOUND_FRACTION = 0.8
+_PALETTE = sns.color_palette("colorblind")
 SERIES = (
-    ("base", "Hugging Face eager", "#555555", "o", "--", 2.0),
-    ("torch", "DF PyTorch", "#3B6FB6", "s", ":", 2.0),
-    ("triton", "DF Triton", "#D1495B", "o", "-", 3.0),
-    ("flashdeberta", "FlashDeBERTa", "#2A9D8F", "D", "-.", 2.0),
+    ("base", "Hugging Face eager", _PALETTE[0], "o", (4, 2), 1.8),
+    ("torch", "DF PyTorch", _PALETTE[2], "s", (1, 1.5), 1.8),
+    ("flashdeberta", "FlashDeBERTa", _PALETTE[4], "D", (5, 2, 1, 2), 1.8),
+    ("triton", "DF Triton", _PALETTE[3], "o", (), 2.8),
 )
 PASS_TITLES = {
     "forward": "Forward",
@@ -42,13 +46,30 @@ def load_results(path: Path) -> tuple[pd.DataFrame, dict[str, Any]]:
         "pass",
         "sequence_length",
         "p50_ms",
-        "effective_attention_tflops",
+        "batch_size",
+        "head_dim",
         "incremental_peak_allocated_bytes",
     }
     missing = sorted(required.difference(frame.columns))
     if missing:
         raise ValueError(f"{path} is missing fields: {', '.join(missing)}")
+    # Recompute from shape and time so older reports use the current FLOP count.
+    frame["attention_tflops"] = frame.apply(_attention_tflops, axis=1)
     return frame, report.get("configuration", {})
+
+
+def _attention_tflops(row: pd.Series) -> float:
+    from benchmarks.benchmark_cuda import attention_flops, make_config
+
+    if row["status"] != "ok":
+        return math.nan
+    flops = attention_flops(
+        make_config(int(row["head_dim"])),
+        int(row["batch_size"]),
+        int(row["sequence_length"]),
+        row["pass"],
+    )
+    return flops / (row["p50_ms"] * 1e9)
 
 
 def _length_label(value: int) -> str:
@@ -71,35 +92,46 @@ def _memory_ticks(values: pd.Series) -> tuple[float, ...]:
     return tuple(ticks)
 
 
-def _plot_series(axis: Any, panel: pd.DataFrame, metric: str) -> None:
-    for implementation, label, color, marker, linestyle, linewidth in SERIES:
+def _host_bound(rows: pd.DataFrame) -> pd.Series:
+    if "host_ms_per_iter" not in rows:
+        return pd.Series(False, index=rows.index)
+    return rows["host_ms_per_iter"] >= HOST_BOUND_FRACTION * rows["p50_ms"]
+
+
+def _plot_series(axis: Any, panel: pd.DataFrame, metric: str, *, mark_host_bound: bool) -> None:
+    for implementation, label, color, marker, dashes, linewidth in SERIES:
         rows = panel[panel["implementation"].eq(implementation)].sort_values("sequence_length")
         if rows.empty:
             continue
-        axis.plot(
+        (line,) = axis.plot(
             rows["sequence_length"],
             rows[metric],
             label=label,
             color=color,
-            marker=marker,
-            linestyle=linestyle,
             linewidth=linewidth,
-            markersize=5.5,
-            markeredgewidth=0,
+            zorder=3 if implementation == "triton" else 2,
         )
+        line.set_dashes(dashes or (None, None))
+        host_bound = _host_bound(rows) if mark_host_bound else pd.Series(False, index=rows.index)
+        for hollow, points in rows.groupby(host_bound):
+            axis.scatter(
+                points["sequence_length"],
+                points[metric],
+                marker=marker,
+                s=34 if implementation == "triton" else 26,
+                facecolor="white" if hollow else color,
+                edgecolor=color,
+                linewidth=1.4,
+                zorder=4,
+            )
 
 
 def _style_axis(axis: Any, lengths: list[int], tick_labels: list[str]) -> None:
     axis.set_xscale("log", base=2)
     axis.set_xticks(lengths, labels=tick_labels)
-    axis.grid(axis="y", color="#D7DADF", linewidth=0.8)
-    axis.grid(axis="x", color="#ECEEF1", linewidth=0.6)
-    axis.set_axisbelow(True)
-    axis.spines["top"].set_visible(False)
-    axis.spines["right"].set_visible(False)
-    axis.spines["left"].set_color("#4C5158")
-    axis.spines["bottom"].set_color("#4C5158")
-    axis.tick_params(colors="#30343A", length=4, width=0.8)
+    axis.minorticks_off()
+    axis.margins(x=0.04)
+    sns.despine(ax=axis)
 
 
 def _make_metric_figure(
@@ -117,12 +149,12 @@ def _make_metric_figure(
     figure, axes = plt.subplots(
         1,
         len(passes),
-        figsize=(6.0 * len(passes), 4.85),
+        figsize=(4.6 * len(passes), 4.2),
         sharey=metric == "peak_memory_gib",
         squeeze=False,
     )
     axes = axes[0]
-    figure.subplots_adjust(left=0.085, right=0.985, top=0.70, bottom=0.24, wspace=0.23)
+    timing = metric == "attention_tflops"
 
     lengths = sorted(int(value) for value in usable["sequence_length"].unique())
     tick_labels = [_length_label(length) for length in lengths]
@@ -130,11 +162,11 @@ def _make_metric_figure(
     for index, pass_mode in enumerate(passes):
         axis = axes[index]
         panel = usable[usable["pass"].eq(pass_mode)]
-        _plot_series(axis, panel, metric)
+        _plot_series(axis, panel, metric, mark_host_bound=timing)
         _style_axis(axis, lengths, tick_labels)
-        axis.set_title(f"({chr(97 + index)})  {PASS_TITLES[pass_mode]}", loc="left", pad=11)
+        axis.set_title(PASS_TITLES[pass_mode], loc="left", fontweight="bold")
         axis.set_xlabel("Sequence length")
-        if metric == "effective_attention_tflops":
+        if timing:
             axis.set_ylim(bottom=0)
         else:
             axis.set_yscale("log", base=2)
@@ -143,39 +175,43 @@ def _make_metric_figure(
             axis.set_yticks(ticks)
             axis.yaxis.set_major_formatter(FuncFormatter(_memory_label))
 
+    for axis in axes[1:]:
+        axis.set_ylabel("")
     axes[0].set_ylabel(ylabel)
     handles, labels = axes[0].get_legend_handles_labels()
+    order = [labels.index(label) for _, label, *_ in reversed(SERIES) if label in labels]
     figure.legend(
-        handles,
-        labels,
+        [handles[index] for index in order],
+        [labels[index] for index in order],
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.86),
-        ncol=4,
+        bbox_to_anchor=(0.5, 0.925),
+        ncol=len(order),
         frameon=False,
-        handlelength=3.2,
-        columnspacing=2.0,
+        handlelength=2.6,
+        columnspacing=1.8,
     )
 
     gpu = str(usable["gpu"].iloc[0]) if "gpu" in usable else "CUDA GPU"
-    figure.suptitle(f"{title} ({gpu})", y=0.965, fontsize=18, fontweight="bold")
-    figure.text(
-        0.5,
-        0.045,
-        (
-            f"{configuration.get('dtype', 'bf16').upper()}   ·   head dimension "
-            f"{configuration.get('head_dim', 64)}   ·   "
-            f"batch × length = {configuration.get('total_tokens', 16384):,} tokens   ·   "
-            f"median, {configuration.get('timer', 'do_bench')} timer"
-        ),
-        ha="center",
-        fontsize=9.5,
-        color="#555A61",
+    figure.suptitle(f"{title} · {gpu}", x=0.5, y=0.985, fontsize=15, fontweight="bold")
+    setup_footer = (
+        f"{configuration.get('dtype', 'bf16').upper()}  ·  head dim "
+        f"{configuration.get('head_dim', 64)}  ·  "
+        f"{configuration.get('total_tokens', 16384):,} tokens per batch"
     )
+    if timing:
+        formula_footer = (
+            "Algorithmic FLOPs per B,H: forward 4L²D + 4LRD  ·  "
+            "backward 10L²D + 12LRD  ·  combined 14L²D + 16LRD"
+        )
+        setup_footer += "  ·  median of do_bench  ·  hollow markers: host-bound"
+        figure.text(0.5, 0.048, formula_footer, ha="center", fontsize=8.7, color="#454A52")
+    figure.text(0.5, 0.018, setup_footer, ha="center", fontsize=9, color="#5A5F66")
+    figure.tight_layout(rect=(0, 0.085 if timing else 0.05, 1, 0.9), w_pad=2.2)
 
     png = output_dir / f"{output_stem}.png"
     pdf = output_dir / f"{output_stem}.pdf"
-    figure.savefig(png, dpi=dpi, facecolor="white")
-    figure.savefig(pdf, facecolor="white")
+    figure.savefig(png, dpi=dpi, facecolor="white", bbox_inches="tight", pad_inches=0.12)
+    figure.savefig(pdf, facecolor="white", bbox_inches="tight", pad_inches=0.12)
     plt.close(figure)
     return png, pdf
 
@@ -192,32 +228,29 @@ def make_release_figures(
     # Memory above the pre-measurement allocation (weights and inputs excluded).
     usable["peak_memory_gib"] = usable["incremental_peak_allocated_bytes"] / GIB
 
-    plt.rcParams.update(
-        {
-            "font.family": "sans-serif",
-            "font.sans-serif": ["DejaVu Sans"],
-            "font.size": 10.5,
-            "axes.titlesize": 13.5,
-            "axes.titleweight": "bold",
-            "axes.labelsize": 11.5,
-            "axes.edgecolor": "#4C5158",
-            "axes.linewidth": 0.8,
-            "xtick.labelsize": 9.5,
-            "ytick.labelsize": 9.5,
+    sns.set_theme(
+        context="notebook",
+        style="whitegrid",
+        font="DejaVu Sans",
+        font_scale=0.95,
+        rc={
+            "axes.titlesize": 12.5,
+            "axes.labelsize": 11,
             "legend.fontsize": 10.5,
-            "figure.facecolor": "white",
-            "axes.facecolor": "white",
+            "grid.color": "#E4E6EA",
+            "grid.linewidth": 0.8,
+            "axes.edgecolor": "#6B7078",
             "pdf.fonttype": 42,
             "ps.fonttype": 42,
-        }
+        },
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     throughput = _make_metric_figure(
         usable,
         configuration,
-        metric="effective_attention_tflops",
-        title="Attention layer speed",
-        ylabel="QK+PV-equivalent TFLOP/s",
+        metric="attention_tflops",
+        title="Disentangled-attention algorithmic throughput",
+        ylabel="Algorithmic TFLOP/s",
         output_stem="kernel_throughput_h200",
         output_dir=output_dir,
         dpi=dpi,
@@ -239,7 +272,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("input", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmarks/results/kernel"))
-    parser.add_argument("--dpi", type=int, default=220)
+    parser.add_argument("--dpi", type=int, default=200)
     args = parser.parse_args()
 
     frame, configuration = load_results(args.input)

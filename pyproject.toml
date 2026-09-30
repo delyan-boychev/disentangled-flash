@@ -30,9 +30,12 @@ benchmark = [
     "tqdm>=4.66",
 ]
 dev = [
+    "matplotlib>=3.9",
     "numpy>=1.24",
+    "pandas>=2.2",
     "pytest>=8",
     "ruff>=0.12",
+    "seaborn>=0.13",
     "transformers>=4.57",
 ]
 
@@ -47,6 +50,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
+pythonpath = ["."]
 testpaths = ["tests"]
 markers = [
     "cuda: requires an NVIDIA CUDA GPU",

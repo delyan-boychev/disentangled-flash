@@ -84,96 +84,90 @@ position projections in the autograd graph. The same tuning policy applies to
 training, with independently selected entries for the LSE-producing forward,
 dQ, and dK/dV kernels.
 
-## CUDA benchmark
+## Performance
 
-```bash
-pip install -e ".[benchmark]"
-```
+The benchmark compares exact DeBERTa disentangled attention across Hugging Face
+eager, DF PyTorch, DF Triton, and FlashDeBERTa.
 
-```bash
-python -m benchmarks.benchmark_cuda \
-  --tuning-mode profile_only \
-  --profile src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json \
-  --output attention_kernel_results.json
-```
+### H200
 
-The release matrix compares one DeBERTa-v3-base-shaped attention layer across
-Hugging Face eager, DF PyTorch, DF Triton, and FlashDeBERTa. It measures
-inference forward, training backward, and training forward+backward in BF16 at
-lengths 128, 512, 1024, 2048, 4096, and 8192. Every point contains exactly
-16,384 active tokens (`batch = 16384 / length`), so there is no batch or
-packed-layout axis. The layer has 12 heads of dimension 64 and no dropout.
-As in FlashAttention, backward is timed on its own: forward runs once, then
-`out.backward(grad, retain_graph=True)` is replayed.
+- **Hardware:** one NVIDIA H200 (SM90).
+- **Software:** BF16, PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
+  Transformers 5.17.0, and FlashDeBERTa 0.0.7.
+- **Shape:** 12 heads, head dimension 64, sequence lengths 128 to 8192, and
+  `batch = 16384 / length`.
+- **Passes:** forward, backward, and forward + backward, with dropout disabled.
+- **DF Triton policy:** built-in heuristic, without a tuning profile.
 
-Timing follows FlashAttention 3. Every configuration runs once in its own
-process: one untimed call for compilation and setup, then Triton's `do_bench`
-with 3 ms warmup and 30 ms of timing, which flushes the L2 cache before each
-iteration, and a one-second pause before the next process. The garbage
-collector is paused while timing.
+![Attention layer throughput on H200](docs/figures/kernel_throughput_h200.png)
 
-The default timer is eager, so it includes Python, autograd and kernel-launch
-cost. For short training steps that cost is larger than the GPU work for every
-implementation, and results follow the CPU clock. `--timer cudagraph` replays
-the same calls from a CUDA graph to leave only GPU time; implementations that
-sync with the host are reported as `uncapturable`. Results record median, min,
-p10 and p90 latency, the CPU cost of issuing one iteration, QK+PV-equivalent
-throughput, incremental peak allocated memory, and allocator retries or
-`cudaMalloc` calls during eager timing. The Hugging Face `[B, 1, L, L]` mask and
-relative-position matrix are built once before timing, as a real encoder does.
+Throughput is algorithmic work divided by time. For batch `B`, heads `H`,
+length `L`, head dimension `D`, and `R` active relative-position rows, the
+forward, backward, and combined counts are respectively
+`BH(4L²D + 4LRD)`, `BH(10L²D + 12LRD)`, and
+`BH(14L²D + 16LRD)`. Backward includes score recomputation plus both operand
+gradients for QK, C2P, and P2C. As in FlashAttention, softmax, gathers, and
+projection layers are excluded.
 
-Generate the throughput and memory plots with:
+Median latency in milliseconds, and DF Triton's speedup over Hugging Face eager
+and FlashDeBERTa (`*` marks a host-bound DF Triton point):
 
-```bash
-python -m benchmarks.plot_cuda_results \
-  attention_kernel_results.json \
-  --output-dir benchmarks/results/kernel
-```
+| Length | Batch | Forward | vs HF | vs FlashDeBERTa | Backward | vs HF | vs FlashDeBERTa | Fwd + bwd | vs HF | vs FlashDeBERTa |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 128 | 0.42 | 2.99× | 3.21× | 4.16\* | 0.64× | 0.80× | 4.36\* | 1.00× | 1.10× |
+| 512 | 32 | 0.81 | 3.60× | 1.86× | 4.09\* | 1.09× | 3.20× | 4.73\* | 1.56× | 3.11× |
+| 1024 | 16 | 1.32 | 3.97× | 1.65× | 6.17\* | 1.33× | 9.55× | 7.48\* | 1.80× | 8.23× |
+| 2048 | 8 | 2.35 | 4.45× | 1.54× | 10.91 | 1.56× | 17.1× | 13.29 | 2.07× | 14.4× |
+| 4096 | 4 | 4.42 | 5.00× | 1.49× | 20.67 | 1.70× | 22.1× | 25.15 | 2.27× | 18.4× |
+| 8192 | 2 | 8.51 | 5.19× | 1.48× | 45.67 | 1.57× | 21.7× | 54.39 | 2.13× | 18.5× |
 
-### H200 kernel results
-
-Measured on one NVIDIA H200 (SM90), BF16, PyTorch 2.14.0+cu130, Triton 3.8.0,
-CUDA 13.0, and FlashDeBERTa 0.0.7, using the bundled profile in `profile_only`
-mode. Plots show QK+PV-equivalent throughput and incremental peak memory
-across the six sequence lengths at a fixed total of 16,384 tokens per batch:
-
-![Attention layer QK+PV-equivalent throughput on H200](docs/figures/kernel_throughput_h200.png)
+Forward is fastest at every length. For training, DF Triton leads from length
+512 up. At 128 every implementation's training step is host-bound, so those
+points compare Python and launch overhead rather than kernels. These are
+attention-layer numbers, not full encoder training, and not a comparison with
+plain FlashAttention without relative bias.
 
 ![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
 
-At length 8192 (batch 2), the measured p50 latency and effective throughput
-were:
+Incremental peak allocated memory in GiB, above the process's allocation before
+the measured call:
 
-| Implementation | Forward p50 | Forward TFLOP/s | Forward + backward p50 | Forward + backward TFLOP/s |
-| --- | ---: | ---: | ---: | ---: |
-| Hugging Face eager | 47.40 ms | 8.7 | 119.30 ms | 12.1 |
-| DF PyTorch | 26.33 ms | 15.7 | 153.84 ms | 9.4 |
-| DF Triton | 8.55 ms | 48.2 | 88.91 ms | 16.2 |
-| FlashDeBERTa | 12.45 ms | 33.1 | 659.45 ms | 2.2 |
+| Length | HF forward | DF Triton forward | HF fwd + bwd | DF Triton fwd + bwd | FlashDeBERTa fwd + bwd |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 0.63 | 0.28 | 0.96 | 0.55 | 1.13 |
+| 512 | 1.25 | 0.47 | 1.64 | 1.29 | 0.99 |
+| 2048 | 4.64 | 0.47 | 5.04 | 1.30 | 0.95 |
+| 8192 | 19.07 | 0.47 | 19.47 | 1.30 | 0.94 |
 
-At this length DF Triton is 5.54× faster than Hugging Face eager and 1.46×
-faster than FlashDeBERTa for forward; for forward+backward it is 1.34× and
-7.42× faster, respectively. These are attention-layer measurements, not full
-encoder training numbers. Throughput divides only the dense QK and PV FLOPs by
-the whole layer's time, which also includes the QKV and relative-position
-projections, so it understates GPU utilization, most at short lengths. Timings include each implementation's attention path and are not a
-comparison to plain, no-relative-bias FlashAttention. At short training lengths
-the Triton path is not always fastest (for example, it is slower than the eager
-baseline at lengths 128 and 512).
+DF Triton's memory stays flat with length: at 8192 it allocates 98% less than
+Hugging Face eager for forward and 93% less for forward+backward. FlashDeBERTa
+uses about 0.35 GiB less for training, most of which is DF Triton's per-distance
+position-gradient buffers.
 
-Incremental peak allocated memory at length 8192 was:
+### Benchmark methodology
 
-| Implementation | Forward | Forward + backward |
-| --- | ---: | ---: |
-| Hugging Face eager | 19.70 GiB | 20.10 GiB |
-| DF PyTorch | 9.52 GiB | 12.52 GiB |
-| DF Triton | 0.47 GiB | 1.36 GiB |
-| FlashDeBERTa | 0.49 GiB | 0.97 GiB |
+Install the benchmark dependencies and reproduce the matrix and plots with:
 
-This is allocated tensor memory above the process's pre-measurement CUDA
-allocation, not total device usage. At this length DF Triton reduces incremental
-forward peak allocation by about 98% versus Hugging Face eager; its
-forward+backward allocation is lower by about 93%.
+```bash
+pip install -e ".[benchmark]"
+python -m benchmarks.benchmark_cuda --tuning-mode heuristic --output attention_kernel_results.json
+python -m benchmarks.plot_cuda_results attention_kernel_results.json --output-dir docs/figures
+```
+
+Pass `--tuning-mode profile_only --profile PROFILE.json` to benchmark a tuned
+profile instead; it fails on any workload the profile does not cover.
+
+Each configuration runs in its own process. After one untimed call for
+compilation and setup, Triton's `do_bench` uses 3 ms of warmup and 30 ms of
+timing, flushing L2 before each iteration; processes are separated by one
+second. Backward is timed independently by running forward once and replaying
+`out.backward(grad, retain_graph=True)`.
+
+Timing is eager and therefore includes Python, autograd, and launch overhead.
+Hollow markers identify points where CPU issue time is at least 80% of measured
+latency. The Hugging Face mask and relative-position matrix are constructed
+before timing. The report also records min, p10, median, and p90 latency,
+incremental peak allocated memory, allocator retries, and `cudaMalloc` calls.
 
 ### Kernel tuning profiles
 
@@ -286,31 +280,34 @@ This runs one cold, full GLUE/MNLI matched-validation pass at batch size 8 acros
 Hugging Face, DF PyTorch, DF Triton, and FlashDeBERTa. It reports performance,
 accuracy, numerical error, and classification-decision parity.
 
-To require the bundled H200 configuration and prohibit Triton autotuning:
+To reproduce the release parity run with the portable heuristic and no runtime
+autotuning:
 
 ```bash
 python -m benchmarks.evaluate_mnli \
+  --dtype fp16 \
+  --batch-size 16 \
+  --bucket 512 \
   --require-full-parity \
-  --tuning-mode profile_only \
-  --profile src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json \
-  --output mnli_parity.json
+  --tuning-mode heuristic \
+  --output mnli_parity_fp16_heuristic.json
 ```
 
 ### H200 MNLI decision parity
 
 The full `validation_matched` split (9,815 examples; DeBERTa-v2-xlarge-MNLI)
-was evaluated in FP16 at batch size 16 using the bundled H200 profile. All
+was evaluated in FP16 at batch size 16 using the portable heuristic. All
 implementations and layouts had the same accuracy (91.74%) and zero
 classification-decision mismatches against Hugging Face:
 
 | Variant | Full-split time | Speedup vs. HF eager | Decision mismatches | Maximum absolute logit difference |
 | --- | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 53.01 s | 1.00× | Reference | 0 |
-| DF PyTorch, padded | 55.34 s | 0.96× | 0 / 9,815 | 0.1094 |
-| DF PyTorch, packed | 52.71 s | 1.01× | 0 / 9,815 | 0.1074 |
-| DF Triton, padded | 30.53 s | 1.74× | 0 / 9,815 | 0.0742 |
-| DF Triton, packed | 6.18 s | 8.58× | 0 / 9,815 | 0.0508 |
-| FlashDeBERTa, packed | 22.38 s | 2.37× | 0 / 9,815 | 0.0801 |
+| Hugging Face eager, padded | 53.27 s | 1.00× | Reference | 0 |
+| DF PyTorch, padded | 55.58 s | 0.96× | 0 / 9,815 | 0.1094 |
+| DF PyTorch, packed | 49.93 s | 1.07× | 0 / 9,815 | 0.1074 |
+| DF Triton, padded | 23.25 s | 2.29× | 0 / 9,815 | 0.0752 |
+| DF Triton, packed | 6.94 s | 7.68× | 0 / 9,815 | 0.0752 |
+| FlashDeBERTa, packed | 22.00 s | 2.42× | 0 / 9,815 | 0.0801 |
 
 This is decision parity, not bitwise or elementwise logit parity: the maximum
 logit differences are nonzero. The recorded BF16 run did not meet full decision
