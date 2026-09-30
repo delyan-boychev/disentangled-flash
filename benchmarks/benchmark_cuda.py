@@ -263,7 +263,6 @@ def _prepare_case(args: argparse.Namespace, device: torch.device, dtype: torch.d
     )
     training = args.pass_mode != "forward"
     module.train(training)
-    # Same seed for every implementation, so all of them see identical inputs.
     generator = torch.Generator(device=device).manual_seed(args.seed + 1)
 
     def randn(*shape, requires_grad=training):
@@ -362,9 +361,7 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("BF16 is not supported by this GPU")
 
     operation, clear_gradients, batch_size, num_heads = _prepare_case(args, device, dtype)
-    # One untimed call pays for Triton compilation and lazy setup. do_bench
-    # allocates its L2-flush buffer on first use, so do that here too; the
-    # allocator counters below then only see the implementation.
+    # Exclude compilation, lazy setup, and do_bench's L2 buffer from measurement.
     operation()
     _measure(operation, "do_bench", 0.0, 1.0)
     torch.cuda.synchronize()
@@ -397,8 +394,6 @@ def worker(args: argparse.Namespace) -> dict[str, Any]:
     eager = args.timer == "do_bench"
 
     def counter(name: str) -> int | None:
-        # Graph capture allocates its own pool, so the counters only mean
-        # something for eager timing.
         return after.get(name, 0) - before.get(name, 0) if eager else None
 
     return {

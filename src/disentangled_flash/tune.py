@@ -78,8 +78,6 @@ PRESETS = {
         "dropout": ("off",),
         "search": "full",
     },
-    # A few representative shapes, measuring only the heuristic config and its
-    # neighbors. Uncovered shapes use the heuristic at runtime.
     "standard": {
         "lengths": (128, 512, 2048, 8192),
         "head_dims": (64,),
@@ -91,14 +89,10 @@ PRESETS = {
         "dropout": ("off", "on"),
         "search": "neighborhood",
     },
-    # Full candidate lists over every family; for release profiles.
     "exhaustive": {
         "lengths": TUNING_SEQUENCE_LENGTHS,
-        # All DeBERTa-v2/v3 sizes use head dim 64. xsmall can fall in the <=8
-        # occupancy family, larger models in <=32.
         "head_dims": (64,),
         "batch_heads": TUNING_BATCH_HEADS,
-        # BF16 stands in for the whole half-precision family.
         "dtypes": ("bfloat16", "float32"),
         "relative_modes": ("both",),
         "layouts": ("padded", "packed"),
@@ -270,7 +264,6 @@ def _make_padded_inputs(
     position_plan = position_cache.compact(length, device)
     active_slots = position_plan.active_slots.numel()
     table_width = aligned_slot_count(active_slots)
-    # Head-major storage viewed as [B, H, L, R], as the attention modules produce it.
     relative_shape = (num_heads, batch_size, length, table_width)
     c2p = (
         torch.randn(relative_shape, device=device, dtype=dtype).permute(1, 0, 2, 3)
@@ -478,7 +471,6 @@ def _make_training_inputs(
     )
     position_plan = position_cache.compact(case.sequence_length, device)
     active_slots = position_plan.active_slots.numel()
-    # Same aligned width as the training module; the extra rows are never indexed.
     position_shape = (num_heads, aligned_slot_count(active_slots), case.head_dim)
     pos_key = (
         torch.randn(position_shape, device=device, dtype=dtype, requires_grad=True)
@@ -503,7 +495,6 @@ def _make_training_inputs(
         score_scale=(case.head_dim * scale_factor) ** -0.5,
         dropout_p=dropout_p,
         gradient_band=position_plan.gradient_band,
-        # Fixed seed so every candidate sees the reference's mask.
         dropout_seed=(
             torch.tensor([0x1BF52], device=device, dtype=torch.int64) if dropout_p else None
         ),
@@ -1157,7 +1148,6 @@ def run(args: argparse.Namespace) -> None:
             return search_neighborhood(heuristic_for(workload, batch_heads), safe)
         return safe
 
-    # Re-tune saved winners this GPU can't run.
     completed = {
         workload
         for workload, entry in seed_entries.items()

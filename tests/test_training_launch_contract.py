@@ -215,7 +215,6 @@ def test_autograd_contexts_match_op_signatures():
             for node in ast.walk(_function(module, backward))
             if isinstance(node, ast.Call) and getattr(node.func, "id", "") == backward_op
         )
-        # *ctx.band expands to two values; *ctx.dq_config and *ctx.dkv_config to four.
         widths = {"ctx.band": 2, "ctx.dq_config": 4, "ctx.dkv_config": 4}
         passed = sum(
             widths[ast.unparse(arg.value)] if isinstance(arg, ast.Starred) else 1
@@ -236,7 +235,6 @@ def test_backward_kernels_accept_and_receive_the_gradient_band():
     ):
         function = _function(module, name)
         assert band <= {arg.arg for arg in function.args.args}, name
-        # Gradient rows use their own width, not the position-table width.
         assert "atomic_add" in ast.unparse(function), name
     for name in ("_training_attention_backward_op", "_training_attention_packed_backward_op"):
         launches = [
@@ -268,7 +266,6 @@ def test_band_columns_fold_back_into_slot_gradients():
     table = torch.randn(heads, slots + 3, head_dim, dtype=torch.float64)
     grad_pairs = torch.randn(heads, length, length, dtype=torch.float64)
 
-    # Reference: scatter every pair gradient into its slot.
     positions = torch.arange(length)
     distance = positions[:, None] - positions[None, :] + length - 1
     slot = plan.delta_to_local.long()[distance]
@@ -276,7 +273,6 @@ def test_band_columns_fold_back_into_slot_gradients():
     grad_slots.scatter_add_(2, slot.expand(heads, -1, -1), grad_pairs)
     expected = _position_gradients(grad_slots, rows, table, torch.empty(0, dtype=torch.long))
 
-    # Band: one column per distance, saturated ends summed.
     column = (distance - band.low).clamp(0, band.high - band.low)
     grad_columns = torch.zeros(heads, length, band.column_slots.numel(), dtype=torch.float64)
     grad_columns.scatter_add_(2, column.expand(heads, -1, -1), grad_pairs)

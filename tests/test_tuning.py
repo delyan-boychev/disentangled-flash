@@ -186,7 +186,6 @@ def test_exhaustive_covers_supported_deberta_variants_and_all_kernel_phases():
     assert exhaustive["search"] == "full"
     args = build_parser().parse_args(["--output", "profile.json", "--preset", "exhaustive"])
     cases = list(_cases(args))
-    # 9 lengths x 2 occupancies x (half, FP32 strict, FP32 fast) x 3 layouts.
     assert len(cases) == 162
     assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 1134
 
@@ -196,7 +195,6 @@ def test_standard_is_the_default_and_stays_small():
     assert args.preset == "standard"
     assert PRESETS["standard"]["search"] == "neighborhood"
     cases = list(_cases(args))
-    # 4 lengths x 3 layouts, BF16 only.
     assert len(cases) == 12
     assert len(cases) + 3 * len(cases) * len(_dropout_modes(args)) == 84
 
@@ -1016,7 +1014,6 @@ def test_config_resolution_compiles_with_fullgraph_and_one_graph_per_family(monk
         expected = launcher(torch.ones(batch, length))
         torch.testing.assert_close(compiled(torch.ones(batch, length)), expected)
 
-    # 100 and 120 share the 128 family and the batch never recompiles; 700 is new.
     assert counter.frame_count == 2
 
 
@@ -1093,7 +1090,6 @@ def test_heuristic_matches_the_h200_profile_for_saturated_inference():
 @pytest.mark.parametrize(
     ("phase", "length", "expected"),
     [
-        # Best or near-best in H200 sweeps at the benchmark shapes.
         ("training_forward", 128, KernelConfig(64, 64, 4, 2)),
         ("training_forward", 512, KernelConfig(64, 64, 4, 2)),
         ("backward_dq", 128, KernelConfig(64, 32, 4)),

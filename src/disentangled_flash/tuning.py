@@ -278,7 +278,6 @@ def conservative_candidates(
 
 
 FORWARD_PHASES = frozenset({"inference", "training_forward"})
-# Rough per-thread register budget; the heuristic avoids configs that would spill.
 REGISTER_BUDGET = 160
 
 
@@ -292,8 +291,6 @@ class DeviceResources:
 
     @property
     def pipelines_loads(self) -> bool:
-        # Asynchronous global-to-shared copies, which multi-stage pipelines need,
-        # arrived with compute capability 8.0.
         return self.compute_capability >= (8, 0)
 
     @classmethod
@@ -313,7 +310,6 @@ def _device_resources(index: int) -> DeviceResources:
     properties = torch.cuda.get_device_properties(index)
     shared_memory = getattr(properties, "shared_memory_per_block_optin", 0)
     if not shared_memory:
-        # 48 KiB is always available if torch doesn't report the opt-in limit.
         shared_memory = getattr(properties, "shared_memory_per_block", 48 * 1024)
     return DeviceResources(
         shared_memory_per_block=int(shared_memory),
@@ -366,7 +362,6 @@ def fits_device(
     dtype: str,
     resources: DeviceResources,
 ) -> bool:
-    # Leave headroom for Triton's own shared memory.
     budget = int(resources.shared_memory_per_block * 0.9)
     return estimate_shared_memory(config, phase=phase, head_dim=head_dim, dtype=dtype) <= budget
 
@@ -395,7 +390,6 @@ HEURISTIC_FLOOR = KernelConfig(16, 16, 4)
 
 
 def _base_heuristic(phase: str, sequence_length: int, dtype: str) -> KernelConfig:
-    # Configs that win when the GPU is saturated; smaller batches shrink them later.
     fp32 = tuning_dtype(dtype) == "float32"
     if phase == "inference" and sequence_length <= 128:
         return KernelConfig(32, 64, 4)
@@ -441,7 +435,6 @@ def heuristic_config(
     config = _base_heuristic(phase, length, dtype)
     if head_dim >= 128 and config.block_m * config.block_n > 256:
         config = _shrink(config)
-    # Two stages help forward once there are several K/V tiles to stream.
     if (
         phase in FORWARD_PHASES
         and tuning_dtype(dtype) == "half"
@@ -456,7 +449,6 @@ def heuristic_config(
     ):
         config = _shrink(config)
 
-    # dK/dV launches one program per key tile, the others one per query tile.
     parallel = "block_n" if phase == "backward_dkv" else "block_m"
     while batch_heads is not None and getattr(config, parallel) > 16:
         programs = -(-sequence_length // getattr(config, parallel)) * batch_heads
@@ -1158,7 +1150,6 @@ def occupancy_family(batch_heads: Any) -> int:
     return TUNING_BATCH_HEADS[-1]
 
 
-# Registries are looked up by id so the resolver below only takes constants.
 _REGISTRIES: dict[int, ProfileRegistry] = {}
 
 
