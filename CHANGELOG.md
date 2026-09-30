@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-09-30
+
+### Documentation
+
+- Simplify throughput figure labels ([76fdf02](https://github.com/delyan-boychev/disentangled-flash/commit/76fdf023703b9c3717e2f0d8f60d102230961e5d))
+- Restore three-pass throughput figure ([7863671](https://github.com/delyan-boychev/disentangled-flash/commit/78636714d12be96c4bed9c42840c6289120b2783))
+
+### Miscellaneous Tasks
+
+- Default to a portable heuristic instead of runtime autotuning
+
+Pick launch configs from saved profiles and, on a miss, from a heuristic
+that depends only on the workload and on limits the GPU reports (shared
+memory per block, SM count). Configs that don't fit are dropped before
+compiling, and tiles are split when a launch would leave SMs idle. The
+same resolver runs under torch.compile, where it is evaluated once while
+tracing and recompiles only per length family. mode="heuristic" ignores
+profiles; mode="autotune" keeps runtime autotuning.
+
+The tuner's default standard preset now measures only the heuristic
+config and its nearest candidates on a few representative shapes; the
+previous full matrix is the exhaustive preset. --verbose prints every
+measured candidate.
+
+Training now projects Q/K/V with one GEMM over the original parameters.
+
+The kernel fingerprint ignores module classes and imports. The bundled
+H200 profile's fingerprint was updated after checking that the kernel
+and launch code is unchanged. ([73c88ae](https://github.com/delyan-boychev/disentangled-flash/commit/73c88aec0822267e98337bb5b1d4f43b5cc61ba8))
+
+### Bench
+
+- Finalize release performance results ([c55d83a](https://github.com/delyan-boychev/disentangled-flash/commit/c55d83a84b4b218eae33655b48ba38e86052fd05))
+
 ## [1.0.0] - 2026-09-29
 
 ### Bug Fixes
