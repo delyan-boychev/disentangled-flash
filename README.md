@@ -238,15 +238,17 @@ persistent Triton cache. Both runs kept 91.74% accuracy and zero mismatches.
 
 | Variant | Cold full-split time | Compiled-cache time | Cold speedup vs HF | Compiled speedup vs HF | Decision mismatches |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 88.67 s | 88.74 s | 1.00× | 1.00× | Reference |
-| DF Triton, padded | 40.85 s | 38.15 s | 2.17× | 2.33× | 0 / 9,815 |
-| DF Triton, packed | 17.27 s | **8.46 s** | 5.14× | **10.49×** | 0 / 9,815 |
-| FlashDeBERTa, packed | 43.44 s | 39.15 s | 2.04× | 2.27× | 0 / 9,815 |
+| Hugging Face eager, padded | 88.85 s | 88.67 s | 1.00× | 1.00× | Reference |
+| DF Triton, padded | 38.96 s | 37.50 s | 2.28× | 2.36× | 0 / 9,815 |
+| DF Triton, packed | **8.28 s** | **7.33 s** | **10.73×** | **12.10×** | 0 / 9,815 |
+| FlashDeBERTa, packed | 39.16 s | 38.86 s | 2.27× | 2.28× | 0 / 9,815 |
 
 `heuristic` skips configuration search, not JIT compilation. Set
-`TRITON_CACHE_DIR` to persistent storage to reuse the compiled binaries. The
-8.81-second cold-to-cached difference for packed DF Triton also includes normal
-run-to-run variation.
+`TRITON_CACHE_DIR` to fast persistent storage: a cold run writes compiled
+artifacts, and later processes read them before the first iteration. Slow cache
+I/O can dominate startup even when no recompilation is needed. The 0.95-second
+cold-to-cached difference for packed DF Triton also includes normal run-to-run
+variation.
 
 ## CUDA validation
 
