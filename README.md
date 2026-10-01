@@ -144,6 +144,38 @@ Hugging Face eager for forward and 93% less for forward+backward. FlashDeBERTa
 uses about 0.35 GiB less for training, most of which is DF Triton's per-distance
 position-gradient buffers.
 
+### RTX PRO 6000 Blackwell
+
+- **Hardware:** one NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120).
+- **Software:** BF16, PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
+  Transformers 5.18.0, and FlashDeBERTa 0.0.7.
+- **Shape:** 12 heads, head dimension 64, sequence lengths 128 to 8192, and
+  `batch = 16384 / length`.
+- **Passes:** forward, backward, and forward + backward, with dropout disabled.
+- **DF Triton policy:** built-in heuristic, without runtime tuning or a saved
+  profile.
+
+![Attention layer throughput on RTX PRO 6000 Blackwell](docs/figures/kernel_throughput_rtx6000.png)
+
+Median latency in milliseconds, and DF Triton's speedup over Hugging Face eager
+and FlashDeBERTa:
+
+| Length | Batch | Forward | vs HF | vs FlashDeBERTa | Backward | vs HF | vs FlashDeBERTa | Fwd + bwd | vs HF | vs FlashDeBERTa |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 128 | 128 | 0.57 | 2.92× | 3.16× | 2.01 | 1.73× | 1.76× | 2.49 | 2.02× | 2.08× |
+| 512 | 32 | 0.95 | 4.90× | 1.74× | 4.69 | 1.44× | 1.87× | 5.53 | 2.01× | 1.81× |
+| 1024 | 16 | 1.25 | 6.69× | 1.67× | 6.00 | 2.02× | 5.85× | 7.04 | 2.84× | 5.18× |
+| 2048 | 8 | 1.88 | 8.41× | 1.62× | 8.55 | 2.73× | 13.9× | 10.28 | 3.71× | 11.1× |
+| 4096 | 4 | 3.03 | 12.9× | 1.64× | 13.89 | 3.61× | 19.9× | 16.90 | 5.21× | 16.7× |
+| 8192 | 2 | 5.50 | 14.4× | 1.57× | 29.35 | 3.32× | 20.6× | 34.88 | 5.04× | 17.6× |
+
+![Attention kernel incremental peak memory on RTX PRO 6000 Blackwell](docs/figures/kernel_memory_rtx6000.png)
+
+DF Triton's incremental peak allocation is 0.47 GiB for forward and 1.30 GiB
+for forward+backward at length 8192, compared with 19.07 GiB and 19.47 GiB for
+Hugging Face eager. All 72 configurations completed without allocator retries
+or `cudaMalloc` calls during timing.
+
 ### Benchmark methodology
 
 Install the benchmark dependencies and reproduce the matrix and plots with:
@@ -314,6 +346,28 @@ logit differences are nonzero. The recorded BF16 run did not meet full decision
 parity, so the FP16 result above is the release parity claim. Full-split times
 are from one evaluation run on the H200 at batch size 16, and include the
 benchmark's end-to-end MNLI evaluation path; they are not kernel-only timings.
+
+### RTX PRO 6000 Blackwell MNLI cold start and compiled cache
+
+The same full split was evaluated in FP16 at batch size 8 with heuristic launch
+selection. The first run includes cold compilation; the second was recorded
+after the persistent Triton cache had been populated. Both runs had 91.74%
+accuracy and zero decision mismatches for every variant.
+
+| Variant | Cold full-split time | Compiled-cache time | Cold speedup vs HF | Compiled speedup vs HF | Decision mismatches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hugging Face eager, padded | 88.67 s | 88.74 s | 1.00× | 1.00× | Reference |
+| DF Triton, padded | 40.85 s | 38.15 s | 2.17× | 2.33× | 0 / 9,815 |
+| DF Triton, packed | 17.27 s | **8.46 s** | 5.14× | **10.49×** | 0 / 9,815 |
+| FlashDeBERTa, packed | 43.44 s | 39.15 s | 2.04× | 2.27× | 0 / 9,815 |
+
+The cold timing starts immediately before the first forward and therefore
+includes first-use kernel compilation. `heuristic` skips configuration search,
+but the selected Triton kernels still require one JIT compilation. With
+`TRITON_CACHE_DIR` on persistent storage, later processes load those compiled
+binaries. The observed cold-to-compiled difference is 8.81 seconds for packed
+DF Triton; it includes normal run-to-run variation and is not an isolated
+compiler microbenchmark.
 
 ## CUDA validation
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,16 @@ def _attention_tflops(row: pd.Series) -> float:
 def _length_label(value: int) -> str:
     integer = int(value)
     return f"{integer // 1024}k" if integer >= 1024 else str(integer)
+
+
+def _gpu_output_suffix(gpu: str) -> str:
+    normalized = gpu.lower()
+    if "h200" in normalized:
+        return "h200"
+    if "rtx" in normalized and "6000" in normalized:
+        return "rtx6000"
+    suffix = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return suffix or "cuda"
 
 
 def _memory_label(value: float, _position: int) -> str:
@@ -245,13 +256,14 @@ def make_release_figures(
         },
     )
     output_dir.mkdir(parents=True, exist_ok=True)
+    gpu_suffix = _gpu_output_suffix(str(usable["gpu"].iloc[0]))
     throughput = _make_metric_figure(
         usable,
         configuration,
         metric="attention_tflops",
         title="Disentangled-attention throughput",
         ylabel="TFLOP/s",
-        output_stem="kernel_throughput_h200",
+        output_stem=f"kernel_throughput_{gpu_suffix}",
         output_dir=output_dir,
         dpi=dpi,
     )
@@ -261,7 +273,7 @@ def make_release_figures(
         metric="peak_memory_gib",
         title="Attention incremental peak memory",
         ylabel="Incremental peak memory (GiB, log₂ scale)",
-        output_stem="kernel_memory_h200",
+        output_stem=f"kernel_memory_{gpu_suffix}",
         output_dir=output_dir,
         dpi=dpi,
     )

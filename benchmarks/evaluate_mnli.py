@@ -256,7 +256,7 @@ def forward_model(
 def load_hf_model(model_name: str, *, device: torch.device, dtype: torch.dtype):
     from transformers import AutoModelForSequenceClassification
 
-    model = AutoModelForSequenceClassification.from_pretrained(model_name, torch_dtype=dtype)
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, dtype=dtype)
     return model.to(device=device).eval()
 
 
@@ -280,7 +280,7 @@ def load_variant_model(
             ) from exc
         model = FlashDebertaV2ForSequenceClassification.from_pretrained(
             model_name,
-            torch_dtype=dtype,
+            dtype=dtype,
         )
         return model.to(device=device).eval()
 
