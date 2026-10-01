@@ -41,7 +41,7 @@ def _resolve_backend(
     config: Any,
     inference: bool,
 ) -> str:
-    """Resolve backend selection without falling back to Hugging Face attention."""
+    """Resolve whether the optimized implementation can use Triton."""
 
     if backend not in {"auto", "torch", "triton"}:
         raise ValueError("backend must be 'auto', 'torch', or 'triton'")
@@ -653,6 +653,16 @@ def _enable_deberta(
     if inference and sequence_lengths is not None and was_training:
         raise RuntimeError("call model.eval() before preparing inference buckets")
 
+    first_attention = model.encoder.layer[0].attention.self
+    resolved_backend = _resolve_backend(
+        backend,
+        source_attention=first_attention,
+        config=model.config,
+        inference=inference,
+    )
+    if backend != "torch" and resolved_backend != "triton":
+        return model
+
     model.encoder = DebertaV2OptimizedEncoder(
         model.encoder,
         model.config,
@@ -788,8 +798,10 @@ def optimize_deberta(
     """Enable the optimized DeBERTa encoder.
 
     Use inference=False before building an optimizer so parameters stay
-    trainable. backend="triton" falls back to PyTorch when Triton can't run the
-    model; backend="auto" also checks device and dtype.
+    trainable. ``backend="triton"`` keeps the original Hugging Face encoder when
+    Triton is unavailable or the model shape is unsupported; ``backend="auto"``
+    also checks device and dtype. Select ``backend="torch"`` explicitly to use
+    the optimized PyTorch implementation.
     """
 
     return _enable_deberta(

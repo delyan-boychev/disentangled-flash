@@ -25,11 +25,14 @@ backward.
 - **fused QKV projection is always enabled** for the PyTorch/Triton backends
 
 The training Triton path requires self-attention and head dimensions 32, 64, or
-128. Attention-probability dropout (`attention_probs_dropout_prob`) runs inside
+128. If Triton is unavailable or unsupported, the original Hugging Face
+attention remains in place; select `backend="torch"` explicitly to use the
+optimized PyTorch implementation. Attention-probability dropout
+(`attention_probs_dropout_prob`) runs inside
 the fused kernels: like FlashAttention, the Philox mask is regenerated in the
 backward pass instead of being stored. It does not yet support
 `output_attentions=True` or custom pairwise relative-position tensors. CPU/MPS
-use the differentiable PyTorch backend rather than Triton.
+use the original Hugging Face attention rather than Triton.
 
 > [!IMPORTANT]
 > The Triton kernel has been validated on NVIDIA RTX A6000 (SM86), RTX 6000 Ada
