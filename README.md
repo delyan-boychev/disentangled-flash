@@ -91,8 +91,8 @@ These are BF16 attention-layer results with 12 heads, head dimension 64,
 DeBERTa C2P/P2C attention. DF Triton uses the built-in heuristic, not a tuned
 profile.
 
-Both machines used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0, and
-FlashDeBERTa 0.0.7; Transformers was 5.17.0 on H200 and 5.18.0 on RTX.
+Both machines used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
+Transformers 5.18.0, and FlashDeBERTa 0.0.7.
 
 TFLOP/s is FLOPs divided by time. For batch `B`, heads `H`, length `L`, head
 dimension `D`, and `R` active relative-position rows, we count
@@ -106,7 +106,7 @@ gathers, and projection layers.
 
 ![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
 
-At length 8192, DF Triton is 5.19× faster than Hugging Face forward and 2.13×
+At length 8192, DF Triton is 5.18× faster than Hugging Face forward and 2.15×
 faster for forward+backward. Incremental peak memory is 0.47 GiB forward and
 1.30 GiB combined, versus 19.07 GiB and 19.47 GiB for Hugging Face.
 
@@ -120,6 +120,11 @@ At length 8192, DF Triton is 14.4× faster than Hugging Face forward and 5.04×
 faster combined; against FlashDeBERTa it is 1.57× and 17.6× faster. Peak memory
 matches the H200 run. All 72 cases completed without allocator retries or
 `cudaMalloc` calls during timing.
+
+Short backward cases are sensitive to Python, autograd, and launch overhead;
+on H200 this dominates the length-128 backward measurements. Longer sequences
+are GPU-compute dominated. The plots show measured eager throughput without a
+separate host-bound marker.
 
 ### Benchmark methodology
 
@@ -209,7 +214,7 @@ decision parity. The release command is:
 ```bash
 python -m benchmarks.evaluate_mnli \
   --dtype fp16 \
-  --batch-size 16 \
+  --batch-size 8 \
   --bucket 512 \
   --require-full-parity \
   --tuning-mode heuristic \
@@ -218,23 +223,19 @@ python -m benchmarks.evaluate_mnli \
 
 ### H200
 
-On the full 9,815-example split in FP16 at batch size 16, every backend reached
+On the full 9,815-example split in FP16 at batch size 8, every backend reached
 91.74% accuracy with zero decision mismatches against Hugging Face.
 
-| Variant | Full-split time | Speedup vs. HF eager | Decision mismatches | Maximum absolute logit difference |
-| --- | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 53.27 s | 1.00× | Reference | 0 |
-| DF Triton, padded | 23.25 s | 2.29× | 0 / 9,815 | 0.0752 |
-| DF Triton, packed | 6.94 s | 7.68× | 0 / 9,815 | 0.0752 |
-| FlashDeBERTa, packed | 22.00 s | 2.42× | 0 / 9,815 | 0.0801 |
-
-This is decision parity, not bitwise logit equality. The recorded BF16 run did
-not meet full decision parity, so the release claim uses FP16.
+| Variant | Cold time | Compiled-cache time | Cold speedup | Compiled speedup | Decision mismatches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hugging Face eager, padded | 55.49 s | 55.70 s | 1.00× | 1.00× | Reference |
+| DF Triton, padded | 24.24 s | 23.38 s | 2.29× | 2.38× | 0 / 9,815 |
+| DF Triton, packed | **11.52 s** | **9.99 s** | **4.82×** | **5.58×** | 0 / 9,815 |
+| FlashDeBERTa, packed | 24.41 s | 23.99 s | 2.27× | 2.32× | 0 / 9,815 |
 
 ### RTX PRO 6000 Blackwell
 
-At batch size 8, the first run includes JIT compilation; the second reuses the
-persistent Triton cache. Both runs kept 91.74% accuracy and zero mismatches.
+The same FP16, batch-8 setup also kept 91.74% accuracy and zero mismatches.
 
 | Variant | Cold full-split time | Compiled-cache time | Cold speedup vs HF | Compiled speedup vs HF | Decision mismatches |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -243,12 +244,15 @@ persistent Triton cache. Both runs kept 91.74% accuracy and zero mismatches.
 | DF Triton, packed | **8.28 s** | **7.33 s** | **10.73×** | **12.10×** | 0 / 9,815 |
 | FlashDeBERTa, packed | 39.16 s | 38.86 s | 2.27× | 2.28× | 0 / 9,815 |
 
-`heuristic` skips configuration search, not JIT compilation. Set
-`TRITON_CACHE_DIR` to fast persistent storage: a cold run writes compiled
-artifacts, and later processes read them before the first iteration. Slow cache
-I/O can dominate startup even when no recompilation is needed. The 0.95-second
-cold-to-cached difference for packed DF Triton also includes normal run-to-run
-variation.
+Cold timings include JIT compilation; compiled-cache timings come from a new
+process reusing those binaries. `heuristic` skips configuration search, not
+compilation. Put `TRITON_CACHE_DIR` on fast persistent storage: cold runs write
+artifacts and later processes read them before the first iteration, so slow
+cache I/O can dominate startup. These differences also include normal
+run-to-run variation.
+
+This is decision parity, not bitwise logit equality. The recorded BF16 run did
+not meet full decision parity, so the release claim uses FP16.
 
 ## CUDA validation
 

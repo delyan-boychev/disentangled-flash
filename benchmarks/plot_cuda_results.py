@@ -19,8 +19,6 @@ import seaborn as sns
 from matplotlib.ticker import FuncFormatter
 
 GIB = 1024**3
-# Host issue time at or above this fraction of latency marks a CPU-bound point.
-HOST_BOUND_FRACTION = 0.8
 _PALETTE = sns.color_palette("colorblind")
 SERIES = (
     ("base", "Hugging Face eager", _PALETTE[0], "o", (4, 2), 1.8),
@@ -103,13 +101,7 @@ def _memory_ticks(values: pd.Series) -> tuple[float, ...]:
     return tuple(ticks)
 
 
-def _host_bound(rows: pd.DataFrame) -> pd.Series:
-    if "host_ms_per_iter" not in rows:
-        return pd.Series(False, index=rows.index)
-    return rows["host_ms_per_iter"] >= HOST_BOUND_FRACTION * rows["p50_ms"]
-
-
-def _plot_series(axis: Any, panel: pd.DataFrame, metric: str, *, mark_host_bound: bool) -> None:
+def _plot_series(axis: Any, panel: pd.DataFrame, metric: str) -> None:
     for implementation, label, color, marker, dashes, linewidth in SERIES:
         rows = panel[panel["implementation"].eq(implementation)].sort_values("sequence_length")
         if rows.empty:
@@ -123,18 +115,16 @@ def _plot_series(axis: Any, panel: pd.DataFrame, metric: str, *, mark_host_bound
             zorder=3 if implementation == "triton" else 2,
         )
         line.set_dashes(dashes or (None, None))
-        host_bound = _host_bound(rows) if mark_host_bound else pd.Series(False, index=rows.index)
-        for hollow, points in rows.groupby(host_bound):
-            axis.scatter(
-                points["sequence_length"],
-                points[metric],
-                marker=marker,
-                s=34 if implementation == "triton" else 26,
-                facecolor="white" if hollow else color,
-                edgecolor=color,
-                linewidth=1.4,
-                zorder=4,
-            )
+        axis.scatter(
+            rows["sequence_length"],
+            rows[metric],
+            marker=marker,
+            s=34 if implementation == "triton" else 26,
+            facecolor=color,
+            edgecolor=color,
+            linewidth=1.4,
+            zorder=4,
+        )
 
 
 def _style_axis(axis: Any, lengths: list[int], tick_labels: list[str]) -> None:
@@ -173,7 +163,7 @@ def _make_metric_figure(
     for index, pass_mode in enumerate(passes):
         axis = axes[index]
         panel = usable[usable["pass"].eq(pass_mode)]
-        _plot_series(axis, panel, metric, mark_host_bound=timing)
+        _plot_series(axis, panel, metric)
         _style_axis(axis, lengths, tick_labels)
         axis.set_title(PASS_TITLES[pass_mode], loc="left", fontweight="bold")
         axis.set_xlabel("Sequence length")
@@ -214,7 +204,7 @@ def _make_metric_figure(
             "FLOPs per B,H: forward 4L²D + 4LRD  ·  "
             "backward 10L²D + 12LRD  ·  combined 14L²D + 16LRD"
         )
-        setup_footer += "  ·  median of do_bench  ·  hollow markers: host-bound"
+        setup_footer += "  ·  median of do_bench"
         figure.text(0.5, 0.048, formula_footer, ha="center", fontsize=8.7, color="#454A52")
     figure.text(0.5, 0.018, setup_footer, ha="center", fontsize=9, color="#5A5F66")
     figure.tight_layout(rect=(0, 0.085 if timing else 0.05, 1, 0.9), w_pad=2.2)
