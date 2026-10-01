@@ -441,6 +441,7 @@ def test_plot_output_suffix_uses_short_gpu_names():
     spec.loader.exec_module(plot)
 
     assert plot._gpu_output_suffix("NVIDIA H200") == "h200"
+    assert plot._gpu_output_suffix("NVIDIA RTX A6000") == "a6000"
     assert plot._gpu_output_suffix("NVIDIA RTX PRO 6000 Blackwell Server Edition") == "rtx6000"
     assert plot._gpu_output_suffix("Example GPU 123") == "example_gpu_123"
 

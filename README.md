@@ -32,10 +32,10 @@ backward pass instead of being stored. It does not yet support
 use the differentiable PyTorch backend rather than Triton.
 
 > [!IMPORTANT]
-> The Triton kernel has been validated on NVIDIA RTX 6000 Ada (SM89), H200
-> (SM90), and RTX PRO 6000 Blackwell (SM120). A reviewed H200 profile ships in
-> the package; other GPUs use the portable heuristic and should be validated
-> locally.
+> The Triton kernel has been validated on NVIDIA RTX A6000 (SM86), RTX 6000 Ada
+> (SM89), H200 (SM90), and RTX PRO 6000 Blackwell (SM120). A reviewed H200
+> profile ships in the package; other GPUs use the portable heuristic and
+> should be validated locally.
 
 ## Install
 
@@ -91,8 +91,8 @@ These are BF16 attention-layer results with 12 heads, head dimension 64,
 DeBERTa C2P/P2C attention. DF Triton uses the built-in heuristic, not a tuned
 profile.
 
-Both machines used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
-Transformers 5.18.0, and FlashDeBERTa 0.0.7.
+These runs used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0, Transformers
+5.18.0, and FlashDeBERTa 0.0.7.
 
 TFLOP/s is FLOPs divided by time. For batch `B`, heads `H`, length `L`, head
 dimension `D`, and `R` active relative-position rows, we count
@@ -125,6 +125,17 @@ At length 8192, DF Triton is 14.4× faster than Hugging Face forward and 5.04×
 faster combined; against FlashDeBERTa it is 1.57× and 17.6× faster. Peak memory
 matches the H200 run. All 72 cases completed without allocator retries or
 `cudaMalloc` calls during timing.
+
+### NVIDIA RTX A6000
+
+![Attention layer throughput on RTX A6000](docs/figures/kernel_throughput_a6000.png)
+
+![Attention kernel incremental peak memory on RTX A6000](docs/figures/kernel_memory_a6000.png)
+
+At length 8192, DF Triton is 11.5× faster than Hugging Face forward and 51.3×
+faster combined; against FlashDeBERTa it is 1.34× and 17.8× faster. Incremental
+peak memory is again 0.47 GiB forward and 1.30 GiB combined. All 72 cases
+completed without allocator retries or `cudaMalloc` calls during timing.
 
 Short backward cases are sensitive to Python, autograd, and launch overhead;
 on H200 this dominates the length-128 backward measurements. Longer sequences
@@ -248,6 +259,17 @@ The same FP16, batch-8 setup also kept 91.74% accuracy and zero mismatches.
 | DF Triton, padded | 38.96 s | 37.50 s | 2.28× | 2.36× | 0 / 9,815 |
 | DF Triton, packed | **8.28 s** | **7.33 s** | **10.73×** | **12.10×** | 0 / 9,815 |
 | FlashDeBERTa, packed | 39.16 s | 38.86 s | 2.27× | 2.28× | 0 / 9,815 |
+
+### RTX A6000
+
+The same FP16, batch-8 run reached 91.74% accuracy with zero mismatches.
+
+| Variant | Cold time | Compiled-cache time | Cold speedup | Compiled speedup | Decision mismatches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Hugging Face eager, padded | 235.63 s | 236.12 s | 1.00× | 1.00× | Reference |
+| DF Triton, padded | 112.38 s | 111.46 s | 2.10× | 2.12× | 0 / 9,815 |
+| DF Triton, packed | **18.64 s** | **16.37 s** | **12.64×** | **14.42×** | 0 / 9,815 |
+| FlashDeBERTa, packed | 112.37 s | 112.08 s | 2.10× | 2.11× | 0 / 9,815 |
 
 Cold timings include JIT compilation; compiled-cache timings come from a new
 process reusing those binaries. `heuristic` skips configuration search, not

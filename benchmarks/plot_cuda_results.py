@@ -80,6 +80,8 @@ def _gpu_output_suffix(gpu: str) -> str:
     normalized = gpu.lower()
     if "h200" in normalized:
         return "h200"
+    if "a6000" in normalized:
+        return "a6000"
     if "rtx" in normalized and "6000" in normalized:
         return "rtx6000"
     suffix = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
