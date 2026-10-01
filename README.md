@@ -89,7 +89,8 @@ dQ, and dK/dV kernels.
 These are BF16 attention-layer results with 12 heads, head dimension 64,
 16,384 active tokens per batch, and no dropout. All backends compute exact
 DeBERTa C2P/P2C attention. DF Triton uses the built-in heuristic, not a tuned
-profile.
+profile. Inputs use the padded-shaped layout with every token active; packed is
+omitted because there is no padding to remove.
 
 These runs used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0, Transformers
 5.18.0, and FlashDeBERTa 0.0.7.
