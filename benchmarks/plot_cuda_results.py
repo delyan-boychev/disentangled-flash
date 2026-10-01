@@ -200,14 +200,9 @@ def _make_metric_figure(
         f"{configuration.get('total_tokens', 16384):,} tokens per batch"
     )
     if timing:
-        formula_footer = (
-            "FLOPs per B,H: forward 4L²D + 4LRD  ·  "
-            "backward 10L²D + 12LRD  ·  combined 14L²D + 16LRD"
-        )
         setup_footer += "  ·  median of do_bench"
-        figure.text(0.5, 0.048, formula_footer, ha="center", fontsize=8.7, color="#454A52")
     figure.text(0.5, 0.018, setup_footer, ha="center", fontsize=9, color="#5A5F66")
-    figure.tight_layout(rect=(0, 0.085 if timing else 0.05, 1, 0.9), w_pad=2.2)
+    figure.tight_layout(rect=(0, 0.05, 1, 0.9), w_pad=2.2)
 
     png = output_dir / f"{output_stem}.png"
     pdf = output_dir / f"{output_stem}.pdf"

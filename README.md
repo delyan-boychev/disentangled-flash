@@ -100,6 +100,11 @@ dimension `D`, and `R` active relative-position rows, we count
 `BH(14L²D + 16LRD)` combined. As in FlashAttention, this excludes softmax,
 gathers, and projection layers.
 
+The forward count comes from two dense matrix products, QK and PV
+(`2L²D` each), plus C2P and P2C (`2LRD` each). Backward recomputes the score
+products and forms gradients for both operands: `10L²D` for QK/PV and `12LRD`
+for C2P/P2C. Forward + backward is their sum.
+
 ### NVIDIA H200
 
 ![Attention layer throughput on H200](docs/figures/kernel_throughput_h200.png)
