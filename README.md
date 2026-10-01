@@ -8,14 +8,14 @@
 
 DisentangledFlash provides fused Triton and optimized PyTorch backends
 for bidirectional DeBERTa-v2/v3 attention without materializing the
-`[B, H, L, L]` attention matrix, including inference and experimental
-differentiable training paths.
+`[B, H, L, L]` attention matrix, including inference and training with fused
+backward.
 
 
 ## Status
 
 - NVIDIA CUDA + Triton
-- inference plus experimental differentiable training/backward
+- inference and training, including fused backward
 - DeBERTa-v2/v3-style C2P/P2C disentangled attention
 - FP16, BF16, strict FP32, and optional fast FP32/TF32 mode
 - head dimensions 32, 64, and 128
