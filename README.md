@@ -105,37 +105,42 @@ The forward count comes from two dense matrix products, QK and PV
 products and forms gradients for both operands: `10L²D` for QK/PV and `12LRD`
 for C2P/P2C. Forward + backward is their sum.
 
-### NVIDIA H200
+### Length-8192 summary
+
+| GPU | Pass | DF Triton latency | vs. Hugging Face | vs. FlashDeBERTa | DF peak memory |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **H200** | Forward | 8.48 ms | 5.18× | 1.47× | 0.47 GiB |
+|  | Backward | 45.26 ms | 1.58× | 21.88× | 1.20 GiB |
+|  | Forward + backward | 53.80 ms | 2.15× | 18.62× | 1.30 GiB |
+| **RTX PRO 6000 Blackwell** | Forward | 5.50 ms | 14.44× | 1.57× | 0.47 GiB |
+|  | Backward | 29.35 ms | 3.32× | 20.59× | 1.20 GiB |
+|  | Forward + backward | 34.88 ms | 5.04× | 17.62× | 1.30 GiB |
+| **RTX A6000** | Forward | 16.54 ms | 11.55× | 1.34× | 0.47 GiB |
+|  | Backward | 84.20 ms | 58.59× | 21.27× | 1.20 GiB |
+|  | Forward + backward | 101.17 ms | 51.32× | 17.83× | 1.30 GiB |
+
+All 72 cases per GPU completed without allocator retries or `cudaMalloc` calls
+during timing.
+
+### Full curves
+
+#### NVIDIA H200
 
 ![Attention layer throughput on H200](docs/figures/kernel_throughput_h200.png)
 
 ![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
 
-At length 8192, DF Triton is 5.18× faster than Hugging Face forward and 2.15×
-faster for forward+backward. Incremental peak memory is 0.47 GiB forward and
-1.30 GiB combined, versus 19.07 GiB and 19.47 GiB for Hugging Face.
-
-### NVIDIA RTX PRO 6000 Blackwell
+#### NVIDIA RTX PRO 6000 Blackwell
 
 ![Attention layer throughput on RTX PRO 6000 Blackwell](docs/figures/kernel_throughput_rtx6000.png)
 
 ![Attention kernel incremental peak memory on RTX PRO 6000 Blackwell](docs/figures/kernel_memory_rtx6000.png)
 
-At length 8192, DF Triton is 14.4× faster than Hugging Face forward and 5.04×
-faster combined; against FlashDeBERTa it is 1.57× and 17.6× faster. Peak memory
-matches the H200 run. All 72 cases completed without allocator retries or
-`cudaMalloc` calls during timing.
-
-### NVIDIA RTX A6000
+#### NVIDIA RTX A6000
 
 ![Attention layer throughput on RTX A6000](docs/figures/kernel_throughput_a6000.png)
 
 ![Attention kernel incremental peak memory on RTX A6000](docs/figures/kernel_memory_a6000.png)
-
-At length 8192, DF Triton is 11.5× faster than Hugging Face forward and 51.3×
-faster combined; against FlashDeBERTa it is 1.34× and 17.8× faster. Incremental
-peak memory is again 0.47 GiB forward and 1.30 GiB combined. All 72 cases
-completed without allocator retries or `cudaMalloc` calls during timing.
 
 Short backward cases are sensitive to Python, autograd, and launch overhead;
 on H200 this dominates the length-128 backward measurements. Longer sequences
@@ -161,11 +166,10 @@ timing, flushing L2 before each iteration; processes are separated by one
 second. Backward is timed independently by running forward once and replaying
 `out.backward(grad, retain_graph=True)`.
 
-Timing is eager and therefore includes Python, autograd, and launch overhead.
-Hollow markers identify points where CPU issue time is at least 80% of measured
-latency. The Hugging Face mask and relative-position matrix are constructed
-before timing. The report also records min, p10, median, and p90 latency,
-incremental peak allocated memory, allocator retries, and `cudaMalloc` calls.
+Timing is eager and includes Python, autograd, and launch overhead. The Hugging
+Face mask and relative-position matrix are constructed before timing. The
+report also records min, p10, median, and p90 latency, incremental peak memory,
+allocator retries, and `cudaMalloc` calls.
 
 ### Kernel tuning profiles
 
@@ -237,39 +241,23 @@ python -m benchmarks.evaluate_mnli \
   --output mnli_parity_fp16_heuristic.json
 ```
 
-### H200
-
-On the full 9,815-example split in FP16 at batch size 8, every backend reached
+On the full 9,815-example FP16 split at batch size 8, every row below reached
 91.74% accuracy with zero decision mismatches against Hugging Face.
 
-| Variant | Cold time | Compiled-cache time | Cold speedup | Compiled speedup | Decision mismatches |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 55.49 s | 55.70 s | 1.00× | 1.00× | Reference |
-| DF Triton, padded | 24.24 s | 23.38 s | 2.29× | 2.38× | 0 / 9,815 |
-| DF Triton, packed | **11.52 s** | **9.99 s** | **4.82×** | **5.58×** | 0 / 9,815 |
-| FlashDeBERTa, packed | 24.41 s | 23.99 s | 2.27× | 2.32× | 0 / 9,815 |
-
-### RTX PRO 6000 Blackwell
-
-The same FP16, batch-8 setup also kept 91.74% accuracy and zero mismatches.
-
-| Variant | Cold full-split time | Compiled-cache time | Cold speedup vs HF | Compiled speedup vs HF | Decision mismatches |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 88.85 s | 88.67 s | 1.00× | 1.00× | Reference |
-| DF Triton, padded | 38.96 s | 37.50 s | 2.28× | 2.36× | 0 / 9,815 |
-| DF Triton, packed | **8.28 s** | **7.33 s** | **10.73×** | **12.10×** | 0 / 9,815 |
-| FlashDeBERTa, packed | 39.16 s | 38.86 s | 2.27× | 2.28× | 0 / 9,815 |
-
-### RTX A6000
-
-The same FP16, batch-8 run reached 91.74% accuracy with zero mismatches.
-
-| Variant | Cold time | Compiled-cache time | Cold speedup | Compiled speedup | Decision mismatches |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Hugging Face eager, padded | 235.63 s | 236.12 s | 1.00× | 1.00× | Reference |
-| DF Triton, padded | 112.38 s | 111.46 s | 2.10× | 2.12× | 0 / 9,815 |
-| DF Triton, packed | **18.64 s** | **16.37 s** | **12.64×** | **14.42×** | 0 / 9,815 |
-| FlashDeBERTa, packed | 112.37 s | 112.08 s | 2.10× | 2.11× | 0 / 9,815 |
+| GPU | Variant | Cold time | Compiled-cache time | Cold speedup | Compiled speedup |
+| --- | --- | ---: | ---: | ---: | ---: |
+| **H200** | Hugging Face eager, padded | 55.49 s | 55.70 s | 1.00× | 1.00× |
+|  | DF Triton, padded | 24.24 s | 23.38 s | 2.29× | 2.38× |
+|  | **DF Triton, packed** | **11.52 s** | **9.99 s** | **4.82×** | **5.58×** |
+|  | FlashDeBERTa, packed | 24.41 s | 23.99 s | 2.27× | 2.32× |
+| **RTX PRO 6000 Blackwell** | Hugging Face eager, padded | 88.85 s | 88.67 s | 1.00× | 1.00× |
+|  | DF Triton, padded | 38.96 s | 37.50 s | 2.28× | 2.36× |
+|  | **DF Triton, packed** | **8.28 s** | **7.33 s** | **10.73×** | **12.10×** |
+|  | FlashDeBERTa, packed | 39.16 s | 38.86 s | 2.27× | 2.28× |
+| **RTX A6000** | Hugging Face eager, padded | 235.63 s | 236.12 s | 1.00× | 1.00× |
+|  | DF Triton, padded | 112.38 s | 111.46 s | 2.10× | 2.12× |
+|  | **DF Triton, packed** | **18.64 s** | **16.37 s** | **12.64×** | **14.42×** |
+|  | FlashDeBERTa, packed | 112.37 s | 112.08 s | 2.10× | 2.11× |
 
 Cold timings include JIT compilation; compiled-cache timings come from a new
 process reusing those binaries. `heuristic` skips configuration search, not
