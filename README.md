@@ -32,10 +32,10 @@ backward pass instead of being stored. It does not yet support
 use the differentiable PyTorch backend rather than Triton.
 
 > [!IMPORTANT]
-> The Triton kernel has been validated on NVIDIA RTX
-> 6000 Ada (SM 8.9) and NVIDIA H200 (SM 9.0). A reviewed H200 profile for the
-> documented compiler stack ships in the package. Other GPUs and stacks use
-> bounded autotuning and should be validated locally.
+> The Triton kernel has been validated on NVIDIA RTX 6000 Ada (SM89), H200
+> (SM90), and RTX PRO 6000 Blackwell (SM120). A reviewed H200 profile ships in
+> the package; other GPUs use the portable heuristic and should be validated
+> locally.
 
 ## Install
 
@@ -86,95 +86,40 @@ dQ, and dK/dV kernels.
 
 ## Performance
 
-The benchmark compares exact DeBERTa disentangled attention across Hugging Face
-eager, DF PyTorch, DF Triton, and FlashDeBERTa.
+These are BF16 attention-layer results with 12 heads, head dimension 64,
+16,384 active tokens per batch, and no dropout. All backends compute exact
+DeBERTa C2P/P2C attention. DF Triton uses the built-in heuristic, not a tuned
+profile.
 
-### H200
+Both machines used PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0, and
+FlashDeBERTa 0.0.7; Transformers was 5.17.0 on H200 and 5.18.0 on RTX.
 
-- **Hardware:** one NVIDIA H200 (SM90).
-- **Software:** BF16, PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
-  Transformers 5.17.0, and FlashDeBERTa 0.0.7.
-- **Shape:** 12 heads, head dimension 64, sequence lengths 128 to 8192, and
-  `batch = 16384 / length`.
-- **Passes:** forward, backward, and forward + backward, with dropout disabled.
-- **DF Triton policy:** built-in heuristic, without a tuning profile.
+TFLOP/s is FLOPs divided by time. For batch `B`, heads `H`, length `L`, head
+dimension `D`, and `R` active relative-position rows, we count
+`BH(4L²D + 4LRD)` for forward, `BH(10L²D + 12LRD)` for backward, and
+`BH(14L²D + 16LRD)` combined. As in FlashAttention, this excludes softmax,
+gathers, and projection layers.
+
+### NVIDIA H200
 
 ![Attention layer throughput on H200](docs/figures/kernel_throughput_h200.png)
 
-Throughput is algorithmic work divided by time. For batch `B`, heads `H`,
-length `L`, head dimension `D`, and `R` active relative-position rows, the
-forward, backward, and combined counts are respectively
-`BH(4L²D + 4LRD)`, `BH(10L²D + 12LRD)`, and
-`BH(14L²D + 16LRD)`. Backward includes score recomputation plus both operand
-gradients for QK, C2P, and P2C. As in FlashAttention, softmax, gathers, and
-projection layers are excluded.
-
-Median latency in milliseconds, and DF Triton's speedup over Hugging Face eager
-and FlashDeBERTa (`*` marks a host-bound DF Triton point):
-
-| Length | Batch | Forward | vs HF | vs FlashDeBERTa | Backward | vs HF | vs FlashDeBERTa | Fwd + bwd | vs HF | vs FlashDeBERTa |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 | 0.42 | 2.99× | 3.21× | 4.16\* | 0.64× | 0.80× | 4.36\* | 1.00× | 1.10× |
-| 512 | 32 | 0.81 | 3.60× | 1.86× | 4.09\* | 1.09× | 3.20× | 4.73\* | 1.56× | 3.11× |
-| 1024 | 16 | 1.32 | 3.97× | 1.65× | 6.17\* | 1.33× | 9.55× | 7.48\* | 1.80× | 8.23× |
-| 2048 | 8 | 2.35 | 4.45× | 1.54× | 10.91 | 1.56× | 17.1× | 13.29 | 2.07× | 14.4× |
-| 4096 | 4 | 4.42 | 5.00× | 1.49× | 20.67 | 1.70× | 22.1× | 25.15 | 2.27× | 18.4× |
-| 8192 | 2 | 8.51 | 5.19× | 1.48× | 45.67 | 1.57× | 21.7× | 54.39 | 2.13× | 18.5× |
-
-Forward is fastest at every length. For training, DF Triton leads from length
-512 up. At 128 every implementation's training step is host-bound, so those
-points compare Python and launch overhead rather than kernels. These are
-attention-layer numbers, not full encoder training, and not a comparison with
-plain FlashAttention without relative bias.
-
 ![Attention kernel incremental peak memory on H200](docs/figures/kernel_memory_h200.png)
 
-Incremental peak allocated memory in GiB, above the process's allocation before
-the measured call:
+At length 8192, DF Triton is 5.19× faster than Hugging Face forward and 2.13×
+faster for forward+backward. Incremental peak memory is 0.47 GiB forward and
+1.30 GiB combined, versus 19.07 GiB and 19.47 GiB for Hugging Face.
 
-| Length | HF forward | DF Triton forward | HF fwd + bwd | DF Triton fwd + bwd | FlashDeBERTa fwd + bwd |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 0.63 | 0.28 | 0.96 | 0.55 | 1.13 |
-| 512 | 1.25 | 0.47 | 1.64 | 1.29 | 0.99 |
-| 2048 | 4.64 | 0.47 | 5.04 | 1.30 | 0.95 |
-| 8192 | 19.07 | 0.47 | 19.47 | 1.30 | 0.94 |
-
-DF Triton's memory stays flat with length: at 8192 it allocates 98% less than
-Hugging Face eager for forward and 93% less for forward+backward. FlashDeBERTa
-uses about 0.35 GiB less for training, most of which is DF Triton's per-distance
-position-gradient buffers.
-
-### RTX PRO 6000 Blackwell
-
-- **Hardware:** one NVIDIA RTX PRO 6000 Blackwell Server Edition (SM120).
-- **Software:** BF16, PyTorch 2.14.0+cu130, Triton 3.8.0, CUDA 13.0,
-  Transformers 5.18.0, and FlashDeBERTa 0.0.7.
-- **Shape:** 12 heads, head dimension 64, sequence lengths 128 to 8192, and
-  `batch = 16384 / length`.
-- **Passes:** forward, backward, and forward + backward, with dropout disabled.
-- **DF Triton policy:** built-in heuristic, without runtime tuning or a saved
-  profile.
+### NVIDIA RTX PRO 6000 Blackwell
 
 ![Attention layer throughput on RTX PRO 6000 Blackwell](docs/figures/kernel_throughput_rtx6000.png)
 
-Median latency in milliseconds, and DF Triton's speedup over Hugging Face eager
-and FlashDeBERTa:
-
-| Length | Batch | Forward | vs HF | vs FlashDeBERTa | Backward | vs HF | vs FlashDeBERTa | Fwd + bwd | vs HF | vs FlashDeBERTa |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 128 | 128 | 0.57 | 2.92× | 3.16× | 2.01 | 1.73× | 1.76× | 2.49 | 2.02× | 2.08× |
-| 512 | 32 | 0.95 | 4.90× | 1.74× | 4.69 | 1.44× | 1.87× | 5.53 | 2.01× | 1.81× |
-| 1024 | 16 | 1.25 | 6.69× | 1.67× | 6.00 | 2.02× | 5.85× | 7.04 | 2.84× | 5.18× |
-| 2048 | 8 | 1.88 | 8.41× | 1.62× | 8.55 | 2.73× | 13.9× | 10.28 | 3.71× | 11.1× |
-| 4096 | 4 | 3.03 | 12.9× | 1.64× | 13.89 | 3.61× | 19.9× | 16.90 | 5.21× | 16.7× |
-| 8192 | 2 | 5.50 | 14.4× | 1.57× | 29.35 | 3.32× | 20.6× | 34.88 | 5.04× | 17.6× |
-
 ![Attention kernel incremental peak memory on RTX PRO 6000 Blackwell](docs/figures/kernel_memory_rtx6000.png)
 
-DF Triton's incremental peak allocation is 0.47 GiB for forward and 1.30 GiB
-for forward+backward at length 8192, compared with 19.07 GiB and 19.47 GiB for
-Hugging Face eager. All 72 configurations completed without allocator retries
-or `cudaMalloc` calls during timing.
+At length 8192, DF Triton is 14.4× faster than Hugging Face forward and 5.04×
+faster combined; against FlashDeBERTa it is 1.57× and 17.6× faster. Peak memory
+matches the H200 run. All 72 cases completed without allocator retries or
+`cudaMalloc` calls during timing.
 
 ### Benchmark methodology
 
@@ -203,76 +148,26 @@ incremental peak allocated memory, allocator retries, and `cudaMalloc` calls.
 
 ### Kernel tuning profiles
 
-A matching saved profile is used automatically. Otherwise a deterministic
-heuristic picks the config from the workload (length, head dim, phase,
-precision) and the GPU's own limits: it reads the shared memory per block and SM
-count from the device, so large tiles are never tried on GPUs they don't fit.
-If a config still fails to launch, that workload falls back to Triton
-autotuning. Under `torch.compile` the config is picked once while tracing, so a
-graph recompiles only when the length family changes. Choose a different policy
-with:
+A matching profile is used automatically; otherwise the kernel uses a
+hardware-aware heuristic. `heuristic` always ignores profiles, `profile_only`
+fails on a miss, and `autotune` benchmarks candidates at runtime.
 
 ```python
-from disentangled_flash import (
-    KernelConfig,
-    KernelTuningOptions,
-    optimize_deberta,
-    optimize_deberta_training,
-)
+from disentangled_flash import KernelTuningOptions, optimize_deberta
 
-optimize_deberta(model, tuning=KernelTuningOptions(mode="heuristic"))  # ignore profiles
-optimize_deberta(model, tuning=KernelTuningOptions(mode="autotune"))  # benchmark at runtime
-optimize_deberta(
-    model,
-    tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
-)
-optimize_deberta_training(
-    model,
-    tuning=KernelTuningOptions(profile_paths=("my-gpu-profile.json",)),
-)
-optimize_deberta(
-    model,
-    tuning=KernelTuningOptions(
-        mode="fixed",
-        fixed_config=KernelConfig(64, 64, 4),
-    ),
-)
+optimize_deberta(model, tuning=KernelTuningOptions(mode="heuristic"))
 ```
 
-Profiles are discovered in the user cache, `DISENTANGLED_FLASH_PROFILE_DIR`, and
-the package. Compatibility is keyed by GPU/compiler stack and workload; the
-driver is diagnostic only. Exact length, batch size, head count, and active-slot
-count are runtime values rather than autotune keys.
-
-Generate a profile for your GPU with:
+Generate and inspect a profile with:
 
 ```bash
-python -m disentangled_flash.tune \
-  --output rtx-6000-ada.json
+python -m disentangled_flash.tune --output my-gpu.json
+python -m disentangled_flash.tune inspect my-gpu.json
 ```
 
-```bash
-python -m disentangled_flash.tune inspect rtx-6000-ada.json
-```
-
-The default `standard` preset is cheap: lengths 128, 512, 2048, and 8192 in BF16
-over padded and packed layouts, 84 phase workloads in total. Each one measures
-only the heuristic config and its three closest candidates. Shapes it doesn't
-cover use the heuristic at runtime.
-
-`--preset exhaustive` is what the bundled profiles use: every length family
-(`64` through `8192`), both launch-occupancy regimes, half precision plus strict
-and fast FP32, and the full candidate lists, for 1134 phase workloads. Like
-FlashAttention and FlexAttention, FP16 and BF16 share one half-precision family,
-and FP32 searches only single-stage schedules with small tiles. Training is
-tuned with and without attention dropout.
-
-Either way, configs that don't fit the GPU's shared memory are skipped before
-compiling, results are parity-checked, and each workload is saved as soon as it
-finishes, so tuning can resume. `--passes`, `--dropout off|on`, and the shape
-options restrict a run; `--verbose` prints every measured candidate, which is
-handy for comparing configs at one exact shape, e.g.
-`--preset exhaustive --lengths 128 --batch-heads 1536 --verbose`.
+The default preset tests the heuristic and nearby configs. Release profiles use
+`--preset exhaustive`. Runs are parity-checked, resumable, and saved after each
+workload.
 
 ### Packed unpadded inference and training
 
@@ -308,12 +203,8 @@ created by the packed Triton path.
 python -m benchmarks.evaluate_mnli
 ```
 
-This runs one cold, full GLUE/MNLI matched-validation pass at batch size 8 across
-Hugging Face, DF PyTorch, DF Triton, and FlashDeBERTa. It reports performance,
-accuracy, numerical error, and classification-decision parity.
-
-To reproduce the release parity run with the portable heuristic and no runtime
-autotuning:
+This runs one cold matched-validation pass and reports speed, accuracy, and
+decision parity. The release command is:
 
 ```bash
 python -m benchmarks.evaluate_mnli \
@@ -325,34 +216,25 @@ python -m benchmarks.evaluate_mnli \
   --output mnli_parity_fp16_heuristic.json
 ```
 
-### H200 MNLI decision parity
+### H200
 
-The full `validation_matched` split (9,815 examples; DeBERTa-v2-xlarge-MNLI)
-was evaluated in FP16 at batch size 16 using the portable heuristic. All
-implementations and layouts had the same accuracy (91.74%) and zero
-classification-decision mismatches against Hugging Face:
+On the full 9,815-example split in FP16 at batch size 16, every backend reached
+91.74% accuracy with zero decision mismatches against Hugging Face.
 
 | Variant | Full-split time | Speedup vs. HF eager | Decision mismatches | Maximum absolute logit difference |
 | --- | ---: | ---: | ---: | ---: |
 | Hugging Face eager, padded | 53.27 s | 1.00× | Reference | 0 |
-| DF PyTorch, padded | 55.58 s | 0.96× | 0 / 9,815 | 0.1094 |
-| DF PyTorch, packed | 49.93 s | 1.07× | 0 / 9,815 | 0.1074 |
 | DF Triton, padded | 23.25 s | 2.29× | 0 / 9,815 | 0.0752 |
 | DF Triton, packed | 6.94 s | 7.68× | 0 / 9,815 | 0.0752 |
 | FlashDeBERTa, packed | 22.00 s | 2.42× | 0 / 9,815 | 0.0801 |
 
-This is decision parity, not bitwise or elementwise logit parity: the maximum
-logit differences are nonzero. The recorded BF16 run did not meet full decision
-parity, so the FP16 result above is the release parity claim. Full-split times
-are from one evaluation run on the H200 at batch size 16, and include the
-benchmark's end-to-end MNLI evaluation path; they are not kernel-only timings.
+This is decision parity, not bitwise logit equality. The recorded BF16 run did
+not meet full decision parity, so the release claim uses FP16.
 
-### RTX PRO 6000 Blackwell MNLI cold start and compiled cache
+### RTX PRO 6000 Blackwell
 
-The same full split was evaluated in FP16 at batch size 8 with heuristic launch
-selection. The first run includes cold compilation; the second was recorded
-after the persistent Triton cache had been populated. Both runs had 91.74%
-accuracy and zero decision mismatches for every variant.
+At batch size 8, the first run includes JIT compilation; the second reuses the
+persistent Triton cache. Both runs kept 91.74% accuracy and zero mismatches.
 
 | Variant | Cold full-split time | Compiled-cache time | Cold speedup vs HF | Compiled speedup vs HF | Decision mismatches |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -361,13 +243,10 @@ accuracy and zero decision mismatches for every variant.
 | DF Triton, packed | 17.27 s | **8.46 s** | 5.14× | **10.49×** | 0 / 9,815 |
 | FlashDeBERTa, packed | 43.44 s | 39.15 s | 2.04× | 2.27× | 0 / 9,815 |
 
-The cold timing starts immediately before the first forward and therefore
-includes first-use kernel compilation. `heuristic` skips configuration search,
-but the selected Triton kernels still require one JIT compilation. With
-`TRITON_CACHE_DIR` on persistent storage, later processes load those compiled
-binaries. The observed cold-to-compiled difference is 8.81 seconds for packed
-DF Triton; it includes normal run-to-run variation and is not an isolated
-compiler microbenchmark.
+`heuristic` skips configuration search, not JIT compilation. Set
+`TRITON_CACHE_DIR` to persistent storage to reuse the compiled binaries. The
+8.81-second cold-to-cached difference for packed DF Triton also includes normal
+run-to-run variation.
 
 ## CUDA validation
 
@@ -377,7 +256,6 @@ python -m validation.validate_cuda
 
 Run this before publishing a profile for a new GPU or compiler stack.
 
-
 ## Bundled H200 tuning profile
 
 The package automatically discovers the reviewed
@@ -386,7 +264,7 @@ profile. Its 1,134 validated winners cover inference, training forward, and both
 backward phases across the standard DeBERTa-v2/v3 workload families through
 length 8192. They require H200 SM 9.0, PyTorch 2.14.0+cu130, CUDA 13.0, and
 the recorded Triton 3.8.0 compiler fingerprint; otherwise `auto` mode uses
-bounded autotuning.
+the heuristic.
 
 ## Release parity checks
 
@@ -401,17 +279,10 @@ python -m validation.validate_multistep_training \
   --profile src/disentangled_flash/profiles/h200-sm90-deberta-v2-v3-torch-2.14-cu130-triton-3.8.json
 ```
 
-The BF16 check used a 12-layer DeBERTa-v2-shaped model, length 1024, batch 2,
-dropout 0.1, and 20 optimizer steps. It passed the configured final fixed-loss
-gate: the candidate/reference fixed losses after step 20 were 0.683213 and
-0.683757, respectively (0.0796% relative difference, below the 5% limit).
-Reference and candidate fixed losses fell by 0.4446 and 0.4452 over the run.
-The check also records backward gradients and post-update parameters: at the
-last step, aggregate gradient relative L2 difference was 14.75% (cosine
-similarity 0.9891), and parameter relative L2 difference was 0.42% (cosine
-similarity 0.99999). Thus this is a multi-step training-path parity check
-including backward, not a claim that individual gradients are numerically
-identical. End-to-end performance is not part of the release benchmark matrix.
+The 12-layer BF16 check runs 20 optimizer steps at length 1024, batch 2, and
+dropout 0.1. Final fixed loss differed by 0.0796%; final parameter relative L2
+difference was 0.42% with cosine similarity 0.99999. It validates the training
+path, including backward, but does not claim elementwise-identical gradients.
 
 ## Attribution
 
