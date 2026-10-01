@@ -100,10 +100,14 @@ dimension `D`, and `R` active relative-position rows, we count
 `BH(14L²D + 16LRD)` combined. As in FlashAttention, this excludes softmax,
 gathers, and projection layers.
 
-The forward count comes from two dense matrix products, QK and PV
-(`2L²D` each), plus C2P and P2C (`2LRD` each). Backward recomputes the score
-products and forms gradients for both operands: `10L²D` for QK/PV and `12LRD`
-for C2P/P2C. Forward + backward is their sum.
+The forward count covers the query-key product that forms token-to-token
+scores, the probability-value product that produces the output, and the C2P
+and P2C relative-position score products. Backward covers the corresponding
+Q/K/V and relative-position gradients. Like FlashAttention, the fused backward
+does not store the full attention matrix, so it also recomputes the score
+products. A multiply-add counts as two FLOPs. We use this FlashAttention-style
+count for every backend as a common throughput scale, even when a baseline
+saves different intermediates; latency and speedup are measured directly.
 
 ### Length-8192 summary
 
