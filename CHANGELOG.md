@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1] - 2026-10-01
+
+### Bug Fixes
+
+- Preserve base attention on Triton fallback ([f1606d6](https://github.com/delyan-boychev/disentangled-flash/commit/f1606d623361882b1928193aa62bace5975d470d))
+
+### Documentation
+
+- Add RTX 6000 benchmark results ([b1a02f4](https://github.com/delyan-boychev/disentangled-flash/commit/b1a02f4852e0a90c00b445e6fa5e9387de0dcec7))
+- Tighten benchmark documentation ([5db9df6](https://github.com/delyan-boychev/disentangled-flash/commit/5db9df60cfcbca0ef78e92e00b7c86172c0ea3a4))
+- Refresh RTX MNLI cache results ([188a0cc](https://github.com/delyan-boychev/disentangled-flash/commit/188a0cce113d460c150dd930681ec63baa57f10f))
+- Refresh H200 results and simplify plots ([f538d1e](https://github.com/delyan-boychev/disentangled-flash/commit/f538d1e3485e56edc7487d8e22ac2fc84386e0e9))
+- Move FLOP derivation out of figures ([20e545e](https://github.com/delyan-boychev/disentangled-flash/commit/20e545eb432938c2b90b32e8f65fcd4dc15b8b3d))
+- Add RTX A6000 benchmark results ([692841d](https://github.com/delyan-boychev/disentangled-flash/commit/692841df8a859bff31e3eee3eaf4620633469cf0))
+- Group benchmark results by GPU ([74ac0cd](https://github.com/delyan-boychev/disentangled-flash/commit/74ac0cda5942558bc595c03a7588ff61e400298d))
+- Explain attention FLOP accounting ([5beebc6](https://github.com/delyan-boychev/disentangled-flash/commit/5beebc6a3b27ff765c6141f3e4d1881cf85fe321))
+- Mark backward as supported ([77ae3fb](https://github.com/delyan-boychev/disentangled-flash/commit/77ae3fb46a0adc3a946347c9f75359ba5da156c0))
+- Clarify kernel benchmark layout ([ce64e6d](https://github.com/delyan-boychev/disentangled-flash/commit/ce64e6daf6b25d76e7271050ef72a2928ad711f9))
+- Tighten benchmark layout note ([34c8412](https://github.com/delyan-boychev/disentangled-flash/commit/34c8412ba735ce76b153e60d3cb5c93f853cdb42))
+- Clarify when packed layout helps ([4bc077c](https://github.com/delyan-boychev/disentangled-flash/commit/4bc077c7b69c3cb381bb0fed832031d2252e78b7))
+
 ## [1.1.0] - 2026-09-30
 
 ### Documentation
