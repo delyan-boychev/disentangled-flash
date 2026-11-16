@@ -26,6 +26,12 @@ from .position import (
 )
 
 
+# A distance-ordered table has 2L - 1 rows where the compact one has one row per
+# active slot. Past this ratio the wider position GEMM costs more than the
+# gather it replaces.
+DISTANCE_TABLE_MAX_GROWTH = 1.5
+
+
 class TorchPositionPlan(NamedTuple):
     """Layer projections plus shared gather indices for one sequence length.
 
@@ -456,17 +462,34 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         if cached is not None:
             return cached
 
-        indices = self.position_plan_cache.compact(sequence_length, resolved_device)
-        pos_key, pos_query = self._project_distance_positions(sequence_length, resolved_device)
-        plan = TorchPositionPlan(
-            sequence_length=sequence_length,
-            active_slots=indices.active_slots,
-            c2p_local=None,
-            p2c_local=None,
-            pos_key=pos_key,
-            pos_query=pos_query,
-            by_distance=True,
-        )
+        compact = self.position_plan_cache.compact(sequence_length, resolved_device)
+        slot_count = int(compact.active_slots.numel())
+        if 0 < 2 * sequence_length - 1 <= DISTANCE_TABLE_MAX_GROWTH * slot_count:
+            pos_key, pos_query = self._project_distance_positions(
+                sequence_length,
+                resolved_device,
+            )
+            plan = TorchPositionPlan(
+                sequence_length=sequence_length,
+                active_slots=compact.active_slots,
+                c2p_local=None,
+                p2c_local=None,
+                pos_key=pos_key,
+                pos_query=pos_query,
+                by_distance=True,
+            )
+        else:
+            indices = self.position_plan_cache.dense(sequence_length, resolved_device)
+            pos_key, pos_query = self._project_active_positions(indices.active_slots)
+            plan = TorchPositionPlan(
+                sequence_length=sequence_length,
+                active_slots=indices.active_slots,
+                # Self-attention uses the same map for c2p and p2c.
+                c2p_local=indices.pair_to_local,
+                p2c_local=indices.pair_to_local,
+                pos_key=pos_key,
+                pos_query=pos_query,
+            )
         self._position_projection_cache[cache_key] = plan
         return plan
 

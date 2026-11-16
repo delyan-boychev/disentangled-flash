@@ -88,12 +88,12 @@ def test_prepared_plan_matches_gather_plan(pos_att_type, position_buckets, lengt
         expected, _ = module.forward_prepared(hidden, mask, gather_plan(module, length))
         actual, _ = module.forward_prepared(hidden, mask, plan)
 
-    assert plan.by_distance
-    assert plan.c2p_local is None and plan.p2c_local is None
+    assert plan.by_distance == (length <= 33)
+    assert (plan.c2p_local is None) == plan.by_distance
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-6)
 
 
-@pytest.mark.parametrize("length", [1, 7, 100])
+@pytest.mark.parametrize("length", [1, 7, 33, 100])
 def test_prepared_plan_matches_reference_attention(length):
     config = make_config()
     module, relative = make_module(config)
@@ -110,7 +110,7 @@ def test_prepared_plan_matches_reference_attention(length):
     torch.testing.assert_close(actual, expected, rtol=0, atol=1e-5)
 
 
-@pytest.mark.parametrize("lengths", [(40, 7, 23), (5, 6, 7, 8, 9), (3, 100, 4)])
+@pytest.mark.parametrize("lengths", [(33, 7, 23), (5, 6, 7, 8, 9), (3, 30, 4)])
 def test_lengths_share_distance_tables_in_any_order(lengths):
     module, _ = make_module(make_config())
     inputs = {length: torch.randn(1, length, 32) for length in lengths}
@@ -142,3 +142,14 @@ def test_distance_tables_are_cleared_with_the_inference_cache():
     module.clear_inference_cache()
 
     assert not module._distance_position_cache
+
+
+def test_long_lengths_keep_the_compact_gather_plan():
+    module, _ = make_module(make_config())
+
+    short, long = module.prepare_shape(33), module.prepare_shape(100)
+
+    # 65 distance rows for 49 slots, then 199 for 63.
+    assert short.by_distance and short.pos_key.size(1) == 65
+    assert not long.by_distance and long.pos_key.size(1) == long.active_slots.numel()
+    assert long.c2p_local is not None
