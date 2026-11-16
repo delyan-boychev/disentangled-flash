@@ -498,8 +498,13 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         plan: TorchPositionPlan,
+        *,
+        assume_unpadded: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Pure tensor forward for a plan created outside the compiled graph."""
+        """Pure tensor forward for a plan created outside the compiled graph.
+
+        assume_unpadded overrides the module setting for this call.
+        """
 
         self._validate_inference_call()
         batch_size, sequence_length = hidden_states.shape[:2]
@@ -528,7 +533,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             scale=self._scale(scale_factor),
             num_heads=self.num_attention_heads,
             all_head_size=self.all_head_size,
-            assume_unpadded=self.assume_unpadded,
+            assume_unpadded=(self.assume_unpadded if assume_unpadded is None else assume_unpadded),
         )
         return context_layer, None
 

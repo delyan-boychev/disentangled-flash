@@ -1668,8 +1668,14 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         plan: TorchPositionPlan | TritonPreparedPositionPlan,
+        *,
+        assume_unpadded: bool | None = None,
     ) -> tuple[torch.Tensor, None]:
-        """Pure backend-dispatched forward using an already prepared plan."""
+        """Pure backend-dispatched forward using an already prepared plan.
+
+        assume_unpadded overrides the module setting for this call on the Torch
+        backend; the Triton backend ignores it.
+        """
 
         if self.backend == "torch":
             if not isinstance(plan, TorchPositionPlan):
@@ -1678,6 +1684,7 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
                 hidden_states,
                 attention_mask,
                 plan,
+                assume_unpadded=assume_unpadded,
             )
 
         if not isinstance(plan, TritonPreparedPositionPlan):

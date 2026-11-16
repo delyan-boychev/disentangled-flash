@@ -340,8 +340,13 @@ class DebertaV2OptimizedEncoder(nn.Module):
         *,
         output_hidden_states: bool = True,
         return_dict: bool = True,
+        assume_unpadded: bool | None = None,
     ) -> Any:
-        """Execute the encoder without dense mask/relative-position construction."""
+        """Execute the encoder without dense mask/relative-position construction.
+
+        assume_unpadded overrides the encoder setting for this call (Torch
+        backend only): pass True when attention_mask is known to be all ones.
+        """
 
         if not self.inference:
             raise RuntimeError("forward_prepared() is available only when inference=True")
@@ -366,6 +371,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
                 next_kv,
                 layer_attention_mask,
                 plan,
+                assume_unpadded=assume_unpadded,
             )
             attention_output = layer.attention.output(self_output, next_kv)
             intermediate_output = layer.intermediate(attention_output)
@@ -621,12 +627,23 @@ class DebertaV2OptimizedEncoder(nn.Module):
             query_states,
             relative_pos,
         )
+        # One check here spares every Torch layer its mask passes when nothing
+        # is padded. forward_prepared() stays free of data-dependent control flow,
+        # and so does this method while it is being compiled.
+        assume_unpadded = None
+        if (
+            self.backend == "torch"
+            and not self.assume_unpadded
+            and not torch.compiler.is_compiling()
+        ):
+            assume_unpadded = bool(attention_mask.all())
         return self.forward_prepared(
             hidden_states,
             attention_mask,
             plans,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
+            assume_unpadded=assume_unpadded,
         )
 
 
