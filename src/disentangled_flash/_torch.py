@@ -27,14 +27,35 @@ from .position import (
 
 
 class TorchPositionPlan(NamedTuple):
-    """Layer projections plus shared gather indices for one sequence length."""
+    """Layer projections plus shared gather indices for one sequence length.
+
+    With by_distance=True the projections hold one row per relative distance
+    (2L - 1 rows) instead of one per active slot, and scores are read through
+    a view: c2p_local and p2c_local are None.
+    """
 
     sequence_length: int
     active_slots: torch.Tensor
-    c2p_local: torch.Tensor
-    p2c_local: torch.Tensor
+    c2p_local: torch.Tensor | None
+    p2c_local: torch.Tensor | None
     pos_key: torch.Tensor | None
     pos_query: torch.Tensor | None
+    by_distance: bool = False
+
+
+def _scores_by_distance(scores: torch.Tensor) -> torch.Tensor:
+    """View [..., L, 2L - 1] per-distance scores as [..., L, L] without a gather.
+
+    Returns out[..., i, j] = scores[..., i, L - 1 - i + j]. Row i starts L - 1 - i
+    columns in, so in the flattened tensor consecutive rows are 2L - 2 apart.
+    """
+
+    length = scores.size(-2)
+    if length == 1:
+        return scores
+    step = 2 * length - 2
+    rows = scores.flatten(-2)[..., length - 1 : length - 1 + length * step]
+    return rows.unflatten(-1, (length, step))[..., :length]
 
 
 def _torch_disentangled_attention(
@@ -55,7 +76,17 @@ def _torch_disentangled_attention(
     batch_size, _, sequence_length, _ = query_layer.shape
     attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2) / scale)
 
-    if plan.pos_key is not None:
+    if plan.by_distance:
+        # Both tables are ordered so that the [L, L] scores are a view of the product.
+        if plan.pos_key is not None:
+            c2p_raw = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2))
+            attention_scores = attention_scores + _scores_by_distance(c2p_raw) / scale
+        if plan.pos_query is not None:
+            p2c_raw = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2))
+            attention_scores = attention_scores + (
+                _scores_by_distance(p2c_raw).transpose(-1, -2) / scale
+            )
+    elif plan.pos_key is not None:
         c2p_raw = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2)) / scale
         attention_scores = attention_scores + torch.gather(
             c2p_raw,
@@ -68,7 +99,7 @@ def _torch_disentangled_attention(
             ),
         )
 
-    if plan.pos_query is not None:
+    if not plan.by_distance and plan.pos_query is not None:
         p2c_raw = torch.matmul(key_layer, plan.pos_query.transpose(-1, -2)) / scale
         attention_scores = attention_scores + torch.gather(
             p2c_raw.transpose(-1, -2),
@@ -152,6 +183,13 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             tuple[torch.Tensor | None, torch.Tensor | None],
         ] = {}
 
+        # One table pair per device, ordered by relative distance and sized for
+        # the longest prepared length; shorter lengths use a slice of it.
+        self._distance_position_cache: dict[
+            str,
+            tuple[int, torch.Tensor | None, torch.Tensor | None],
+        ] = {}
+
         self.register_load_state_dict_post_hook(_invalidate_attention_cache_after_load)
 
     def set_position_plan_cache(
@@ -163,6 +201,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self.position_plan_cache = cache
         self._position_projection_cache.clear()
         self._compact_position_projection_cache.clear()
+        self._distance_position_cache.clear()
         return self
 
     def clear_inference_cache(self) -> None:
@@ -174,6 +213,7 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self._cached_qkv_bias = None
         self._position_projection_cache.clear()
         self._compact_position_projection_cache.clear()
+        self._distance_position_cache.clear()
 
     def train(self, mode: bool = True) -> TorchInferenceDisentangledSelfAttention:
         if mode:
@@ -350,6 +390,49 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self._compact_position_projection_cache[cache_key] = projected
         return projected
 
+    def _project_distance_positions(
+        self,
+        sequence_length: int,
+        device: torch.device,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return projected positions with one row per relative distance.
+
+        Row m of the key table is distance L - 1 - m and row m of the query
+        table is distance m - (L - 1), the order _scores_by_distance() reads.
+        The slot of a distance does not depend on the sequence length, so every
+        length is a slice of the table built for the longest one.
+        """
+
+        has_key = self.relative_attention and "c2p" in self.pos_att_type
+        has_query = self.relative_attention and "p2c" in self.pos_att_type
+        if not has_key and not has_query:
+            return None, None
+
+        device_key = str(device)
+        capacity, key_table, query_table = self._distance_position_cache.get(
+            device_key,
+            (0, None, None),
+        )
+        if sequence_length > capacity:
+            if (has_key and self._cached_pos_key is None) or (
+                has_query and self._cached_pos_query is None
+            ):
+                raise RuntimeError("call prepare_for_inference() before prepare_shape()")
+            # Grow geometrically so lengths arriving in increasing order do not
+            # each leave a table behind in their plans.
+            capacity = max(sequence_length, 2 * capacity)
+            compact = self.position_plan_cache.compact(capacity, device)
+            slots = compact.active_slots[compact.delta_to_local.long()]
+            key_table = self._cached_pos_key.index_select(1, slots.flip(0)) if has_key else None
+            query_table = self._cached_pos_query.index_select(1, slots) if has_query else None
+            self._distance_position_cache[device_key] = capacity, key_table, query_table
+
+        start, rows = capacity - sequence_length, 2 * sequence_length - 1
+        return (
+            key_table.narrow(1, start, rows) if key_table is not None else None,
+            query_table.narrow(1, start, rows) if query_table is not None else None,
+        )
+
     def release_position_projection_workspace(self) -> None:
         """Release full projected tables after compact bucket tables are built."""
 
@@ -373,16 +456,16 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         if cached is not None:
             return cached
 
-        indices = self.position_plan_cache.dense(sequence_length, resolved_device)
-        pos_key, pos_query = self._project_active_positions(indices.active_slots)
+        indices = self.position_plan_cache.compact(sequence_length, resolved_device)
+        pos_key, pos_query = self._project_distance_positions(sequence_length, resolved_device)
         plan = TorchPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
-            # Self-attention uses the same map for c2p and p2c.
-            c2p_local=indices.pair_to_local,
-            p2c_local=indices.pair_to_local,
+            c2p_local=None,
+            p2c_local=None,
             pos_key=pos_key,
             pos_query=pos_query,
+            by_distance=True,
         )
         self._position_projection_cache[cache_key] = plan
         return plan
