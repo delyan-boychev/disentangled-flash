@@ -269,9 +269,24 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
 
         self.clear_inference_cache()
         self._prepare_fused_qkv()
+        self.restore_position_projection_workspace(rel_embeddings)
+        return self
 
+    @torch.no_grad()
+    def restore_position_projection_workspace(
+        self,
+        rel_embeddings: torch.Tensor | None,
+    ) -> None:
+        """Project the full position tables again; prepared shapes are kept.
+
+        prepare_shape() needs them for a length whose slot range has not been
+        prepared yet, after release_position_projection_workspace() freed them.
+        """
+
+        if self.training:
+            raise RuntimeError("restore_position_projection_workspace() requires module.eval()")
         if not self.relative_attention:
-            return self
+            return
         if rel_embeddings is None:
             raise ValueError("rel_embeddings is required for relative attention")
 
@@ -291,7 +306,6 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
                 projection(relative),
                 self.num_attention_heads,
             )
-        return self
 
     def _plan_device(self) -> torch.device:
         if self._cached_pos_key is not None:

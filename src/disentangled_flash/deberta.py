@@ -241,6 +241,16 @@ class DebertaV2OptimizedEncoder(nn.Module):
             self.clear_inference_cache()
         return result
 
+    @staticmethod
+    def _normalize_lengths(sequence_lengths: int | Iterable[int]) -> tuple[int, ...]:
+        if isinstance(sequence_lengths, int):
+            lengths = (sequence_lengths,)
+        else:
+            lengths = tuple(dict.fromkeys(int(length) for length in sequence_lengths))
+        if not lengths or any(length < 1 for length in lengths):
+            raise ValueError("sequence_lengths must contain positive integers")
+        return lengths
+
     @torch.no_grad()
     def prepare_for_inference(
         self,
@@ -254,12 +264,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
             )
         if self.training:
             raise RuntimeError("prepare_for_inference() requires encoder.eval()")
-        if isinstance(sequence_lengths, int):
-            lengths = (sequence_lengths,)
-        else:
-            lengths = tuple(dict.fromkeys(int(length) for length in sequence_lengths))
-        if not lengths or any(length < 1 for length in lengths):
-            raise ValueError("sequence_lengths must contain positive integers")
+        lengths = self._normalize_lengths(sequence_lengths)
 
         # Projected tables are per layer; index plans are shared.
         self.clear_inference_cache()
@@ -279,6 +284,45 @@ class DebertaV2OptimizedEncoder(nn.Module):
             attention.release_position_projection_workspace()
 
         self.activate_shape(lengths[0])
+        return self
+
+    @torch.no_grad()
+    def extend_prepared_lengths(
+        self,
+        sequence_lengths: int | Iterable[int],
+    ) -> DebertaV2OptimizedEncoder:
+        """Prepare more buckets without rebuilding the ones that already exist.
+
+        The cost does not depend on how many lengths are already prepared, and
+        the active bucket is unchanged. With nothing prepared yet this is
+        prepare_for_inference().
+        """
+
+        if not self._prepared_plans:
+            return self.prepare_for_inference(sequence_lengths)
+        if self.training:
+            raise RuntimeError("extend_prepared_lengths() requires encoder.eval()")
+        missing = tuple(
+            length
+            for length in self._normalize_lengths(sequence_lengths)
+            if length not in self._prepared_plans
+        )
+        if not missing:
+            return self
+
+        rel_embeddings = self.get_rel_embedding()
+        attentions = self._attention_modules()
+        for attention in attentions:
+            attention.restore_position_projection_workspace(rel_embeddings)
+
+        device = attentions[0].query_proj.weight.device
+        for length in missing:
+            self._prepared_plans[length] = tuple(
+                attention.prepare_shape(length, device) for attention in attentions
+            )
+
+        for attention in attentions:
+            attention.release_position_projection_workspace()
         return self
 
     def activate_shape(self, sequence_length: int) -> DebertaV2OptimizedEncoder:
