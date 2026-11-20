@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.2] - 2026-11-20
+
+### Bug Fixes
+
+- Bound inference caches and prepare new lengths incrementally ([0382aa6](https://github.com/delyan-boychev/disentangled-flash/commit/0382aa67c4d9d74d54cccf721aa329a9c3128e60))
+
 ## [1.1.1] - 2026-10-01
 
 ### Bug Fixes
