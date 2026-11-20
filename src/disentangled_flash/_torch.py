@@ -23,18 +23,50 @@ from .packed import PackedSequenceInfo, resolve_packed_info
 from .position import (
     SharedPositionPlanCache,
     canonical_device,
+    dense_pair_map,
 )
 
 
 class TorchPositionPlan(NamedTuple):
-    """Layer projections plus shared gather indices for one sequence length."""
+    """Layer projections plus shared gather indices for one sequence length.
+
+    Prepared plans carry the compact ``[2L - 1]`` ``delta_to_local`` lookup and leave
+    ``c2p_local``/``p2c_local`` as None; attention expands the lookup to the
+    ``[L, L]`` gather map per call instead of keeping one per length.
+    """
 
     sequence_length: int
     active_slots: torch.Tensor
-    c2p_local: torch.Tensor
-    p2c_local: torch.Tensor
+    c2p_local: torch.Tensor | None
+    p2c_local: torch.Tensor | None
     pos_key: torch.Tensor | None
     pos_query: torch.Tensor | None
+    delta_to_local: torch.Tensor | None = None
+
+
+def share_pair_map(plans: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Expand the gather map once for layers whose plans share one lookup.
+
+    Every layer of an encoder reads the same model-wide lookup, so one ``[L, L]`` map
+    per forward serves them all; it is not kept after the call.
+    """
+
+    first = plans[0] if plans else None
+    if (
+        not isinstance(first, TorchPositionPlan)
+        or first.c2p_local is not None
+        or first.delta_to_local is None
+    ):
+        return plans
+    pair_map = dense_pair_map(first.delta_to_local, first.sequence_length)
+    return tuple(
+        plan._replace(c2p_local=pair_map, p2c_local=pair_map)
+        if isinstance(plan, TorchPositionPlan)
+        and plan.c2p_local is None
+        and plan.delta_to_local is first.delta_to_local
+        else plan
+        for plan in plans
+    )
 
 
 def _torch_disentangled_attention(
@@ -55,12 +87,23 @@ def _torch_disentangled_attention(
     batch_size, _, sequence_length, _ = query_layer.shape
     attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2) / scale)
 
+    c2p_local, p2c_local = plan.c2p_local, plan.p2c_local
+    if (c2p_local is None or p2c_local is None) and (
+        plan.pos_key is not None or plan.pos_query is not None
+    ):
+        if plan.delta_to_local is None:
+            raise ValueError("position plan has neither gather maps nor a delta_to_local lookup")
+        # Self-attention uses the same map for c2p and p2c.
+        pair_map = dense_pair_map(plan.delta_to_local, sequence_length)
+        c2p_local = pair_map if c2p_local is None else c2p_local
+        p2c_local = pair_map if p2c_local is None else p2c_local
+
     if plan.pos_key is not None:
         c2p_raw = torch.matmul(query_layer, plan.pos_key.transpose(-1, -2)) / scale
         attention_scores = attention_scores + torch.gather(
             c2p_raw,
             dim=-1,
-            index=plan.c2p_local.expand(
+            index=c2p_local.expand(
                 batch_size,
                 num_heads,
                 sequence_length,
@@ -73,7 +116,7 @@ def _torch_disentangled_attention(
         attention_scores = attention_scores + torch.gather(
             p2c_raw.transpose(-1, -2),
             dim=-2,
-            index=plan.p2c_local.expand(
+            index=p2c_local.expand(
                 batch_size,
                 num_heads,
                 sequence_length,
@@ -307,7 +350,11 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         self,
         active_slots: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Return compact projected positions, shared across equivalent buckets."""
+        """Return views of the full projected tables for one contiguous slot range.
+
+        Views, not copies: every prepared length shares one table per layer, so
+        memory does not grow with the number of distinct lengths.
+        """
 
         slot_count = int(active_slots.numel())
         if slot_count == 0:
@@ -337,21 +384,26 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             if self._cached_pos_key is None:
                 raise RuntimeError("call prepare_for_inference() before prepare_shape()")
 
-            pos_key = self._cached_pos_key.narrow(1, slot_start, slot_count).contiguous()
+            pos_key = self._cached_pos_key.narrow(1, slot_start, slot_count)
 
         pos_query = None
         if self.relative_attention and "p2c" in self.pos_att_type:
             if self._cached_pos_query is None:
                 raise RuntimeError("call prepare_for_inference() before prepare_shape()")
 
-            pos_query = self._cached_pos_query.narrow(1, slot_start, slot_count).contiguous()
+            pos_query = self._cached_pos_query.narrow(1, slot_start, slot_count)
 
         projected = (pos_key, pos_query)
         self._compact_position_projection_cache[cache_key] = projected
         return projected
 
     def release_position_projection_workspace(self) -> None:
-        """Release full projected tables after compact bucket tables are built."""
+        """Drop this layer's references to the full projected tables.
+
+        Prepared plans are views of these tables, so this frees no memory while they
+        exist; a later prepare_shape() for a new length then needs
+        prepare_for_inference() again. The encoder does not call it.
+        """
 
         self._cached_pos_key = None
         self._cached_pos_query = None
@@ -373,16 +425,17 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         if cached is not None:
             return cached
 
-        indices = self.position_plan_cache.dense(sequence_length, resolved_device)
+        # The O(L) lookup is kept; the [L, L] gather map is expanded per call.
+        indices = self.position_plan_cache.compact(sequence_length, resolved_device)
         pos_key, pos_query = self._project_active_positions(indices.active_slots)
         plan = TorchPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
-            # Self-attention uses the same map for c2p and p2c.
-            c2p_local=indices.pair_to_local,
-            p2c_local=indices.pair_to_local,
+            c2p_local=None,
+            p2c_local=None,
             pos_key=pos_key,
             pos_query=pos_query,
+            delta_to_local=indices.delta_to_local,
         )
         self._position_projection_cache[cache_key] = plan
         return plan
@@ -532,6 +585,15 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
         )
         return context_layer, None
 
+    @staticmethod
+    def _with_pair_map(plan: TorchPositionPlan) -> TorchPositionPlan:
+        """Expand the gather map once for a call that runs the plan many times."""
+
+        if plan.c2p_local is not None or plan.delta_to_local is None:
+            return plan
+        pair_map = dense_pair_map(plan.delta_to_local, plan.sequence_length)
+        return plan._replace(c2p_local=pair_map, p2c_local=pair_map)
+
     def forward_packed(
         self,
         hidden_states: torch.Tensor,
@@ -570,7 +632,8 @@ class TorchInferenceDisentangledSelfAttention(OriginalDisentangledSelfAttention)
             self.prepare_for_inference(rel_embeddings)
 
         plans = {
-            length: self.prepare_shape(length, hidden_states.device) for length in set(info.lengths)
+            length: self._with_pair_map(self.prepare_shape(length, hidden_states.device))
+            for length in set(info.lengths)
         }
         outputs = []
         for start, end, length in zip(info.offsets, info.offsets[1:], info.lengths):

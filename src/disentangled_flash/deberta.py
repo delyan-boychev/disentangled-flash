@@ -19,6 +19,7 @@ from ._reference import BaseModelOutput
 from ._torch import (
     TorchPositionPlan,
     TorchTrainingDisentangledSelfAttention,
+    share_pair_map,
 )
 from .kernel import (
     InferenceDisentangledSelfAttention,
@@ -188,6 +189,7 @@ class DebertaV2OptimizedEncoder(nn.Module):
             layer.attention.self = replacement
 
         self._prepared_plans: dict[int, tuple[PositionPlan, ...]] = {}
+        self._prepared_versions: tuple[int, ...] | None = None
         self._active_sequence_length: int | None = None
         self._active_plans: tuple[PositionPlan, ...] | None = None
         if self.inference:
@@ -241,12 +243,49 @@ class DebertaV2OptimizedEncoder(nn.Module):
             self.clear_inference_cache()
         return result
 
+    def _parameter_versions(self) -> tuple[int, ...] | None:
+        """In-place edit counters of every parameter, or None if they are not tracked."""
+
+        try:
+            return tuple(parameter._version for parameter in self.parameters())
+        except RuntimeError:  # Inference tensors have no version counter.
+            return None
+
+    def _prepared_state_is_current(self) -> bool:
+        """Whether the layer caches behind ``_prepared_plans`` can be reused."""
+
+        if not self._prepared_plans:
+            return False
+        for attention in self._attention_modules():
+            if getattr(attention, "_cached_qkv_weight", None) is None:
+                return False
+            if (
+                attention.relative_attention
+                and "c2p" in attention.pos_att_type
+                and attention._cached_pos_key is None
+            ):
+                return False
+            if (
+                attention.relative_attention
+                and "p2c" in attention.pos_att_type
+                and attention._cached_pos_query is None
+            ):
+                return False
+        versions = self._parameter_versions()
+        return versions is None or versions == self._prepared_versions
+
     @torch.no_grad()
     def prepare_for_inference(
         self,
         sequence_lengths: int | Iterable[int],
     ) -> DebertaV2OptimizedEncoder:
-        """Prepare every layer and every selected production bucket."""
+        """Prepare every layer for exactly these sequence lengths and activate the first.
+
+        Lengths that are already prepared are kept, missing ones are built and lengths
+        not listed are dropped, so calling it again with one more length costs one
+        length. Everything is rebuilt after the caches were cleared (train(), to(),
+        load_state_dict(), clear_inference_cache()) or a parameter changed in place.
+        """
 
         if not self.inference:
             raise RuntimeError(
@@ -261,22 +300,24 @@ class DebertaV2OptimizedEncoder(nn.Module):
         if not lengths or any(length < 1 for length in lengths):
             raise ValueError("sequence_lengths must contain positive integers")
 
-        # Projected tables are per layer; index plans are shared.
-        self.clear_inference_cache()
-        rel_embeddings = self.get_rel_embedding()
         attentions = self._attention_modules()
-        for attention in attentions:
-            attention.eval().prepare_for_inference(rel_embeddings)
+        if not self._prepared_state_is_current():
+            # Full projected tables are per layer and stay resident: every prepared
+            # length reads views of them. Index plans are shared across layers.
+            self.clear_inference_cache()
+            rel_embeddings = self.get_rel_embedding()
+            for attention in attentions:
+                attention.eval().prepare_for_inference(rel_embeddings)
+            self._prepared_versions = self._parameter_versions()
 
         device = attentions[0].query_proj.weight.device
-        for length in lengths:
-            self._prepared_plans[length] = tuple(
-                attention.prepare_shape(length, device) for attention in attentions
-            )
-
-        # Prepared shapes own their position tables, so free the full ones.
-        for attention in attentions:
-            attention.release_position_projection_workspace()
+        plans = {
+            length: self._prepared_plans.get(length)
+            or tuple(attention.prepare_shape(length, device) for attention in attentions)
+            for length in lengths
+        }
+        self._prepared_plans.clear()
+        self._prepared_plans.update(plans)
 
         self.activate_shape(lengths[0])
         return self
@@ -361,6 +402,8 @@ class DebertaV2OptimizedEncoder(nn.Module):
         ):
             layer_attention_mask = attention_mask.bool().contiguous()
 
+        # PyTorch plans keep only the O(L) lookup; expand it once for all layers.
+        plans = share_pair_map(plans)
         for index, (layer, plan) in enumerate(zip(self.layer, plans)):
             self_output, _ = layer.attention.self.forward_prepared(
                 next_kv,
