@@ -15,7 +15,7 @@ import torch
 
 from ._torch import TorchInferenceDisentangledSelfAttention, TorchPositionPlan
 from .packed import PackedSequenceInfo, resolve_packed_info
-from .position import canonical_device, pad_position_table
+from .position import canonical_device, pad_position_table, position_window
 from .tuning import (
     DEFAULT_KERNEL_CONFIGS,
     KernelConfig,
@@ -1390,6 +1390,12 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
         self._triton_position_projection_cache: dict[
             tuple[int, str], TritonPreparedPositionPlan
         ] = {}
+        # One (lookup, tables) entry per tuning family and device. Per-length plans only
+        # reference it, so preparing more lengths allocates nothing new on the GPU.
+        self._triton_family_tables: dict[
+            tuple[int, str],
+            tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None],
+        ] = {}
 
     def _reshape_heads(
         self,
@@ -1411,6 +1417,8 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
             self._failed_profile_workloads.clear()
         if hasattr(self, "_triton_position_projection_cache"):
             self._triton_position_projection_cache.clear()
+        if hasattr(self, "_triton_family_tables"):
+            self._triton_family_tables.clear()
 
     @staticmethod
     def _table_width(plan: TritonPreparedPositionPlan, active_slot_count: int) -> int:
@@ -1620,24 +1628,56 @@ class InferenceDisentangledSelfAttention(TorchInferenceDisentangledSelfAttention
 
         representative = tuning_sequence_length(sequence_length)
         indices = self.position_plan_cache.compact(representative, resolved_device)
-        representative_plan = self._triton_position_projection_cache.get(
-            (representative, str(resolved_device))
-        )
-        if representative_plan is None:
-            pos_key, pos_query = self._project_active_positions(indices.active_slots)
-            pos_key, pos_query = pad_position_table(pos_key), pad_position_table(pos_query)
-        else:
-            pos_key, pos_query = representative_plan.pos_key, representative_plan.pos_query
+        family_key = representative, str(resolved_device)
+        family = self._triton_family_tables.get(family_key)
+        if family is None:
+            family = self._family_position_tables(indices.active_slots, indices.delta_to_local)
+            self._triton_family_tables[family_key] = family
+        delta_to_local, pos_key, pos_query = family
         plan = TritonPreparedPositionPlan(
             sequence_length=sequence_length,
             active_slots=indices.active_slots,
-            delta_to_local=indices.delta_to_local.to(dtype=torch.int32).contiguous(),
+            delta_to_local=delta_to_local,
             position_offset=representative - 1,
             pos_key=pos_key,
             pos_query=pos_query,
         )
         self._triton_position_projection_cache[cache_key] = plan
         return plan
+
+    def _family_position_tables(
+        self,
+        active_slots: torch.Tensor,
+        delta_to_local: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """The lookup and position tables shared by one tuning family.
+
+        Tables are views of an aligned row window of the full projected tables, and
+        the lookup is shifted to index that window, so no table is copied. If the
+        aligned window does not fit, fall back to a padded copy of the active rows.
+        """
+
+        has_key = self.relative_attention and "c2p" in self.pos_att_type
+        has_query = self.relative_attention and "p2c" in self.pos_att_type
+        if (has_key and self._cached_pos_key is None) or (
+            has_query and self._cached_pos_query is None
+        ):
+            raise RuntimeError("call prepare_for_inference() before prepare_shape()")
+        lookup = delta_to_local.to(dtype=torch.int32).contiguous()
+        full = self._cached_pos_key if has_key else self._cached_pos_query if has_query else None
+        window = None if full is None else position_window(active_slots, lookup, full.size(-2))
+        if window is None:
+            pos_key, pos_query = self._project_active_positions(active_slots)
+            return lookup, pad_position_table(pos_key), pad_position_table(pos_query)
+
+        def view(table: torch.Tensor | None) -> torch.Tensor | None:
+            return None if table is None else table.narrow(-2, window.start, window.width)
+
+        return (
+            window.delta_to_local.contiguous(),
+            view(self._cached_pos_key if has_key else None),
+            view(self._cached_pos_query if has_query else None),
+        )
 
     def _get_cached_shape_plan(
         self,

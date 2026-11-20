@@ -33,6 +33,53 @@ def pad_position_table(table: torch.Tensor | None) -> torch.Tensor | None:
     return torch.nn.functional.pad(table, (0, 0, 0, extra))
 
 
+class PositionWindow(NamedTuple):
+    """An aligned row window of a full projected position table.
+
+    ``delta_to_local`` indexes rows of ``table.narrow(-2, start, width)``, so every
+    length reads a view of one table instead of its own padded copy.
+    """
+
+    start: int
+    width: int
+    delta_to_local: torch.Tensor
+
+
+def position_window(
+    active_slots: torch.Tensor,
+    delta_to_local: torch.Tensor,
+    table_rows: int,
+) -> PositionWindow | None:
+    """Fit ``active_slots`` into an aligned window of a ``table_rows``-row table.
+
+    The window is ``aligned_slot_count(len(active_slots))`` rows wide and covers the
+    active slots; rows past them are real table rows that the kernels never index.
+    Returns None when the aligned window does not fit in the table.
+    """
+
+    slot_count = int(active_slots.numel())
+    width = aligned_slot_count(slot_count)
+    if slot_count == 0 or width > table_rows:
+        return None
+    first = int(active_slots[0])
+    start = min(first, table_rows - width)
+    shift = first - start
+    lookup = delta_to_local if not shift else (delta_to_local + shift).to(delta_to_local.dtype)
+    return PositionWindow(start, width, lookup)
+
+
+def dense_pair_map(delta_to_local: torch.Tensor, sequence_length: int) -> torch.Tensor:
+    """Expand a compact ``[2L - 1]`` slot lookup to the ``[1, 1, L, L]`` gather map.
+
+    Built on the lookup's device and not cached: it is ``O(L^2)`` and cheap to rebuild,
+    so keeping one per sequence length would grow memory with every length seen.
+    """
+
+    positions = torch.arange(sequence_length, device=delta_to_local.device)
+    delta_indices = positions[:, None] - positions[None, :] + sequence_length - 1
+    return delta_to_local.long()[delta_indices][None, None]
+
+
 class GradientBand(NamedTuple):
     """Distance columns that let backward write position gradients without atomics.
 
@@ -108,8 +155,9 @@ def canonical_device(
 class SharedPositionPlanCache:
     """Position-index tensors shared by all encoder layers.
 
-    compact() never builds an L x L tensor. dense() builds one int64 map for the
-    PyTorch path, shared across layers.
+    compact() never builds an L x L tensor and is cached per length (it is O(L)).
+    dense() builds the int64 [L, L] map for the PyTorch path on demand and does not
+    cache it, so memory does not grow with the number of distinct lengths.
     """
 
     def __init__(
@@ -125,11 +173,9 @@ class SharedPositionPlanCache:
         self.position_embedding_size = position_embedding_size
         self.uses_position_bias = uses_position_bias
         self._compact: dict[tuple[int, str], SharedPositionIndexPlan] = {}
-        self._dense: dict[tuple[int, str], SharedDensePositionIndexPlan] = {}
 
     def clear(self) -> None:
         self._compact.clear()
-        self._dense.clear()
 
     def _key(
         self,
@@ -213,31 +259,19 @@ class SharedPositionPlanCache:
         sequence_length: int,
         device: torch.device | str,
     ) -> SharedDensePositionIndexPlan:
-        """Return the shared dense gather map for prepared PyTorch attention."""
+        """Build the dense gather map for PyTorch attention (not cached)."""
 
-        length, device_key, resolved_device = self._key(sequence_length, device)
-        cache_key = length, device_key
-        cached = self._dense.get(cache_key)
-        if cached is not None:
-            return cached
-
+        length, _, resolved_device = self._key(sequence_length, device)
         compact = self.compact(length, resolved_device)
-        positions = torch.arange(length, dtype=torch.long)
-        delta_indices = positions[:, None] - positions[None, :] + length - 1
-        pair_to_local = compact.delta_to_local.cpu()[delta_indices].to(
-            device=resolved_device,
-            dtype=torch.long,
-        )
-        plan = SharedDensePositionIndexPlan(
+        return SharedDensePositionIndexPlan(
             compact=compact,
-            pair_to_local=pair_to_local.unsqueeze(0).unsqueeze(0),
+            pair_to_local=dense_pair_map(compact.delta_to_local, length),
         )
-        self._dense[cache_key] = plan
-        return plan
 
 
 __all__ = [
     "GradientBand",
+    "PositionWindow",
     "SharedDensePositionIndexPlan",
     "SharedPositionIndexPlan",
     "SharedPositionPlanCache",
